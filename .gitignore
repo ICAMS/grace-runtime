@@ -1,0 +1,12 @@
+build*/
+__pycache__/
+*.npz
+!tests/fixtures/*.npz
+Testing/
+python/build/
+*.egg-info/
+*.so
+dist/
+.micromamba/
+.mm/
+.grace-cache/

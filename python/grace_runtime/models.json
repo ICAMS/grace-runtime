@@ -1,0 +1,220 @@
+{
+ "schema": 1,
+ "generated_by": "tensorpotential ci/gen_grace_runtime_models.py",
+ "models": [
+  {
+   "name": "GRACE-1L-OMAT-large-base",
+   "aliases": [
+    "GRACE-1L-OMAT-large-base-fp64"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-large-base-kokkos.npz",
+   "sha256": "1eb8c7cfe0a931445772f59b5745bd7e19d41942e8214a4b1c3622319168dbd9",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-OMAT-large-ft-AM",
+   "aliases": [
+    "GRACE-1L-OMAT-large-ft-AM-fp64",
+    "GRACE-1L-OAM-L"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-large-ft-AM-kokkos.npz",
+   "sha256": "7d03ddcf9ab862a4f26242723b0497ebb1e90ea08d6a733fd9cf46644ea62a03",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-OMAT-large-ft-E",
+   "aliases": [
+    "GRACE-1L-OMAT-large-ft-E-fp64",
+    "GRACE-1L-OMAT-L"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-large-ft-E-kokkos.npz",
+   "sha256": "fc4210991c1573abb6d89b93298337473c465dd5d3344661bd49964a539f45af",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-OMAT-medium-base",
+   "aliases": [
+    "GRACE-1L-OMAT-medium-base-fp64"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-medium-base-kokkos.npz",
+   "sha256": "0b8506915a68537a03d5abf105bd867f72702202858edc3be539f9164520d839",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-OMAT-medium-ft-AM",
+   "aliases": [
+    "GRACE-1L-OMAT-medium-ft-AM-fp64",
+    "GRACE-1L-OAM-M"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-medium-ft-AM-kokkos.npz",
+   "sha256": "9dde747b8c87bcb90d897c302316a245891d1ae0f6080d1090045c27f5b8bd16",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-OMAT-medium-ft-E",
+   "aliases": [
+    "GRACE-1L-OMAT-medium-ft-E-fp64",
+    "GRACE-1L-OMAT-M"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-OMAT-medium-ft-E-kokkos.npz",
+   "sha256": "8044d041a91c575d642c00939aad999aae8a1fc29f3a62d3a27b96cdacc05e23",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-SMAX-OMAT-large",
+   "aliases": [
+    "GRACE-1L-SMAX-OMAT-large-fp64"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-SMAX-OMAT-large-kokkos.npz",
+   "sha256": "9bf94290e2f631d40a23ac0bb6a4ec04663fa180f51fbda4c2331e3dea404257",
+   "uq": true
+  },
+  {
+   "name": "GRACE-1L-SMAX-large",
+   "aliases": [
+    "GRACE-1L-SMAX-large-fp64"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-SMAX-large-kokkos.npz",
+   "sha256": "97a7f56dec6a00bfc042f463228efd2c15baa020b66f41a4e5e67fcd826c850c",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-large-base",
+   "aliases": [
+    "GRACE-2L-OMAT-large-base-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-large-base-kokkos.npz",
+   "sha256": "548673865a541cec72b36ace24e68b6d914ee73fa2bf5014020c3fdb797b0c41",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-large-ft-AM",
+   "aliases": [
+    "GRACE-2L-OMAT-large-ft-AM-fp64",
+    "GRACE-2L-OAM-L"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-large-ft-AM-kokkos.npz",
+   "sha256": "c8da113dc07e6c4543bf92d965edb637fe8e82abcd1f10491ef89aed55e41b28",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-large-ft-E",
+   "aliases": [
+    "GRACE-2L-OMAT-large-ft-E-fp64",
+    "GRACE-2L-OMAT-L"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-large-ft-E-kokkos.npz",
+   "sha256": "8eddb95fd292844e30b1e1781b8e72872f68f7404e67089dd81149deef5f075e",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-medium-base",
+   "aliases": [
+    "GRACE-2L-OMAT-medium-base-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-medium-base-kokkos.npz",
+   "sha256": "e70ac2df552fd95168184b8850749815163d298f0e925439648c7fb1b30711b6",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-medium-ft-AM",
+   "aliases": [
+    "GRACE-2L-OMAT-medium-ft-AM-fp64",
+    "GRACE-2L-OAM-M"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-medium-ft-AM-kokkos.npz",
+   "sha256": "6a953663d26fc440b8bf071b0eed0295407d22377ad6dae53fc823dc7be1fea7",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-OMAT-medium-ft-E",
+   "aliases": [
+    "GRACE-2L-OMAT-medium-ft-E-fp64",
+    "GRACE-2L-OMAT-M"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-OMAT-medium-ft-E-kokkos.npz",
+   "sha256": "3b79e4c61a2907d0bec09bd3f3da56edbc79662caead0195c033d56397f13d52",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-SMAX-OMAT-large",
+   "aliases": [
+    "GRACE-2L-SMAX-OMAT-large-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-SMAX-OMAT-large-kokkos.npz",
+   "sha256": "928efd9cf11b8d1d7fca8876f59cd356e1a35e88ff602f913e43b731cd4ff35b",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-SMAX-OMAT-medium",
+   "aliases": [
+    "GRACE-2L-SMAX-OMAT-medium-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-SMAX-OMAT-medium-kokkos.npz",
+   "sha256": "c038e4fb1a2c87101bd218c2a279f015d98744aec19afda245b2736e928a0b3a",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-SMAX-large",
+   "aliases": [
+    "GRACE-2L-SMAX-large-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-SMAX-large-kokkos.npz",
+   "sha256": "c3c375e9a12dd0b1d308d9b69bf49ed082d6a9618b823cc22528f123a0e78b91",
+   "uq": true
+  },
+  {
+   "name": "GRACE-2L-SMAX-medium",
+   "aliases": [
+    "GRACE-2L-SMAX-medium-fp64"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-2L-SMAX-medium-kokkos.npz",
+   "sha256": "a140e16b3ce8ee8c003a11445f3c2a0f69f303f06966516cd83f717c4ad1e759",
+   "uq": true
+  },
+  {
+   "name": "GRACE-3L-OMAT-large",
+   "aliases": [],
+   "arch": "3L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v4-uq-v6/kokkos/GRACE-3L-OMAT-large-kokkos.npz",
+   "sha256": "9f62dd08e5adf1fd0dc9ae56383694bc7073f4690f58a6d2ac10dd5bb6a67d6a",
+   "uq": true
+  },
+  {
+   "name": "GRACE-3L-OMAT-large-ft-AM",
+   "aliases": [],
+   "arch": "3L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v4-uq-v6/kokkos/GRACE-3L-OMAT-large-ft-AM-kokkos.npz",
+   "sha256": "10d390ebb8d4ee36bd9ea3df268327dbb92de598fabcec40d0e6a93085422916",
+   "uq": true
+  }
+ ],
+ "unsupported": {
+  "GRACE-1L-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-1L-OAM_2Feb25": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-1L-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-2L-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-2L-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-FS-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE-FS-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
+  "GRACE_2L_OAM_28Jan25": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator"
+ }
+}

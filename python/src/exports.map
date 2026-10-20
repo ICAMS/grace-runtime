@@ -1,0 +1,2 @@
+/* only the module init is exported: libstdc++ template instances (regex, ...) stay local */
+{ global: PyInit_*; local: *; };

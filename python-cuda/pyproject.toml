@@ -1,0 +1,31 @@
+[build-system]
+requires = ["scikit-build-core>=1.1", "nanobind>=3.1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "grace-runtime-cuda12"
+version = "0.0.1.dev0"    # = grace-runtime (scripts/build_cuda_wheels.sh sets both from the repository pyproject)
+description = "NVIDIA GPU backend (CUDA 12) of grace-runtime: fused GRACE-1L/2L/3L Kokkos kernels for V100, RTX 20xx/30xx/40xx/50xx, A100/A30, L40S, H100/H200, B200/B300"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Academic Software License (ASL); bundled third-party code (Kokkos: Apache-2.0 WITH LLVM-exception): see THIRD_PARTY_NOTICES.md" }
+classifiers = ["License :: Other/Proprietary License"]
+dependencies = ["grace-runtime==0.0.1.dev0"]
+
+[project.urls]
+Homepage = "https://github.com/ICAMS/grace-runtime"
+Issues = "https://github.com/ICAMS/grace-runtime/issues"
+
+[project.optional-dependencies]
+# cuBLAS for the UQ projections (loaded at run time; without it hand-written kernels, UQ ~25-45 % slower)
+cublas = ["nvidia-cublas-cu12>=12.4,<13"]
+
+[project.entry-points."grace_runtime.backends"]
+cuda12 = "grace_runtime_cuda12"
+
+[tool.scikit-build]
+wheel.packages = ["grace_runtime_cuda12"]
+# CPython >= 3.12: one abi3 wheel (nanobind STABLE_ABI); 3.10 / 3.11 get regular wheels
+wheel.py-api = "cp312"
+wheel.license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", "LICENSE-Kokkos", "libgrace/third_party/grace_cnpy/LICENSE"]
+cmake.build-type = "Release"
