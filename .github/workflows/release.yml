@@ -1,0 +1,60 @@
+# A published GitHub release X.Y.Z builds the packages (the CPU wheels and CUDA wheels workflows) and uploads them by
+# Trusted Publishing. A pre-release goes to TestPyPI (environment "testpypi"), a release to PyPI (environment "pypi");
+# every upload waits for an approval in its environment. grace-runtime goes first and on its own; grace-runtime-cuda12
+# (which pins grace-runtime==X.Y.Z) is built and follows only when the repository variable GRACE_RELEASE_CUDA is "true".
+# The files must carry the version of the release tag.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    uses: ./.github/workflows/cpu-wheels.yml
+
+  publish-cpu:
+    needs: cpu
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.release.prerelease && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cpu-wheels
+          path: dist
+      - name: version = release tag
+        run: |
+          T=${{ github.event.release.tag_name }}; ls dist
+          for f in dist/*; do case "$(basename "$f")" in grace_runtime-$T-*.whl|grace_runtime-$T.tar.gz) ;; *) echo "::error::$f is not version $T"; exit 1 ;; esac; done
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ github.event.release.prerelease && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
+  cuda:
+    if: vars.GRACE_RELEASE_CUDA == 'true'
+    uses: ./.github/workflows/cuda-wheels.yml
+
+  publish-cuda:
+    if: vars.GRACE_RELEASE_CUDA == 'true'
+    needs: [cuda, publish-cpu]
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.release.prerelease && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cuda-wheels
+          path: dist
+      - name: version = release tag
+        run: |
+          T=${{ github.event.release.tag_name }}; ls dist
+          for f in dist/*; do case "$(basename "$f")" in grace_runtime_cuda12-$T-*.whl|grace_runtime_cuda12-$T.tar.gz) ;; *) echo "::error::$f is not version $T"; exit 1 ;; esac; done
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ github.event.release.prerelease && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}

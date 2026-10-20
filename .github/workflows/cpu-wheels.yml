@@ -1,0 +1,97 @@
+# CPU package grace-runtime: libgrace C++ tests, the sdist and the manylinux2014 x86_64 wheels (CPython 3.10, 3.11 and
+# one abi3 wheel for >= 3.12; scripts/build_wheels.sh, conda-forge compilers with the glibc 2.17 sysroot, no Docker),
+# then each wheel in clean environments (scripts/test_wheels.sh). The wheels are kept as the artifact "cpu-wheels".
+name: CPU wheels
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [dev]      # the release pull request
+  workflow_call:         # from release.yml
+
+permissions:
+  contents: read
+
+env:
+  TEST_MODELS: "GRACE-2L-SMAX-OMAT-medium GRACE-1L-OMAT-large-base GRACE-2L-OMAT-medium-ft-E GRACE-3L-OMAT-large GRACE-2L-SMAX-OMAT-large"
+
+jobs:
+  ctest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
+          echo "MAMBA_ROOT_PREFIX=$HOME/micromamba" >> "$GITHUB_ENV"
+          echo "GRACE_CACHE=$HOME/grace-cache" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: ~/grace-cache
+          key: grace-test-models-v2
+      - name: environment and test models
+        run: |
+          $MAMBA_EXE create -y -q -n gn-ctest -c conda-forge python=3.12 gxx_linux-64 "sysroot_linux-64=2.17" cmake ninja pip numpy ase tqdm
+          $MAMBA_ROOT_PREFIX/envs/gn-ctest/bin/python scripts/download_test_models.py $TEST_MODELS
+          $MAMBA_ROOT_PREFIX/envs/gn-ctest/bin/python -c "import sys; sys.path.insert(0, 'python/tests'); from model_tools import strip_uq; strip_uq('$GRACE_CACHE/GRACE-2L-SMAX-OMAT-medium/kokkos.npz', 'nouq.npz')"
+      - name: build and ctest (x86-64-v3 flags, which every runner CPU runs)
+        run: |
+          export GRACE_TEST_NOUQ=$PWD/nouq.npz
+          $MAMBA_EXE run -n gn-ctest cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release "-DGRACE_ARCH_FLAGS=-march=x86-64-v3"
+          $MAMBA_EXE run -n gn-ctest cmake --build build-ci -j "$(nproc)"
+          cd build-ci && $MAMBA_EXE run -n gn-ctest ctest --output-on-failure
+
+  wheels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
+      - name: build
+        run: bash scripts/build_wheels.sh dist/wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpu-wheels
+          path: |
+            dist/wheelhouse/*.whl
+            dist/wheelhouse/*.tar.gz
+          if-no-files-found: error
+
+  test-wheels:
+    needs: wheels
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
+          echo "MAMBA_ROOT_PREFIX=$HOME/micromamba" >> "$GITHUB_ENV"
+          echo "GRACE_CACHE=$HOME/grace-cache" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cpu-wheels
+          path: dist/wheelhouse
+      - uses: actions/cache@v4
+        with:
+          path: ~/grace-cache
+          key: grace-test-models-v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: test models
+        run: |
+          python -m pip install -q tqdm
+          python scripts/download_test_models.py $TEST_MODELS
+      - name: test the CPython ${{ matrix.python }} wheel
+        run: PYTHONS=${{ matrix.python }} bash scripts/test_wheels.sh dist/wheelhouse

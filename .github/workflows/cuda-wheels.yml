@@ -1,0 +1,96 @@
+# NVIDIA GPU package grace-runtime-cuda12: one job per GPU architecture builds Kokkos (cached) and that architecture's
+# module for CPython 3.10, 3.11 and >= 3.12 (abi3) (scripts/build_cuda_wheels.sh: CUDA 12.9 and conda-forge compilers
+# with the glibc 2.17 sysroot, no Docker, no CUDA toolkit on the runner); scripts/merge_cuda_wheels.py then makes one
+# wheel per CPython tag with all modules. The runners have no GPU: the check job tests the wheels' contents and that
+# device="auto" runs on the CPU without a GPU; the GPU tests are scripts/test_cuda_wheels.sh on a GPU machine.
+# The wheels and the sdist are kept as the artifact "cuda-wheels".
+name: CUDA wheels
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [dev]      # the release pull request
+  workflow_call:         # from release.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [sm70, sm80, sm90, sm100, sm120]
+    steps:
+      - uses: actions/checkout@v4
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
+          # nvcc needs up to ~3 GB per process
+          M=$(free -g | awk '/^Mem:/{print $2}'); echo "NPROC=$(( M / 3 > 0 ? M / 3 : 1 ))" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/grace-runtime/kokkos-wheel/install-*-${{ matrix.arch }}
+          key: kokkos-${{ matrix.arch }}-${{ hashFiles('python-cuda/CMakeLists.txt', 'scripts/build_cuda_wheels.sh') }}
+      - name: build
+        run: GRACE_KK_ARCHS=${{ matrix.arch }} bash scripts/build_cuda_wheels.sh dist/cuda-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-${{ matrix.arch }}
+          path: |
+            dist/cuda-${{ matrix.arch }}/*.whl
+            dist/cuda-${{ matrix.arch }}/*.tar.gz
+          if-no-files-found: error
+
+  merge-and-check:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cuda-sm*
+          path: dist/parts
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
+          echo "MAMBA_ROOT_PREFIX=$HOME/micromamba" >> "$GITHUB_ENV"
+          echo "GRACE_CACHE=$HOME/grace-cache" >> "$GITHUB_ENV"
+      - name: merge (one wheel per CPython tag with all modules)
+        run: |
+          $MAMBA_EXE create -y -q -n gn-cudachk -c conda-forge python=3.12 pip numpy ase tqdm auditwheel binutils
+          $MAMBA_ROOT_PREFIX/envs/gn-cudachk/bin/python scripts/merge_cuda_wheels.py dist/cuda-wheelhouse dist/parts/cuda-sm*/*.whl
+          cp "$(ls dist/parts/cuda-sm80/*.tar.gz)" dist/cuda-wheelhouse/
+          ls -la dist/cuda-wheelhouse
+      - name: check the wheels' contents
+        run: |
+          for w in dist/cuda-wheelhouse/*.whl; do
+            $MAMBA_ROOT_PREFIX/envs/gn-cudachk/bin/python scripts/check_cuda_wheel.py "$w" sm70,sm80,sm90,sm100,sm120
+          done
+      - name: without a GPU, device="auto" runs on the CPU (no warning)
+        run: |
+          PYTHONS=3.12 bash scripts/build_wheels.sh dist/wheelhouse    # the CPU package it plugs into
+          P=$MAMBA_ROOT_PREFIX/envs/gn-cudachk/bin
+          $P/python -m pip install -q dist/wheelhouse/*cp312-abi3*.whl dist/cuda-wheelhouse/*cp312-abi3*.whl
+          $P/grace-runtime models download GRACE-1L-OMAT-large-base
+          cd /tmp && $P/python -W error::RuntimeWarning - <<'PY'
+          import os, grace_runtime, grace_runtime._cuda as c
+          print("plug-ins:", [p.__name__ for p in c.plugins()], "modules:", c.available())
+          assert "grace_runtime_cuda12" in [p.__name__ for p in c.plugins()]
+          os.environ.pop("GRACE_RUNTIME_DEVICE", None)
+          calc = grace_runtime.GRACERuntimeCalculator("GRACE-1L-OMAT-large-base")
+          assert calc.backend == "cpu", calc.backend
+          print("no GPU: device='auto' ->", calc.backend)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-wheels
+          path: |
+            dist/cuda-wheelhouse/*.whl
+            dist/cuda-wheelhouse/*.tar.gz
+          if-no-files-found: error
