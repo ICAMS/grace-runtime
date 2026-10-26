@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=1.1", "nanobind>=3.1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "grace-runtime-rocm6"
+version = "0.0.1.dev1"    # = grace-runtime (scripts/build_rocm_wheels.sh sets both from the repository pyproject)
+description = "AMD GPU backend (ROCm 6) of grace-runtime: fused GRACE-1L/2L/3L Kokkos kernels for MI210/MI250/MI250X and MI300A/MI300X"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Academic Software License (ASL); bundled third-party code (Kokkos: Apache-2.0 WITH LLVM-exception): see THIRD_PARTY_NOTICES.md" }
+classifiers = ["License :: Other/Proprietary License"]
+dependencies = ["grace-runtime==0.0.1.dev1"]
+
+[project.urls]
+Homepage = "https://github.com/ICAMS/grace-runtime"
+Issues = "https://github.com/ICAMS/grace-runtime/issues"
+
+[project.entry-points."grace_runtime.backends"]
+rocm6 = "grace_runtime_rocm6"
+
+[tool.scikit-build]
+wheel.packages = ["grace_runtime_rocm6"]
+# CPython >= 3.12: one abi3 wheel (nanobind STABLE_ABI); 3.10 / 3.11 get regular wheels
+wheel.py-api = "cp312"
+wheel.license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", "LICENSE-Kokkos", "libgrace/third_party/grace_cnpy/LICENSE"]
+cmake.build-type = "Release"

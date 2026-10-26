@@ -41,7 +41,7 @@ def fake_plugin(tmp_path, name, abi, archs=("sm80",)):
 
 def test_abi_mismatch_is_a_clear_import_error(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(fake_plugin(tmp_path, "gn_fake_backend", abi=_cuda.ABI + 1)))
-    with pytest.raises(ImportError, match=r"9\.9\.9 has GPU backend ABI 2.*needs ABI 1"):
+    with pytest.raises(ImportError, match=rf"9\.9\.9 has GPU backend ABI {_cuda.ABI + 1}.*needs ABI {_cuda.ABI}"):
         _cuda.plugins()
     sys.modules.pop("gn_fake_backend", None)
 
@@ -164,6 +164,16 @@ def test_ptx_needs_a_driver_for_the_toolkit_of_the_modules(sm100_without_module)
     sm100_without_module.setenv("GRACE_RUNTIME_ALLOW_PTX", "1")
     sm100_without_module.setitem(_cuda._state, "driver", 12040)
     with pytest.raises(ImportError, match=r"CUDA >= 12\.9.*supports 12\.4.*update the driver"):
+        _cuda.select(0)
+
+
+def test_forced_older_module_needs_the_driver_too(sm100_without_module):
+    """GRACE_RUNTIME_CUDA_ARCH of an older family is PTX as well: the same driver check (else Kokkos aborts at its
+    start, "likely mismatch of architecture")"""
+    sm100_without_module.setenv("GRACE_RUNTIME_CUDA_ARCH", "sm90")
+    assert _cuda.select(0) == ("sm90", True)
+    sm100_without_module.setitem(_cuda._state, "driver", 12080)
+    with pytest.raises(ImportError, match=r"sm90 module's PTX.*CUDA >= 12\.9.*supports 12\.8.*update the driver"):
         _cuda.select(0)
 
 

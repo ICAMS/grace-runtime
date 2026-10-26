@@ -6,6 +6,7 @@
 #include "grace/kk/grace_1l_kk_impl.h"
 #include "grace/kk/fused_common.h"
 #include "grace/kk/fused_dense.h"
+#include "grace/kk/fused_hip_bonds.h"
 #include "grace/kk/g1l_shape_large.h"
 
 #include <algorithm>
@@ -53,7 +54,6 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
   const int nlm = (this->lmax + 1) * (this->lmax + 1);
   if (this->lmax > G1LF_MAX_LMAX)
     GRACE_KK_ERROR("grace/1l/fused/kk: lmax {} > {} not supported", this->lmax, G1LF_MAX_LMAX);
-  if (m.mlp_rad_has_chem_emb) GRACE_KK_ERROR("grace/1l/fused/kk: element-dependent radial MLP not supported");
   if (this->nradmax * nlm > G1LF_TEAM * G1LF_MAX_ACC || this->nradmax > G1LF_TEAM || G1LF_TEAM % this->nradmax)
     GRACE_KK_ERROR("grace/1l/fused/kk: radial width {} outside the compiled bond kernels", this->nradmax);
   if (this->fc_n_out != G1LF_NO && this->fc_n_out != G1LF_NO_M)
@@ -150,6 +150,7 @@ Grace1LFusedKK<DeviceType, Traits>::run(const typename Base::RunInput &in)
   if ((int) d_vir.extent(0) < inum) d_vir = V2<double>("g1lf:vir", inum, 6);
   Kokkos::deep_copy(d_vir, 0.0);
   auto out = Base::run(in);
+  bonds_ready = false;    // the compact bond list belongs to that run (begin_run)
   if (this->vflag_global) {
     for (int k = 0; k < 6; k++) {
       auto vir = d_vir;
@@ -160,6 +161,7 @@ Grace1LFusedKK<DeviceType, Traits>::run(const typename Base::RunInput &in)
     }
   }
   if (this->couple_eq) Kokkos::deep_copy(out.dedl, this->d_dedl);
+  check_kernel_launches<DeviceType>("GRACE-1L/KK");
   return out;
 }
 
@@ -171,6 +173,22 @@ Grace1LFusedKK<DeviceType, Traits>::run(const typename Base::RunInput &in)
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::fused_A()
 {
+#if GRACE_KK_GEMM_MFMA
+  if constexpr (is_hip_v<DeviceType>) {
+    if (a_mfma) {    // CDNA: matrix-core basis (begin_run)
+      auto run = [&](auto cpl) {
+        GraceFusedKK::a_fwd_mfma<DeviceType, Traits, decltype(cpl)::value>(
+            "g1lf:A", this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n, this->d_A, this->x,
+            this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff, this->d_z_tr,
+            this->couple_eq, this->couple_bit1, this->couple_bit2, this->couple_lambda, this->d_mask,
+            this->d_idx_sph, this->alm, this->blm, this->cl, this->dl, d_splR);
+      };
+      if (this->couple_eq) run(std::true_type{});
+      else run(std::false_type{});
+      return;
+    }
+  }
+#endif
   if (this->couple_eq) fused_A_c<true>();    // two-group coupling compiled only into its own kernels
   else fused_A_c<false>();
 }
@@ -185,7 +203,8 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
   auto Af = this->d_A;
   const int co = this->chunk_offset;
   auto x = this->x; auto type = this->type; auto map = this->d_map;
-  auto neigh = this->d_neighbors; auto numneigh = this->d_numneigh; auto ilist = this->d_ilist;
+  auto ilist = this->d_ilist;
+  auto nbl = bond_list();    // the atom's bonds (GPU: the run's compact list)
   auto bc = this->d_bond_cutoff; auto ztr = this->d_z_tr; auto lfrom = d_lfrom;
   const int ceq = this->couple_eq, cb1 = this->couple_bit1, cb2 = this->couple_bit2;    // two-group coupling (CPL)
   const double clam = this->couple_lambda;
@@ -195,8 +214,11 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
   auto sc = d_splR;
   const int N = spline_n;
 
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, G1LF_TEAM, 2>>;
   using member = typename team_policy::member_type;
+  // GPU: z[mu_j, n] folded into the staged radial (Rs = R z, zero for the bonds out of range and Y zeroed for them),
+  // so the accumulation is one FMA per (output, bond) on two shared reads, without a branch on mus[b]
+  constexpr bool gpu = is_gpu_v<DeviceType>;
   const size_t shmem = (size_t) G1LF_NB * (nlm + nout + 1) * sizeof(F) + G1LF_NB * sizeof(int);
   team_policy pol(cs, G1LF_TEAM);
   pol = pol.set_scratch_size(0, Kokkos::PerTeam(shmem));
@@ -215,13 +237,13 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
     F acc[G1LF_MAX_ACC];
     for (int k = 0; k < G1LF_MAX_ACC; k++) acc[k] = 0.0f;
 
-    const int jnum = numneigh(i);
+    const int jnum = nbl.count(i, ii + co);
     for (int jb = 0; jb < jnum; jb += G1LF_NB) {
       const int nb = (jnum - jb < G1LF_NB) ? jnum - jb : G1LF_NB;
       Kokkos::parallel_for(Kokkos::TeamThreadRange(t, G1LF_NB), [&](const int b) {
         int mu = -1;
         if (b < nb) {
-          const int j = neigh(i, jb + b) & Traits::neighmask;
+          const int j = nbl(i, ii + co, jb + b);
           const double dx = x(j, 0) - xi, dy = x(j, 1) - yi, dz = x(j, 2) - zi;    // bond geometry in fp64
           const double r2 = dx * dx + dy * dy + dz * dz;
           const int muj = map(type(j));
@@ -237,12 +259,15 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
             }
           }
         }
+        if (gpu && mu < 0)
+          for (int lm = 0; lm < nlm; lm++) Ys[b * nlm + lm] = 0.0f;
         mus[b] = mu;
       });
       t.team_barrier();
       Kokkos::parallel_for(Kokkos::TeamThreadRange(t, G1LF_NB * nout), [&](const int q) {
         const int b = q / nout, o = q - b * nout;
-        Rs[q] = (mus[b] >= 0) ? spline_v(sc, N, xs[b], o) : 0.0f;
+        if (gpu) Rs[q] = (mus[b] >= 0) ? spline_v(sc, N, xs[b], o) * ztr(mus[b], o / nl) : 0.0f;
+        else Rs[q] = (mus[b] >= 0) ? spline_v(sc, N, xs[b], o) : 0.0f;
       });
       t.team_barrier();
 #pragma unroll
@@ -251,9 +276,13 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
         if (a >= nA) continue;
         const int n = a / nlm, lm = a - n * nlm, o = n * nl + lfrom(lm);
         F s = acc[k];
-        for (int b = 0; b < nb; b++) {
-          const int mu = mus[b];
-          if (mu >= 0) s += Rs[b * nout + o] * Ys[b * nlm + lm] * ztr(mu, n);
+        if (gpu) {
+          for (int b = 0; b < nb; b++) s += Rs[b * nout + o] * Ys[b * nlm + lm];
+        } else {
+          for (int b = 0; b < nb; b++) {
+            const int mu = mus[b];
+            if (mu >= 0) s += Rs[b * nout + o] * Ys[b * nlm + lm] * ztr(mu, n);
+          }
         }
         acc[k] = s;
       }
@@ -277,6 +306,21 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A_c()
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd()
 {
+  if constexpr (is_gpu_v<DeviceType>) {
+    if (bwd_wave) {    // GPU: one 64-thread team per atom, thread = bond (begin_run)
+      auto run = [&](auto cpl) {
+        GraceFusedKK::bond_bwd_wave<DeviceType, Traits, decltype(cpl)::value>(
+            "g1lf:bond_bwd", this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n, this->d_A_adj,
+            this->f, d_vir, this->x, this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff,
+            this->d_z_tr, this->couple_eq, this->couple_bit1, this->couple_bit2, this->couple_lambda, this->d_mask,
+            this->d_dedl, this->d_idx_sph, this->alm, this->blm, this->cl, this->dl, d_splR, this->vflag_global != 0,
+            this->vflag_atom != 0, this->cvflag_atom != 0, this->d_vatom, this->d_cvatom);
+      };
+      if (this->couple_eq) run(std::true_type{});
+      else run(std::false_type{});
+      return;
+    }
+  }
   if (this->couple_eq) fused_bond_bwd_c<true>();
   else fused_bond_bwd_c<false>();
 }
@@ -293,7 +337,8 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
   auto Aa = this->d_A_adj;
   auto f = this->f; auto vir = d_vir;
   auto x = this->x; auto type = this->type; auto map = this->d_map;
-  auto neigh = this->d_neighbors; auto numneigh = this->d_numneigh; auto ilist = this->d_ilist;
+  auto ilist = this->d_ilist;
+  auto nbl = bond_list();    // the atom's bonds (GPU: the run's compact list)
   auto bc = this->d_bond_cutoff; auto ztr = this->d_z_tr;
   const int ceq = this->couple_eq, cb1 = this->couple_bit1, cb2 = this->couple_bit2;    // two-group coupling (CPL)
   const double clam = this->couple_lambda;
@@ -307,39 +352,43 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
   const bool do_va = this->vflag_atom != 0, do_cva = this->cvflag_atom != 0;
   auto va = this->d_vatom; auto cva = this->d_cvatom;
 
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
-  using member = typename team_policy::member_type;
-  const int nf = nlm * NR + NBR * (4 * nlm + 8) + 3 * G1LF_TEAM;
-  const size_t shmem = (size_t) nf * sizeof(F) + 2 * NBR * sizeof(int);
-  team_policy pol(cs, G1LF_TEAM);
-  pol = pol.set_scratch_size(0, Kokkos::PerTeam(shmem));
-
-  Kokkos::parallel_for("g1lf:bond_bwd", pol, KOKKOS_LAMBDA(const member &t) {
+  using member = typename Kokkos::TeamPolicy<DeviceType>::member_type;    // launch: fbwd_launch
+  // GPU: dE/dA rows as [channel][lm] (LMP floats, 16-byte loads), Y and G of a bond as [lm][Y, Gx, Gy, Gz]
+  constexpr bool gpu = is_gpu_v<DeviceType>;
+  const int LMP = fused_lmp(nlm);
+  // GPU: the bond geometry of NBG >= NBR bonds per step (more lanes busy, fewer barriers), then rounds of NBR
+  const int NBG = gpu ? (NBR > 48 ? NBR : 48 / NBR * NBR) : NBR;
+  const int nf = (gpu ? NR * LMP : nlm * NR) + NBG * (4 * nlm + 8) + 3 * G1LF_TEAM;
+  const size_t shmem = (size_t) nf * sizeof(F) + 2 * NBG * sizeof(int) + (gpu ? 16 : 0);
+  auto body = KOKKOS_LAMBDA(const member &t) {
     const int ii = t.league_rank();
     const int i = ilist[ii + co];
     const int mui = map(type(i));
     const auto xi = x(i, 0), yi = x(i, 1), zi = x(i, 2);    // positions' precision (double)
-    F *Aa_s = (F *) t.team_shmem().get_shmem(nf * sizeof(F));
-    int *mus = (int *) t.team_shmem().get_shmem(2 * NBR * sizeof(int));
-    int *js = mus + NBR;
-    F *Ys = Aa_s + nlm * NR, *Gs = Ys + NBR * nlm, *geo = Gs + NBR * 3 * nlm, *Fs = geo + NBR * 8;
+    F *Aa_s;
+    if (gpu) Aa_s = (F *) t.team_shmem().get_shmem_aligned(nf * sizeof(F), 16);
+    else Aa_s = (F *) t.team_shmem().get_shmem(nf * sizeof(F));
+    int *mus = (int *) t.team_shmem().get_shmem(2 * NBG * sizeof(int));
+    int *js = mus + NBG;
+    F *Ys = Aa_s + (gpu ? NR * LMP : nlm * NR), *Gs = Ys + NBG * nlm, *geo = Gs + NBG * 3 * nlm, *Fs = geo + NBG * 8;
     const int tid = t.team_rank();
 
     Kokkos::parallel_for(Kokkos::TeamThreadRange(t, nlm * NR), [&](const int q) {
       const int lm = q / NR, c = q - lm * NR;
-      Aa_s[q] = Aa(ii, c, lm);
+      if (gpu) Aa_s[c * LMP + lm] = Aa(ii, c, lm);
+      else Aa_s[q] = Aa(ii, c, lm);
     });
     double v[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     double dla = 0.0;    // dE/dlambda (coupling)
     t.team_barrier();
 
-    const int jnum = numneigh(i);
-    for (int jb = 0; jb < jnum; jb += NBR) {
-      const int nb = (jnum - jb < NBR) ? jnum - jb : NBR;
-      Kokkos::parallel_for(Kokkos::TeamThreadRange(t, NBR), [&](const int b) {
+    const int jnum = nbl.count(i, ii + co);
+    for (int jb = 0; jb < jnum; jb += NBG) {
+      const int nb = (jnum - jb < NBG) ? jnum - jb : NBG;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange(t, NBG), [&](const int b) {
         int mu = -1;
         if (b < nb) {
-          const int j = neigh(i, jb + b) & Traits::neighmask;
+          const int j = nbl(i, ii + co, jb + b);
           const double dx = x(j, 0) - xi, dy = x(j, 1) - yi, dz = x(j, 2) - zi;    // bond geometry in fp64
           const double r2 = dx * dx + dy * dy + dz * dz;
           const int muj = map(type(j));
@@ -355,17 +404,21 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
               gb[3] = F(dx * rinv); gb[4] = F(dy * rinv); gb[5] = F(dz * rinv);
               gb[6] = F(r);
               if (CPL) gb[7] = F(dlm / rc);
-              real_sph_grad(lmax, gb[3], gb[4], gb[5], idx_s, alm, blm, cl, dl, Ys + b * nlm, Gs + b * 3 * nlm);
+              if (gpu)
+                real_sph_grad<4, 4>(lmax, gb[3], gb[4], gb[5], idx_s, alm, blm, cl, dl, Ys + b * 4 * nlm, Ys + b * 4 * nlm + 1);
+              else
+                real_sph_grad(lmax, gb[3], gb[4], gb[5], idx_s, alm, blm, cl, dl, Ys + b * nlm, Gs + b * 3 * nlm);
             }
           }
         }
         mus[b] = mu;
       });
       t.team_barrier();
+      for (int sb = 0; sb < nb; sb += NBR) {
       {
-        const int b = tid / NR, n = tid - b * NR;
+        const int b = sb + tid / NR, n = tid - (tid / NR) * NR;
         F fx = 0.0f, fy = 0.0f, fz = 0.0f;
-        if (b < nb && mus[b] >= 0) {
+        if (tid < NBR * NR && b < nb && mus[b] >= 0) {    // NBR NR < TEAM when NR does not divide it
           const int mu = mus[b];
           const F *gb = geo + b * 8, *Yb = Ys + b * nlm, *Gb = Gs + b * 3 * nlm;
           F R[G1LF_MAX_LMAX + 1], dR[G1LF_MAX_LMAX + 1], gR[G1LF_MAX_LMAX + 1];
@@ -376,6 +429,44 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
           }
           F gx = 0.0f, gy = 0.0f, gz = 0.0f;
           const F z = ztr(mu, n);
+          if (gpu) {
+            // the same sums: dE/dA row of channel n as float4, [Y, G] of (bond, lm) as one float4
+            constexpr int LMX = fused_lmp((G1LF_MAX_LMAX + 1) * (G1LF_MAX_LMAX + 1));
+            F aa[LMX];
+            const GF4 *a4 = reinterpret_cast<const GF4 *>(Aa_s + n * LMP);
+#pragma unroll
+            for (int q = 0; q < LMX / 4; q++) {
+              GF4 v = {0.0f, 0.0f, 0.0f, 0.0f};
+              if (4 * q < nlm) v = a4[q];
+              aa[4 * q] = v.x; aa[4 * q + 1] = v.y; aa[4 * q + 2] = v.z; aa[4 * q + 3] = v.w;
+            }
+            const GF4 *yg = reinterpret_cast<const GF4 *>(Ys + b * 4 * nlm);
+            if (is_hip_v<DeviceType>) {    // HIP-Clang unrolls the nested loops (the flat one was 1-2 % slower)
+#pragma unroll
+              for (int l = 0; l <= G1LF_MAX_LMAX; l++) {
+                if (l >= nl) continue;
+#pragma unroll
+                for (int lm = l * l; lm < (l + 1) * (l + 1); lm++) {
+                  const GF4 q = yg[lm];
+                  const F w = aa[lm] * z;
+                  gR[l] += w * q.x;
+                  const F wr = w * R[l];
+                  gx += wr * q.y; gy += wr * q.z; gz += wr * q.w;
+                }
+              }
+            } else {    // one flat lm loop: nvcc keeps aa in registers (l_of_y)
+#pragma unroll
+              for (int lm = 0; lm < (G1LF_MAX_LMAX + 1) * (G1LF_MAX_LMAX + 1); lm++) {
+                const int l = l_of_y(lm);
+                if (l >= nl) continue;
+                const GF4 q = yg[lm];
+                const F w = aa[lm] * z;
+                gR[l] += w * q.x;
+                const F wr = w * R[l];
+                gx += wr * q.y; gy += wr * q.z; gz += wr * q.w;
+              }
+            }
+          } else {
 #pragma unroll
           for (int l = 0; l <= G1LF_MAX_LMAX; l++) {
             if (l >= nl) continue;
@@ -385,6 +476,7 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
               const F wr = w * R[l];
               gx += wr * Gb[3 * lm]; gy += wr * Gb[3 * lm + 1]; gz += wr * Gb[3 * lm + 2];
             }
+          }
           }
           F rad = 0.0f;
 #pragma unroll
@@ -400,11 +492,11 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
         if (tid < NBR * NR) { Fs[3 * tid] = fx; Fs[3 * tid + 1] = fy; Fs[3 * tid + 2] = fz; }
       }
       t.team_barrier();
-      if (tid < nb && mus[tid] >= 0) {
-        const int b = tid, j = js[b];
+      if (tid < NBR && sb + tid < nb && mus[sb + tid] >= 0) {
+        const int b = sb + tid, j = js[b];
         F fx = 0.0f, fy = 0.0f, fz = 0.0f;
         for (int c = 0; c < NR; c++) {
-          fx += Fs[3 * (b * NR + c)]; fy += Fs[3 * (b * NR + c) + 1]; fz += Fs[3 * (b * NR + c) + 2];
+          fx += Fs[3 * (tid * NR + c)]; fy += Fs[3 * (tid * NR + c) + 1]; fz += Fs[3 * (tid * NR + c) + 2];
         }
         Kokkos::atomic_add(&f(i, 0), (typename Traits::kk_acc_float) fx);
         Kokkos::atomic_add(&f(i, 1), (typename Traits::kk_acc_float) fy);
@@ -424,6 +516,7 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
         }
       }
       t.team_barrier();
+      }
     }
     if (do_v && tid < NBR)
       for (int k = 0; k < 6; k++) Kokkos::atomic_add(&vir(ii + co, k), v[k]);
@@ -432,7 +525,8 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
       t.team_reduce(Kokkos::Sum<double>(s));
       if (tid == 0) Kokkos::atomic_add(&dedl(), s);
     }
-  });
+  };
+  GraceFusedKK::fbwd_launch<DeviceType, G1LF_TEAM>("g1lf:bond_bwd", cs, shmem, body);
 }
 // dense-chain kernels and metadata: shared with grace/2l/fused/kk in grace_fused_kokkos_dense.h
 template<class DeviceType, class Traits>
@@ -573,7 +667,7 @@ void Grace1LFusedKK<DeviceType, Traits>::red_fwd()
   auto rho = this->d_rho;
   auto type = this->type; auto ilist = this->d_ilist;
   const int no = this->rho_n_out;
-  Kokkos::parallel_for("g1lf:Reduce", Kokkos::RangePolicy<DeviceType>(0, cs * nblk * NQ), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("g1lf:Reduce", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nblk * NQ), KOKKOS_LAMBDA(const int q) {
     const int ii = q % cs, r = q / cs, blk = r / NQ, kq = r - blk * NQ;
     const int ty = type(ilist[ii + co]);
     F4 acc = F4{0.f, 0.f, 0.f, 0.f};
@@ -608,14 +702,25 @@ void Grace1LFusedKK<DeviceType, Traits>::red_bwd()
   auto gr = this->d_rho_adj;
   auto type = this->type; auto ilist = this->d_ilist;
   const int no = this->rho_n_out;
-  Kokkos::parallel_for("g1lf:RevReduce", Kokkos::RangePolicy<DeviceType>(0, cs * gtot), KOKKOS_LAMBDA(const int q) {
+  // the weight / output views of a thread selected as raw pointers and strides, as the 2L reverse reducers (a view
+  // selected by reference lives in scratch memory: MI250X 1L W-bcc-31k RevReduce 5.89 -> 4.30 ms per call)
+  const F *wp0 = W0.data(), *wp1 = W1.data(), *wp2 = W2.data(), *wp3 = W3.data();
+  const long a0 = W0.stride(0), a1 = W1.stride(0), a2 = W2.stride(0), a3 = W3.stride(0);
+  const long b0 = W0.stride(1), b1 = W1.stride(1), b2 = W2.stride(1), b3 = W3.stride(1);
+  const long e0 = W0.stride(2), e1 = W1.stride(2), e2 = W2.stride(2), e3 = W3.stride(2);
+  F *xp0 = dX0.data(), *xp1 = dX1.data(), *xp2 = dX2.data(), *xp3 = dX3.data();
+  const long xa0 = dX0.stride(0), xa1 = dX1.stride(0), xa2 = dX2.stride(0), xa3 = dX3.stride(0);
+  const long xb0 = dX0.stride(1), xb1 = dX1.stride(1), xb2 = dX2.stride(1), xb3 = dX3.stride(1);
+  const long xc0 = dX0.stride(2), xc1 = dX1.stride(2), xc2 = dX2.stride(2), xc3 = dX3.stride(2);
+  Kokkos::parallel_for("g1lf:RevReduce", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * gtot), KOKKOS_LAMBDA(const int q) {
     const int g = q / cs, ii = q - g * cs;
     const int xs = (g >= gb3) ? 3 : (g >= gb2) ? 2 : (g >= gb1) ? 1 : 0;
     const int fi = g - ((xs == 0) ? 0 : (xs == 1) ? gb1 : (xs == 2) ? gb2 : gb3);
     const int nin = (xs == 0) ? n0 : (xs == 1) ? n1 : (xs == 2) ? n2 : n3;
-    const auto &W = (xs == 0) ? W0 : (xs == 1) ? W1 : (xs == 2) ? W2 : W3;
-    const auto &dX = (xs == 0) ? dX0 : (xs == 1) ? dX1 : (xs == 2) ? dX2 : dX3;
     const int ty = type(ilist[ii + co]);
+    const F *Wt = (xs == 0) ? wp0 + ty * a0 : (xs == 1) ? wp1 + ty * a1 : (xs == 2) ? wp2 + ty * a2 : wp3 + ty * a3;
+    const long wt = (xs == 0) ? b0 : (xs == 1) ? b1 : (xs == 2) ? b2 : b3;
+    const long wn = (xs == 0) ? e0 : (xs == 1) ? e1 : (xs == 2) ? e2 : e3;
     F4 gk[NQ];
     for (int k = 0; k < NQ; k++) {
       F v[4];
@@ -625,18 +730,21 @@ void Grace1LFusedKK<DeviceType, Traits>::red_bwd()
     F acc[NIN];
     for (int n = 0; n < NIN; n++) acc[n] = 0.0f;
     for (int c = roff(g); c < roff(g + 1); c++) {
-      const int t = rtile(c);
+      const F *Wb = Wt + rtile(c) * wt;
 #pragma unroll
       for (int n = 0; n < NIN; n++) {
         if (n >= nin) continue;
-        const F4 *wr = reinterpret_cast<const F4 *>(&W(ty, t, n, 0));
+        const F4 *wr = reinterpret_cast<const F4 *>(Wb + n * wn);
         F s = 0.0f;
         for (int k = 0; k < NQ; k++) s += dot4(wr[k], gk[k]);
         acc[n] += s;
       }
     }
+    F *Xb = (xs == 0) ? xp0 + ii * xa0 + fi * xc0 : (xs == 1) ? xp1 + ii * xa1 + fi * xc1 :
+            (xs == 2) ? xp2 + ii * xa2 + fi * xc2 : xp3 + ii * xa3 + fi * xc3;
+    const long xn = (xs == 0) ? xb0 : (xs == 1) ? xb1 : (xs == 2) ? xb2 : xb3;
 #pragma unroll
-    for (int n = 0; n < NIN; n++) if (n < nin) dX(ii, n, fi) = acc[n];
+    for (int n = 0; n < NIN; n++) if (n < nin) Xb[n * xn] = acc[n];
   });
 }
 
@@ -647,11 +755,37 @@ void Grace1LFusedKK<DeviceType, Traits>::red_bwd()
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::stage_bond_fwd(int, int) { fused_A(); }
 
+// GPU: the run's compact bond list (every bond kernel of the run reads it) and the bond kernels for this model; one
+// line on stderr per process: the kernels of the first run and why. The wave-per-atom backward is the default on HIP
+// only: on CUDA the team-of-256 kernel is faster for 1L (A100, g1lf:bond_bwd 77 vs 88 ms per call, C-diamond-125k).
+template<class DeviceType, class Traits>
+void Grace1LFusedKK<DeviceType, Traits>::begin_run()
+{
+  if constexpr (is_gpu_v<DeviceType>) {
+    GraceFusedKK::compact_bonds<DeviceType, Traits>(this->inum, this->maxneigh, this->x, this->type, this->d_map,
+        this->d_neighbors, this->d_numneigh, this->d_ilist, this->d_bond_cutoff, this->couple_eq, this->couple_bit1,
+        this->couple_bit2, this->couple_lambda, this->d_mask, d_cnb, d_cnum);
+    bonds_ready = true;
+    const int lmax = this->lmax, NR = this->nradmax;
+    const KernelChoice a = GraceFusedKK::fused_mfma(GraceFusedKK::a_fwd_mfma_fits<DeviceType>(lmax, NR));
+    const KernelChoice w = GraceFusedKK::fused_wave_bwd(GraceFusedKK::bond_bwd_wave_fits<DeviceType>(lmax, NR),
+                                                        is_hip_v<DeviceType>);
+    a_mfma = a.on;
+    bwd_wave = w.on;
+    static std::once_flag logged;
+    std::call_once(logged, [&] {
+      std::fprintf(stderr, "grace kk: GRACE-1L bond kernels: basis A on the %s, bond backward on the %s kernel (%s); "
+                   "dense FCs on the %s kernels\n", GraceFusedKK::fused_mfma_says(a).c_str(),
+                   w.on ? "wave-per-atom" : "team-of-256", w.why.c_str(), fcm_A1.mfma_f ? "matrix-core" : "vector-ALU");
+    });
+  }
+}
+
 #define G1LF_SHAPE_FWD(P, Lv, Rv, Ov)                                                                  \
   {                                                                                                 \
     auto L_ = Lv; auto R_ = Rv; auto O_ = Ov;                                                       \
     const int cs = this->chunk_size, nc = (int) O_.extent(1);                                       \
-    Kokkos::parallel_for("g1lf:ShapeProd_" #P, Kokkos::RangePolicy<DeviceType>(0, cs * nc),         \
+    Kokkos::parallel_for("g1lf:ShapeProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),         \
       KOKKOS_LAMBDA(const int q) {                                                                  \
         const int k = q / cs, ii = q - k * cs;                                                      \
         G1LShape_L::fwd_##P(L_, R_, O_, ii, k);                                                     \
@@ -661,7 +795,7 @@ void Grace1LFusedKK<DeviceType, Traits>::stage_bond_fwd(int, int) { fused_A(); }
   {                                                                                                 \
     auto L_ = Lv; auto R_ = Rv; auto D_ = Dv; auto dL_ = dLv; auto dR_ = dRv;                       \
     const int cs = this->chunk_size, nc = (int) D_.extent(1), nx = (int) dL_.extent(2), ng = NG;    \
-    Kokkos::parallel_for("g1lf:ShapeRevProd_" #P, Kokkos::RangePolicy<DeviceType>(0, cs * nc),      \
+    Kokkos::parallel_for("g1lf:ShapeRevProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),      \
       KOKKOS_LAMBDA(const int q) {                                                                  \
         const int k = q / cs, ii = q - k * cs;                                                      \
         G1LShape_L::rev_##P(L_, R_, D_, dL_, dR_, ii, k);                                           \

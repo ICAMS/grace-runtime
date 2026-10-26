@@ -15,7 +15,9 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -82,6 +84,29 @@ struct Result {
   double e = 0;
   std::vector<double> f;
 };
+
+// the allocations in the memory space of Dev made while tracked (Kokkos Tools callbacks) and not yet freed
+std::map<const void *, std::pair<uint64_t, std::string>> live_allocs;
+void on_alloc(Kokkos::Profiling::SpaceHandle h, const char *name, const void *p, uint64_t n)
+{
+  if (std::strcmp(h.name, Dev::memory_space::name()) == 0) live_allocs[p] = {n, name};
+}
+void on_dealloc(Kokkos::Profiling::SpaceHandle, const char *, const void *p, uint64_t)
+{
+  live_allocs.erase(p);
+}
+void track_allocs(bool on)
+{
+  live_allocs.clear();
+  Kokkos::Tools::Experimental::set_allocate_data_callback(on ? on_alloc : nullptr);
+  Kokkos::Tools::Experimental::set_deallocate_data_callback(on ? on_dealloc : nullptr);
+}
+uint64_t live_bytes()
+{
+  uint64_t b = 0;
+  for (const auto &a : live_allocs) b += a.second.first;
+  return b;
+}
 
 // a cell as CSR bonds (offset, j, rij per bond) through the engine with the layered owner <-> image exchange
 template<class Eng> Result run_csr(Eng &eng, int n, std::vector<double> pos, const std::vector<int> &type, int ntypes,
@@ -305,6 +330,29 @@ void smoke(const std::shared_ptr<grace::GRACE3LModel> &m)
     std::printf("fp32 W54 translated by 500 A: dE/n %.3e  max|dF| %.3e\n", std::fabs(a.e - b.e) / 54, df);
     CHECK(std::fabs(a.e - b.e) / 54 <= 1e-6 && df <= 5e-6);
   }
+  // test_release_buffers_frees_device_memory: release_buffers() (Python: free_gpu_memory) gives back the work buffers
+  // of a run on 250 atoms (MI250X: 466 MB); what stays allocated on the device beyond setup() (one-atom buffers, the
+  // tables built on first use: 1.9 MB) is below 4 MB
+  {
+    Cell c = lattice_cell(3.165, {{0, 0, 0}, {.5, .5, .5}}, {1, 1}, 5, 0.08, {"W"});
+    std::vector<int> map = {-1, t2m[1]};
+    E3 e;
+    e.set_model(m, map);
+    e.setup();
+    track_allocs(true);
+    run_csr(e, c.n, c.pos, c.type, c.ntypes, c.cell.data(), c.offset, c.j.data(), c.rij.data());
+    const uint64_t used = live_bytes();
+    e.release_buffers();
+    const uint64_t kept = live_bytes();
+    std::printf("release_buffers: %.1f MB on the device after a run of %d atoms, %.3f MB after the release\n",
+                used / 1048576.0, c.n, kept / 1048576.0);
+    if (kept >= (4u << 20))
+      for (const auto &a : live_allocs)
+        if (a.second.first >= 65536) std::printf("  kept: %s %.3f MB\n", a.second.second.c_str(), a.second.first / 1048576.0);
+    track_allocs(false);
+    CHECK(used > (8u << 20));    // the run's work buffers were seen
+    CHECK(kept < (4u << 20));
+  }
   // test_fp32_matches_mixed_multi_element: <float,float> within 1e-5 eV/A, 1e-6 eV/atom of <float,double> on
   // multi-element cells with short bonds and large forces (perovskite SrTiO3; a 25-element bcc solid solution)
   {
@@ -346,10 +394,8 @@ void smoke(const std::shared_ptr<grace::GRACE3LModel> &m)
         fold.fc_fold = 1;
         fold.fuse_radial = 1;
         double dev_gb = 0.0;
-#ifdef KOKKOS_ENABLE_CUDA
         size_t fr = 0, tot = 0;
-        if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) dev_gb = (double) tot / 1e9;
-#endif
+        if (grace::kk::device_mem_info(fr, tot)) dev_gb = (double) tot / 1e9;
         // tables for all 625 HEA25 pairs (9.4 GB) where the device has room; auto otherwise
         const bool want_tables = c.ntypes <= 3 || dev_gb >= 20.0;
         fold.spline_mb = (c.ntypes > 3 && want_tables) ? 12000.0 : -1.0;
@@ -357,10 +403,14 @@ void smoke(const std::shared_ptr<grace::GRACE3LModel> &m)
         plain.setup();
         fold.set_model(m, map);
         fold.setup();
-        CHECK(fold.fold_on[0] && fold.fold_on[1] && fold.fold_on[2]);
+        // GPU: fc_fold (where a BLAS backend is available) and the fused L1 radial are not deselected silently
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+        if (grace::kk::blas::available()) CHECK(fold.fold_on[0] && fold.fold_on[1] && fold.fold_on[2]);
         if (want_tables) CHECK(fold.spline_on && fold.l1_radial_fused());
+#endif
+        auto &cr = c;    // clang (hipcc) with -fopenmp cannot capture the structured binding c
         auto run = [&](E3F &e) {
-          return run_csr(e, c.n, c.pos, c.type, c.ntypes, c.cell.data(), c.offset, c.j.data(), c.rij.data());
+          return run_csr(e, cr.n, cr.pos, cr.type, cr.ntypes, cr.cell.data(), cr.offset, cr.j.data(), cr.rij.data());
         };
         plain.chunksize = fold.chunksize = 0;
         const Result a = run(plain), b = run(fold);

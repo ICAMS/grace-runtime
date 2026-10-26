@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 
 using Dev = Kokkos::DefaultExecutionSpace;
 using T = grace::kk::DefaultTraits<Dev>;
@@ -29,6 +30,11 @@ template class grace::kk::Grace3LKK<Dev, float, float, T>;
 
 namespace {
 using namespace kkt;
+
+// a View64 does not pass as a plain view (whose int indices would wrap again): only through .base()
+using PlainV = Kokkos::View<float ***, Kokkos::LayoutRight, Dev>;
+static_assert(!std::is_convertible_v<grace::kk::View64<PlainV>, const PlainV &>);
+static_assert(std::is_convertible_v<PlainV, grace::kk::View64<PlainV>>);
 
 // the 2^31-element guards without large allocations: a plain view above 2^31 elements is refused before it is
 // allocated; chunksize auto keeps a work buffer of 10000 values per atom below 2^31 elements for 10^6 atoms

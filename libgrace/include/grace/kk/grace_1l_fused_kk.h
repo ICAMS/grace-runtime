@@ -6,6 +6,7 @@
 
 #include "grace/kk/grace_1l_kk.h"
 #include "grace/kk/fused_dense.h"
+#include "grace/kk/fused_hip_bonds.h"
 
 #include <array>
 #include <vector>
@@ -28,6 +29,11 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   // checks the model against the compiled kernels, builds the dense metadata and the radial tables
   void setup() override;
   typename Base::RunOutput run(const typename Base::RunInput &in) override;
+  void release_buffers() override
+  {
+    Base::release_buffers();
+    MemKK::drop(d_vir, d_cnb, d_cnum);
+  }
   int spline_n = 1024;                  // cubic-Hermite intervals of the radial tables ('spline' keyword)
   int no_shape = 0;                     // 'noshape': generic CG products
 
@@ -44,6 +50,14 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   void fused_bond_bwd();
   template<bool CPL> void fused_A_c();          // CPL: two-group coupling
   template<bool CPL> void fused_bond_bwd_c();
+  void begin_run() override;                     // GPU: d_cnb / d_cnum and the bond kernels of the run
+  // the bonds the bond kernels read (BondList, fused_hip_bonds.h): on a GPU the run's compact list
+  auto bond_list() const
+  {
+    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("grace/1l/fused/kk: bond kernel without the run's bond list");
+    return GraceFusedKK::BondList<Traits, is_gpu_v<DeviceType>, decltype(this->d_neighbors), decltype(this->d_numneigh),
+                                  V2<int>, V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
+  }
 
   using FCMeta = GraceFusedKK::FCMetaT<DeviceType>;
   using ProdMeta = GraceFusedKK::ProdMetaT<DeviceType>;
@@ -76,6 +90,10 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   V3<F> d_splR;                         // [N][nradmax * (lmax+1)][4] cubic coefficients in t
   V1<int> d_lfrom;                      // l of lm
   V2<double> d_vir;                     // [inum][6]
+  V2<int> d_cnb;                        // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+  V1<int> d_cnum;                       //      and their number, [inum]
+  bool bonds_ready = false;             // GPU: d_cnb / d_cnum built for the current run (begin_run .. end of run)
+  bool a_mfma = false, bwd_wave = false;    // basis A on the matrix cores (HIP), wave-per-atom backward (this run)
   FCMeta fcm_A1, fcm_AA1, fcm_AA2;
   ProdMeta pm_AA, pm_AAA, pm_AAAA;
   RedMeta rm;

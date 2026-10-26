@@ -6,10 +6,15 @@
 #include "grace/error.h"
 #include "grace/uq.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace grace {
+namespace cnpy {
+struct NpyArray;
+}
+
 
 // ============================================================================
 // GRACE1LModel: Host-side weight container loaded from .npz file
@@ -26,9 +31,8 @@ struct GRACE1LModel {
   bool has_bond_specific_cutoff = false;
   std::vector<double> bond_cutoff_map;  // [n_elements * n_elements] per-pair cutoffs
 
-  // MLP radial function
+  // MLP radial function (of the bond length only: the loader rejects a chem-embedded one)
   int mlp_rad_n_layers = 0;
-  bool mlp_rad_has_chem_emb = false;
 
   // Chemical embedding [n_elements, embedding_size]
   std::vector<double> chem_embedding;
@@ -46,7 +50,7 @@ struct GRACE1LModel {
   };
   std::vector<MLPLayer> mlp_rad_layers;
 
-  // FC weights (A1, AA1, AA2)
+  // FC weights (A1, AA1, AA2); left weights in every FC (left_coefs = 1, checked by the loader)
   struct FCWeights {
     std::vector<double> w_left, w_right;
     std::vector<int> w_tile_left, w_tile_right;
@@ -54,7 +58,6 @@ struct GRACE1LModel {
     std::vector<double> norm_out_factor;
     double norm_left = 1.0, norm_right = 1.0;
     int n_out = 0;
-    bool left_coefs = true;
     int n_funcs_left = 0, n_funcs_right = 0;
     int w_shape_left = 0, w_shape_right = 0;
   };
@@ -69,7 +72,7 @@ struct GRACE1LModel {
   };
   CGProduct prod_AA, prod_AAA, prod_AAAA;
 
-  // FunctionReduceN (rho)
+  // FunctionReduceN (rho; weights per central element, checked by the loader)
   struct ReduceWeights {
     std::vector<double> W;  // [n_elements, n_out, n_in, w_shape]
     double norm = 1.0;
@@ -79,7 +82,6 @@ struct GRACE1LModel {
     std::vector<int> total_sum_ind;
   };
   int rho_n_out = 0;
-  bool rho_is_elem_dependent = true;
   ReduceWeights reduce_A, reduce_AA, reduce_AAA, reduce_AAAA;
 
   // Energy MLP
@@ -118,6 +120,8 @@ struct GRACE1LModel {
   std::vector<double> uq_rp_matrix;          // [D_basis*rp_dim] row-major projection R
 
   void load(const std::string &filepath);
+  // load() of an archive already read (key -> array), e.g. a modified copy in a test
+  void load_arrays(const std::map<std::string, cnpy::NpyArray> &npz);
 
   // throws grace::Error unless the model carries a usable schema-6 UQ head
 

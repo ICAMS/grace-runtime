@@ -421,7 +421,6 @@ Grace1LFused::Grace1LFused(std::shared_ptr<const GRACE1LModel> m, FusedSettings 
 {
   spline_n = s.spline_n;
   if (spline_n < 16) throw Error("pair grace/1l/fused: spline N must be >= 16");
-  if (model->mlp_rad_has_chem_emb) throw Error("pair grace/1l/fused: chem-embedded radial MLP not supported");
   g_prof_on = getenv("G2LF_PROF") != nullptr;
 }
 
@@ -523,7 +522,7 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   const bool uq_on = fl.uq;
   const bool eonly = fl.energy_only;    // no backward pass: no forces, no virials
   if (uq_on && !uq_ready) throw Error("grace/1l/fused: UQ requested before enable_uq()");
-  if (uq_on && !(out.gamma && out.atomic_sigma && out.gmm_cluster))
+  if (uq_on && inum > 0 && !(out.gamma && out.atomic_sigma && out.gmm_cluster))    // no atoms: nothing written
     throw Error("grace/1l/fused: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
   fthr.ensure(nthreads, nmax_nodes);
   double eng = 0.0;

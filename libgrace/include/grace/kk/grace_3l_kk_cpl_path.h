@@ -42,9 +42,32 @@ KOKKOS_INLINE_FUNCTION constexpr bool cand(int l1, int l2, int L, int m1, int m2
 
 constexpr bool valid(int l1, int l2, int L) { return iabs(l1 - l2) <= L && L <= l1 + l2 && L <= LMAX; }
 
-struct alignas(16) F4 { float v[4]; };
-#define G3L_PATH_CG(k) (((k) & 3) == 0 ? (c4 = cg4[(k) >> 2], c4.v[0]) : c4.v[(k) & 3])
+// Table reads (ob / pr / pt, cg, fcol): the same address in every lane and read-only in the kernel. HIP reads them
+// through the constant address space, i.e. as scalar loads into SGPRs; as generic loads they were one vector load per
+// lane through the texture path (CPLCouplePath: 882 vector, 17 scalar loads).
+template<class T>
+KOKKOS_FORCEINLINE_FUNCTION T uld(const T *p)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+  return *(const __attribute__((address_space(4))) T *) p;
+#else
+  return *p;
+#endif
+}
 
+struct alignas(16) F4 { float v[4]; };
+// HIP: per float (clang does not copy a struct with an array member out of address space 4); the scalar loads merge
+KOKKOS_FORCEINLINE_FUNCTION F4 uld(const F4 *p)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+  return F4{{uld(p->v), uld(p->v + 1), uld(p->v + 2), uld(p->v + 3)}};
+#else
+  return *p;
+#endif
+}
+#define G3L_PATH_CG(k) (((k) & 3) == 0 ? (c4 = uld(cg4 + ((k) >> 2)), c4.v[0]) : c4.v[(k) & 3])
+
+// the table pointers point into global memory (uld reads them through the constant address space on HIP)
 struct Tabs {
   const int *ob, *pr, *pt;
   const float *cg;
@@ -67,7 +90,7 @@ KOKKOS_FORCEINLINE_FUNCTION void p_fwd(const float *x, const float *y, float *O,
 #pragma unroll
         for (int m2 = -l2; m2 <= l2; m2++)
           if (cand(l1, l2, L, m1, m2, M)) { v += G3L_PATH_CG(k) * x[m1 + l1] * y[m2 + l2]; k++; }
-      O[fcol[M + L] * so] = v;
+      O[uld(fcol + M + L) * so] = v;
     }
   }
 }
@@ -80,7 +103,7 @@ KOKKOS_FORCEINLINE_FUNCTION void p_vl(float *g, const float *y, const float *D, 
     int k = 0;
 #pragma unroll
     for (int M = -L; M <= L; M++) {
-      const float d = D[fcol[M + L] * sd];
+      const float d = D[uld(fcol + M + L) * sd];
 #pragma unroll
       for (int m1 = -l1; m1 <= l1; m1++)
 #pragma unroll
@@ -98,7 +121,7 @@ KOKKOS_FORCEINLINE_FUNCTION void p_vr(float *g, const float *x, const float *D, 
     int k = 0;
 #pragma unroll
     for (int M = -L; M <= L; M++) {
-      const float d = D[fcol[M + L] * sd];
+      const float d = D[uld(fcol + M + L) * sd];
 #pragma unroll
       for (int m1 = -l1; m1 <= l1; m1++)
 #pragma unroll
@@ -118,7 +141,7 @@ KOKKOS_FORCEINLINE_FUNCTION void p_vb(float *gl, float *gr, const float *x, cons
     int k = 0;
 #pragma unroll
     for (int M = -L; M <= L; M++) {
-      const float d = D[fcol[M + L] * sd];
+      const float d = D[uld(fcol + M + L) * sd];
 #pragma unroll
       for (int m1 = -l1; m1 <= l1; m1++)
 #pragma unroll
@@ -155,9 +178,9 @@ KOKKOS_FORCEINLINE_FUNCTION void pair_run(const Tabs &tb, float *o, const float 
   }
   for (int t = t0; t < t1; t++) {
     const int *q = tb.pt + 3 * t;
-    const int L = q[0];
-    const float *cg = tb.cg + q[2];
-    const int *fc = tb.fcol + q[1];
+    const int L = uld(q);
+    const float *cg = tb.cg + uld(q + 2);
+    const int *fc = tb.fcol + uld(q + 1);
     if (MODE == 0) { G3L_PATH_SWL(p_fwd, LO, LI, o, in, O, so, cg, fc) }
     else if (MODE == 1) { G3L_PATH_SWL(p_vl, LO, LI, o, in, D, sd, cg, fc) }
     else if (MODE == 2) { G3L_PATH_SWL(p_vr, LI, LO, o, in, D, sd, cg, fc) }
@@ -178,25 +201,25 @@ KOKKOS_FORCEINLINE_FUNCTION void block_run(const Tabs &tb, int b, const float *X
   float o[2 * LO + 1], xo[2 * LO + 1];
 #pragma unroll
   for (int i = 0; i < 2 * LO + 1; i++) {
-    xo[i] = (MODE == 0 || MODE == 3) ? Xo[(bo[1] + i) * sxo] : 0.0f;
+    xo[i] = (MODE == 0 || MODE == 3) ? Xo[(uld(bo + 1) + i) * sxo] : 0.0f;
     o[i] = MODE == 0 ? xo[i] : 0.0f;
   }
-  for (int p = bo[2]; p < bo[3]; p++) {
+  for (int p = uld(bo + 2); p < uld(bo + 3); p++) {
     const int *q = tb.pr + 4 * p;
-    const float *xi = Xi + q[1] * sxi;
-    float *gi = MODE == 3 ? Gi + q[1] * sgi : nullptr;
-    switch (q[0]) {
-      case 0: pair_run<MODE, LO, 0>(tb, o, xo, xi, sxi, gi, sgi, q[2], q[3], O, so, D, sd); break;
-      case 1: pair_run<MODE, LO, 1>(tb, o, xo, xi, sxi, gi, sgi, q[2], q[3], O, so, D, sd); break;
-      case 2: pair_run<MODE, LO, 2>(tb, o, xo, xi, sxi, gi, sgi, q[2], q[3], O, so, D, sd); break;
-      case 3: pair_run<MODE, LO, 3>(tb, o, xo, xi, sxi, gi, sgi, q[2], q[3], O, so, D, sd); break;
-      case 4: pair_run<MODE, LO, 4>(tb, o, xo, xi, sxi, gi, sgi, q[2], q[3], O, so, D, sd); break;
+    const float *xi = Xi + uld(q + 1) * sxi;
+    float *gi = MODE == 3 ? Gi + uld(q + 1) * sgi : nullptr;
+    switch (uld(q)) {
+      case 0: pair_run<MODE, LO, 0>(tb, o, xo, xi, sxi, gi, sgi, uld(q + 2), uld(q + 3), O, so, D, sd); break;
+      case 1: pair_run<MODE, LO, 1>(tb, o, xo, xi, sxi, gi, sgi, uld(q + 2), uld(q + 3), O, so, D, sd); break;
+      case 2: pair_run<MODE, LO, 2>(tb, o, xo, xi, sxi, gi, sgi, uld(q + 2), uld(q + 3), O, so, D, sd); break;
+      case 3: pair_run<MODE, LO, 3>(tb, o, xo, xi, sxi, gi, sgi, uld(q + 2), uld(q + 3), O, so, D, sd); break;
+      case 4: pair_run<MODE, LO, 4>(tb, o, xo, xi, sxi, gi, sgi, uld(q + 2), uld(q + 3), O, so, D, sd); break;
       default: break;
     }
   }
   if (MODE != 0) {
 #pragma unroll
-    for (int i = 0; i < 2 * LO + 1; i++) Go[(bo[1] + i) * sgo] = o[i];
+    for (int i = 0; i < 2 * LO + 1; i++) Go[(uld(bo + 1) + i) * sgo] = o[i];
   }
 }
 
@@ -208,7 +231,7 @@ KOKKOS_INLINE_FUNCTION void run(const Tabs &tb, const float *Xo, long sxo, float
                                 long sgi = 0)
 {
   for (int b = 0; b < tb.nob; b++) {
-    switch (tb.ob[4 * b]) {
+    switch (uld(tb.ob + 4 * b)) {
       case 0: block_run<MODE, 0>(tb, b, Xo, sxo, Go, sgo, Xi, sxi, Gi, sgi, O, so, D, sd); break;
       case 1: block_run<MODE, 1>(tb, b, Xo, sxo, Go, sgo, Xi, sxi, Gi, sgi, O, so, D, sd); break;
       case 2: block_run<MODE, 2>(tb, b, Xo, sxo, Go, sgo, Xi, sxi, Gi, sgi, O, so, D, sd); break;

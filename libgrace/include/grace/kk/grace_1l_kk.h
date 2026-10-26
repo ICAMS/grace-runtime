@@ -14,10 +14,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_DualView.hpp>
 #include <Kokkos_ScatterView.hpp>
-#ifdef KOKKOS_ENABLE_CUDA
-#include <cublas_v2.h>
-#include "grace/kk/cublas_guard.h"
-#endif
+#include "grace/kk/blas.h"
 
 #include <memory>
 #include <type_traits>
@@ -41,7 +38,7 @@ class Grace1LKK {
   struct TagComputeMLPRadial{};
   struct TagComputeAi{};
   // FC, Product, ReduceN dispatched via inline lambdas in compute()
-  struct TagComputeMLPEnergy{};
+  struct TagComputeMLPEnergyR{};    // the energy MLP, a thread per atom
   struct TagComputeDerivative{};
   struct TagComputeUQ{};   // extrapolation grade (gamma) + error model — forward only
 #ifdef KOKKOS_ENABLE_CUDA
@@ -137,7 +134,7 @@ class Grace1LKK {
   void operator() (TagComputeAi, const typename Kokkos::TeamPolicy<DeviceType, TagComputeAi>::member_type& team) const;
 
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagComputeMLPEnergy, const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPEnergy>::member_type& team) const;
+  void operator() (TagComputeMLPEnergyR, const int ii) const;
 
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeDerivative, const typename Kokkos::TeamPolicy<DeviceType, TagComputeDerivative>::member_type& team) const;
@@ -193,6 +190,9 @@ class Grace1LKK {
   bool setup_done = false;    // setup() after the last set_model(): run() refuses otherwise
   void set_type_map(const std::vector<int> &type2mu);    // h_type2model, d_map, cutsq
   virtual void retype() {}    // type-dependent parts of the derived engines (after set_type_map)
+  // run(): x, the neighbour list, ilist (type-sorted) and maxneigh are set, before the chunk decision and the first
+  // stage (the fused engines build their run-wide bond list and buffers here, so the chunk decision sees them)
+  virtual void begin_run() {}
   int neighflag;
 
   // Architecture params (copied from GRACE1LModel for device access)
@@ -232,9 +232,12 @@ class Grace1LKK {
   };
   TypeTables type_tables() const { return {h_type2model, d_map, k_cutsq, save_derived_types()}; }
   // the per-atom buffers shrunk to one atom; weights and type tables stay, the next run() grows the buffers again
-  void release_buffers()
+  virtual void release_buffers()
   {
     if (!setup_done) return;
+    // the caller's views of the last run() (positions, forces, neighbour list, outputs) and the per-atom type order
+    MemKK::drop(x, f, type, d_numneigh, d_neighbors, d_ilist, d_mask, d_eatom, d_vatom, d_cvatom, d_ilist_sorted,
+                d_type_key);
     realloc_all = true;
     grow(1, 1);
     realloc_all = true;
@@ -338,8 +341,6 @@ class Grace1LKK {
 
   // A indicator transform
   t_nn_2d d_A_lin_W;           // [embedding_size, nradmax]
-  NNScalar A_lin_norm;
-  GeomScalar inv_avg_n_neigh;
 
   // Precomputed z_tr[mu,n] = A_lin_norm * inv_avg_n_neigh * Σ_e A_lin_W[e,n] * chem_embed[mu,e]
   t_nn_2d d_z_tr;              // [n_elements, nradmax]
@@ -567,15 +568,13 @@ class Grace1LKK {
   void mlp_cublas_selftest();
   // cuBLAS DGEMM UQ projection: build gather map (once), then per sub-block
   // gather Bmat -> cublasDgemm proj = R·Bmat -> GMM finish. Runs on the current
-  // chunk (chunk_size/chunk_offset). Falls back to nothing if cublas_handle null.
+  // chunk (chunk_size/chunk_offset). Falls back to nothing if blas_handle null.
   void compute_uq_cublas();
  protected:
-  cublasHandle_t cublas_handle = nullptr;
-  bool fc_fused = false;    // a derived engine does the FC layers itself (no cuBLAS needed)
-  bool fc_ops_on() const { return cublas_handle != nullptr || fc_fused; }
-  // owner of cublas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
+  blas::handle_t blas_handle = nullptr;
+  // owner of blas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
   // copy it too): the last copy destroys the handle
-  std::shared_ptr<std::remove_pointer_t<cublasHandle_t>> cublas_owner;
+  std::shared_ptr<std::remove_pointer_t<blas::handle_t>> blas_owner;
   FCCublasOp fc_op_AA1, fc_op_AA2;
   t_nn_1d d_fc_G, d_fc_C;         // shared gather / GEMM-output scratch (float)
   int fc_cublas_max_nin = 0, fc_cublas_max_nout = 0, fc_cublas_max_N = 0;

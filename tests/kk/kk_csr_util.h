@@ -82,6 +82,32 @@ Ref load_ref(const std::string &stem, int n)
   t >> step >> r.etot >> r.p[0] >> r.p[1] >> r.p[2] >> r.p[3] >> r.p[4] >> r.p[5];
   return r;
 }
+// the cell with its type-1 atoms first; keep2 false: without the type-2 atoms and every bond to them
+Cell type1_first(const Cell &c, bool keep2)
+{
+  std::vector<int> order, at(c.n, -1);
+  for (int t : {1, 2})
+    for (int a = 0; a < c.n; a++)
+      if (c.type[a] == t && (t == 1 || keep2)) at[a] = (int) order.size(), order.push_back(a);
+  Cell r;
+  r.n = (int) order.size();
+  r.cell = c.cell;
+  r.volume = c.volume;
+  r.offset = {0};
+  for (int o : order) {
+    r.type.push_back(c.type[o]);
+    r.sys.push_back(0);
+    r.pos.insert(r.pos.end(), c.pos.begin() + 3 * o, c.pos.begin() + 3 * o + 3);
+    for (int64_t b = c.offset[o]; b < c.offset[o + 1]; b++)
+      if (at[c.j[b]] >= 0) {
+        r.j.push_back(at[c.j[b]]);
+        r.rij.insert(r.rij.end(), c.rij.begin() + 3 * b, c.rij.begin() + 3 * b + 3);
+      }
+    r.offset.push_back((int64_t) r.j.size());
+  }
+  return r;
+}
+
 std::vector<int> type2mu_for(const std::vector<std::string> &names)
 {
   std::vector<int> t2m(3, -1);
@@ -99,6 +125,15 @@ struct Result {
   std::vector<double> sys_e, sys_vir;    // batch: per system energy, virial [nsys][6]
   int nimages = 0;
 };
+// a run as the reference of another (the fp64 engine of the same model); the pressure from its virial
+Ref to_ref(const Result &r, double volume)
+{
+  const double nktv2p = 1.6021765e6;    // eV/A^3 -> bar (LAMMPS units metal)
+  Ref ref;
+  ref.f = r.f; ref.pe = r.eatom; ref.etot = r.e;
+  for (int k = 0; k < 6; k++) ref.p[k] = r.vir[k] / volume * nktv2p;
+  return ref;
+}
 
 // two-group coupling (grace/coupling.h): equation, lambda, group bits (1, 2) per local atom
 struct Couple {
@@ -109,8 +144,9 @@ struct Couple {
 // xblock > 0: images per block of the owner <-> image exchange (default: the exchange's own)
 // vglobal false: no global virial (vflag_global 0; per-atom virials still on)
 // sec: when given, the seconds of the engine run alone (fenced)
+// inum >= 0: that many central atoms (0: none, as an MPI rank without local atoms in LAMMPS), default all
 template<class Eng> Result run(Eng &eng, const Cell &c, int nsys = 1, int xblock = 0, bool vglobal = true,
-                               const Couple *cp = nullptr, double *sec = nullptr)
+                               const Couple *cp = nullptr, double *sec = nullptr, int inum = -1)
 {
   grace::kk::CsrImagesKK<Dev, T> img;
   img.build(c.n, c.pos.data(), c.type.data(), c.cell.data(), c.offset.data(), c.j.data(), c.rij.data(),
@@ -120,7 +156,7 @@ template<class Eng> Result run(Eng &eng, const Cell &c, int nsys = 1, int xblock
   typename T::t_kkacc_1d_6 va("va", img.nall);
   typename Eng::RunInput in;
   in.x = img.x; in.f = f; in.type = img.type; in.ilist = img.ilist; in.numneigh = img.numneigh;
-  in.neighbors = img.neighbors; in.inum = c.n; in.nlocal = c.n; in.ntypes = 2;
+  in.neighbors = img.neighbors; in.inum = inum < 0 ? c.n : inum; in.nlocal = c.n; in.ntypes = 2;
   in.eflag_global = 1; in.eflag_atom = 1; in.vflag_global = vglobal ? 1 : 0; in.vflag_atom = 1;
   in.eatom = ea; in.vatom = va;
   typename T::t_int_1d mask;
@@ -183,13 +219,41 @@ template<class Eng> Result run(Eng &eng, const Cell &c, int nsys = 1, int xblock
   return r;
 }
 
-// Tol: energy per atom, per-atom energy, force, pressure (relative). fp64 engines agree with the LAMMPS styles to
+// a first run with no central atoms on a fresh engine (an MPI rank without local atoms): no error, zero energy and
+// forces; the next full run equals a fresh engine's. Kokkos::Max over no atoms gives INT_MIN, from which chunksize
+// auto asked for about 7 GB (GRACE-3L, LAMMPS W2tri on 2 GPU ranks).
+template<class Eng, class M> void check_empty_list(const std::shared_ptr<M> &m, const char *name, const std::string &fx)
+{
+  const Cell c = load_cell(fx + "/WMo54.npz");
+  Eng a, b;
+  a.set_model(m, type2mu_for(m->element_names));
+  a.setup();
+  b.set_model(m, type2mu_for(m->element_names));
+  b.setup();
+  const Result r0 = run(a, c, 1, 0, true, nullptr, nullptr, 0);
+  double f0 = 0, df = 0;
+  for (double v : r0.f) f0 = std::max(f0, std::fabs(v));
+  const Result r1 = run(a, c), r2 = run(b, c);
+  for (size_t q = 0; q < r1.f.size(); q++) df = std::max(df, std::fabs(r1.f[q] - r2.f[q]));
+  std::printf("%s no central atoms: E %g max|F| %g; next run vs fresh engine: dE/n %.3e max|dF| %.3e\n", name, r0.e,
+              f0, std::fabs(r1.e - r2.e) / c.n, df);
+  CHECK(r0.e == 0.0 && f0 == 0.0);
+  CHECK(std::fabs(r1.e - r2.e) / c.n <= 1e-6 && df <= 1e-5);
+}
+
+// Tol: energy per atom, per-atom energy (eV, absolute), force, pressure (relative). fp64 engines agree with the LAMMPS styles to
 // ~1e-14 (same kernels, summation order only); the fused (fp32) ones differ from run to run at the fp32 level (the
-// per-atom energies; their sum is fp64).
+// per-atom energies; their sum is fp64). tol_fp32_2l: the 2L fused engine, per-atom energies 2e-5 on GPUs, where its
+// blocked forward reducers sum in another fp32 order (1.14e-5 eV on WMo54, |e_i| ~ 8-13 eV, i.e. ~1e-6 relative).
 struct Tol {
   double e, ei, f, p;
 };
 constexpr Tol tol_fp64 = {1e-10, 1e-10, 1e-10, 1e-10}, tol_fp32 = {2e-6, 1e-5, 2e-5, 1e-5};
+#if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
+constexpr Tol tol_fp32_2l = {2e-6, 2e-5, 2e-5, 1e-5};
+#else
+constexpr Tol tol_fp32_2l = tol_fp32;
+#endif
 // fp32 against fp64: per-atom energies to 1e-5 (2L), so the energy per atom of a 2-atom cell (W2tri) as well; the
 // pressure of W2tri (2 atoms, 9e4 bar) to 1.2e-5 (W54, WMo54: < 8e-6), at fp32 rounding of the bond forces
 constexpr Tol tol_fp32_vs_fp64 = {2e-5, 2e-5, 2e-5, 2e-5};

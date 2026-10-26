@@ -779,7 +779,6 @@ Grace2LFused::Grace2LFused(std::shared_ptr<const GRACE2LModel> m, FusedSettings 
   store_l1 = s.store_l1;
   store_l1_max_gb = s.store_l1_max_gb;
   if (spline_n < 16) throw Error("pair grace/2l/fused: spline N must be >= 16");
-  if (model->L1_mlp_rad_has_chem_emb) throw Error("pair grace/2l/fused: chem-embedded radial MLP not supported");
   g_prof_on = getenv("G2LF_PROF") != nullptr;
 }
 
@@ -952,7 +951,7 @@ void Grace2LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   eonly = fl.energy_only;
   if (uq_on) {
     if (!uq_ready) throw Error("grace/2l/fused: UQ requested before enable_uq()");
-    if (!(out.gamma && out.atomic_sigma && out.gmm_cluster))
+    if (inum > 0 && !(out.gamma && out.atomic_sigma && out.gmm_cluster))    // no atoms: nothing written
       throw Error("grace/2l/fused: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
     int imax = 0;
     for (int i : order) imax = std::max(imax, i + 1);

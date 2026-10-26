@@ -2,7 +2,7 @@
 // Drivers on the CsrBonds path (what the Python calculator will call) against the LAMMPS styles (pre-move
 // binary, 1 rank x 1 thread) on the same cells: energy, per-atom energy, forces, pressure.
 // Not bit-identical: LAMMPS gathers the bonds in its neighbour-list order and folds ghost forces back by
-// reverse comm; the CSR path sums in matscipy order directly onto the atoms.
+// reverse comm; the CSR path sums in the bond order of the CSR directly onto the atoms.
 //   env GRACE_TEST_REF_DIR (default tests/fixtures/ref): <cell>_<1l|2l>.dump / .thermo from LAMMPS runs of grace/{1l,2l,3l}/fused
 #include "grace/fused_1l.h"
 #include "grace/fused_2l.h"

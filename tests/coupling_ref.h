@@ -29,7 +29,7 @@ inline Ref load(const std::string &path, int n)
   std::ifstream in(path);
   if (!in) {
     std::fprintf(stderr, "coupling reference %s not found\n", path.c_str());
-    std::exit(1);
+    test_exit(1);
   }
   Ref r;
   std::string line;

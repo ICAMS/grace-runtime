@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """Batch.compute_device: device inputs and outputs (torch tensors via DLPack), neighbour lists and images
-built on the GPU, against Batch.compute (host lists) on the batch structures of test_batch (periodic, shifted,
-triclinic 1-2 atom cells, slab, cluster, empty cell, one atom): energies 1e-6 eV/atom, forces 2e-5 eV/A, virials
-1e-5 eV (fp32 kernels, another atom order inside a pass); split passes (small max_nall), energy_only, per-atom
-energies, UQ; inputs on the CPU or of the wrong dtype are refused. Skipped without torch or a GPU module."""
+built on the GPU, against Batch.compute (the same device lists, host copies of inputs and outputs) on the batch
+structures of test_batch (periodic, shifted, triclinic 1-2 atom cells, slab, cluster, empty cell, one atom): energies
+1e-6 eV/atom, forces 2e-5 eV/A, virials 1e-5 eV (fp32 kernels, another atom order inside a pass); split passes (small
+max_nall), energy_only, per-atom energies, UQ; inputs on the CPU or of the wrong dtype are refused. torch's "cuda" device is the GPU of a ROCm torch
+build too (DLPack kDLROCM). Skipped without torch or a GPU module."""
 import numpy as np
 import pytest
 
@@ -11,23 +12,20 @@ torch = pytest.importorskip("torch")
 
 from ase.data import atomic_numbers, chemical_symbols    # noqa: E402
 
-from grace_runtime import _cuda    # noqa: E402
+from grace_runtime import _gpu    # noqa: E402
 from grace_runtime.neighbors import _padded_cell_arrays    # noqa: E402
 
+from gpu_tools import GPU, NO_GPU, gpu_ok    # noqa: E402
 from test_batch import M1, M2, structures    # noqa: E402
 
 M3 = M1.parent.parent / "GRACE-3L-OMAT-large" / "kokkos.npz"
 
 
 def _ok():
-    try:
-        _cuda.module_for(0)
-        return torch.cuda.is_available()
-    except (ImportError, ValueError):
-        return False
+    return gpu_ok() and torch.cuda.is_available()
 
 
-pytestmark = pytest.mark.skipif(not _ok() or not M3.exists(), reason="no GPU module / torch GPU / models")
+pytestmark = pytest.mark.skipif(not _ok() or not M3.exists(), reason=f"{NO_GPU} / torch GPU / models")
 
 
 def arrays(structs, cutoff):
@@ -63,7 +61,7 @@ def run_device(b, natoms, types, pos, cells, pbc, energies=False, uq=False, ener
 
 
 def batch_of(path, species):
-    kk = _cuda.ensure_init("cuda")
+    kk = _gpu.ensure_init(GPU)
     return kk.Batch(kk.Model(str(path)), species, chunksize=-1)
 
 
@@ -80,7 +78,7 @@ def compare(d, h, natoms):
 @pytest.mark.parametrize("path", [M1, M2, M3], ids=["1L", "2L", "3L"])
 def test_device_equals_host(path):
     structs = structures()
-    kk = _cuda.ensure_init("cuda")
+    kk = _gpu.ensure_init(GPU)
     species = sorted({chemical_symbols[z] for a in structs for z in a.numbers})
     b = batch_of(path, species)
     species, natoms, types, pos, cells, pbc = arrays(structs, b.cutoff)
@@ -133,7 +131,7 @@ def test_device_inputs_checked():
 
 
 def test_host_arguments_on_the_device_refused():
-    """natoms / cells / pbc are read on the host: CUDA arrays there raise instead of crashing the process"""
+    """natoms / cells / pbc are read on the host: GPU arrays there raise instead of crashing the process"""
     b = batch_of(M1, ["W"])
     dev = torch.device("cuda", 0)
     pos = torch.tensor([[0.0, 0.0, 0.0], [1.6, 1.6, 1.6]], dtype=torch.float64, device=dev)

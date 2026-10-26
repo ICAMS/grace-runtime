@@ -6,6 +6,7 @@
 
 #include "grace/kk/grace_2l_kk.h"
 #include "grace/kk/fused_dense.h"
+#include "grace/kk/fused_hip_bonds.h"
 
 #include <array>
 #include <vector>
@@ -26,6 +27,11 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   // checks the model against the compiled kernels, builds the dense metadata and the radial tables
   void setup() override;
   typename Base::RunOutput run(const typename Base::RunInput &in) override;
+  void release_buffers() override
+  {
+    Base::release_buffers();
+    MemKK::drop(d_IT, d_gIT, d_ITn, d_vir, d_cnb, d_cnum, d_redP);
+  }
   int store_l1 = 1;                    // keep the L1 forward state per chunk (no recompute in the L1 backward)
   bool l1_kept = true;                 // chunksize auto: store_l1 fits the GPU memory budget next to the chunk
   int no_shape = 0;                    // 'noshape': force the generic CG-product kernels
@@ -59,16 +65,43 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
     int ws_x[8] = {0}, ws_nin[8] = {0}, nfi[4] = {0}, gbase[4] = {0};
     V4<F> W[8];
     V1<int> toff, tws, tfi, ttile, roff, rfo, rtile, rws;
+    int nb = 0;                  // GPU forward: blocks of at most G2LF_RED_BW input rows of one output function
+    V1<int> bfo, bc;             // a block's output function, CSR of the blocks over the by-output connections
+    V1<int> fob, boff;           // blocks of output function fo: fob(fo) .. fob(fo + 1) - 1; partial rows of block b:
+                                 // boff(b) .. boff(b + 1) - 1 (the output width of its function)
+    int nprow = 0;               // partial rows of all blocks (boff(nb), host copy)
+    int brho = 0;                // first block of the second-kind output fo = nfo1 (rho; fob(nfo1), host copy)
   };
   RedMeta rm_I1, rm_B, rm_I2;
+  struct alignas(8) CGTerm { int q; float cg; };    // a YI CG term: index y * NI + I of Q, coefficient
   ProdMeta pm_AA, pm_AAA, pm_AAAA, pm_BB, pm_BBB, pm_BBBB;
   using t_nn3 = typename Base::t_nn_3d;
 
  protected:
 
   V1<int> d_yi_gperm, d_yi_goff;       // YI pairs sorted by (I, l); group offsets
-  grace::kk::View64<V2<F>> d_IT, d_gIT;    // message I and dE/dI, [nall][I * NR2 + n] (neighbour-contiguous)
+  // The layer-2 bond kernels of a run (begin_run): the matrix-core forward / backward or the vector-ALU ones. The message
+  // I is read as d_IT [nall][I NR2 + n] (vector-ALU kernels) and / or d_ITn [nall][niq n + I] (matrix-core kernels,
+  // I padded with zeros to niq); dE/dI is accumulated in d_gIT in the layout of the backward that runs.
+  struct L2Path {
+    bool fwd_m = false, bwd_m = false;
+    int niq = 0;                         // row of a channel in d_ITn / d_gIT of the matrix-core kernels
+    bool need_IT() const { return !fwd_m || !bwd_m; }
+    bool need_ITn() const { return fwd_m || bwd_m; }
+  };
+  L2Path l2p;
+  grace::kk::View64<V2<F>> d_IT, d_gIT;    // message I and dE/dI (neighbour-contiguous rows, see L2Path)
+  grace::kk::View64<V2<F>> d_ITn;      // HIP matrix-core kernels: the message as [nall][niq n + I]
   V2<double> d_vir;                    // [inum, 6] per-atom global-virial partials (bond kernels)
+  V2<int> d_cnb;                       // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+  V1<int> d_cnum;                      //      and their number, [inum]
+  bool bonds_ready = false;            // GPU: d_cnb / d_cnum built for the current run (begin_run .. end of run)
+  bool a_mfma = false, bwd_wave = false;    // layer-1 basis on the matrix cores (HIP), wave-per-atom L1 backward
+  V1<int> d_cgf_off;                   // CDNA matrix-core forward: CG terms of each YI output function (CSR)
+  V1<CGTerm> d_cgf_t;
+  V1<F> d_redP;                        // GPU blocked forward reducers: block partials when YI_adj is too small
+  // partial rows per atom the buffer of YI_adj holds (its rows: L2_nradmax x n_yi_out_funcs per atom)
+  int red_partials_in_yi_adj() const { return this->L2_nradmax * this->n_yi_out_funcs; }
 
  public:    // methods holding extended device lambdas must be public (nvcc)
   void build_spline_tables();
@@ -86,13 +119,27 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   }
   void fused_layer1_A();
   template<bool CPL> void fused_layer1_A_c();     // CPL: two-group coupling
-  int l2_channel_block(bool bwd) const;
+  int l2_channel_block(bool bwd, int *rounds = nullptr) const;    // rounds: geometry rounds of the backward
   void fused_layer2_fwd();
   template<int NIM, bool CPL> void fused_layer2_fwd_t();
+  template<bool CPL> void fused_layer2_fwd_m();     // CDNA matrix cores (GRACE_KK_GEMM_MFMA builds only)
+  template<bool CPL> void fused_layer2_bwd_m();
+  bool l2_fwd_mfma_fits() const;                    // the model and maxneigh inside the matrix-core kernels' limits
+  bool l2_bwd_mfma_fits() const;
+  bool l2_rows() const;     // HIP matrix-core forward: YI, B0 and their adjoints in the bond kernels as per-atom rows
+  void rows_transpose(bool to_rows, const t_nn3 &V, F *T);
   void fused_layer2_bwd();
   template<int NIM, bool CPL> void fused_layer2_bwd_t();
   void fused_layer1_bwd();
   template<bool CPL> void fused_layer1_bwd_c();
+  void begin_run() override;    // GPU: d_cnb / d_cnum, the bond kernels and the message buffers of the run
+  // the bonds the bond kernels read (BondList, fused_hip_bonds.h): on a GPU the run's compact list
+  auto bond_list() const
+  {
+    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("grace/2l/fused/kk: bond kernel without the run's bond list");
+    return GraceFusedKK::BondList<Traits, is_gpu_v<DeviceType>, decltype(this->d_neighbors), decltype(this->d_numneigh),
+                                  V2<int>, V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
+  }
   void stage_L1_bond() override;
   void stage_L1_bond_recompute() override;
   void stage_L2_bond_fwd() override;
@@ -117,9 +164,8 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   template<int NO> void fc_fwd(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   template<int NO> void fc_bwd(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   template<int NO> void fc_fwd4(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
-#ifdef KOKKOS_ENABLE_CUDA
-  void fc_forward_cublas(typename Base::FCCublasOp &, const t_nn3 &, const t_nn3 &, const t_nn3 &) override;
-#endif
+  bool fc_forward_own(typename Base::FCLayer, const t_nn3 &, const t_nn3 &, const t_nn3 &) override;
+  bool uses_cublas_ops() const override { return false; }
   void stage_rev_fc_AA2() override;
   void stage_rev_fc_AA1() override;
   void stage_rev_fc_A1() override;
@@ -142,13 +188,14 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   void stage_rev_prod_BBB() override;
   void stage_rev_prod_BBBB() override;
   void build_red_meta(RedMeta &, const std::vector<RedSpec> &, int nfo, int nfo1, bool elem, const std::vector<int> &nfi_x);
-  template<int NQ, int MODE, int NO1, int NO2>
+  template<int NQ, int MODE, int NO1, int NO2, bool BLK = false>    // BLK: thread per (atom, block), partial sums
   void red_fwd(const RedMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &,
-               const typename Base::t_nn_2d &);
+               const typename Base::t_nn_2d &, bool rho_only = false);
   template<int NQ, int NIN, int MODE, int NO1, int NO2, bool ASSIGN>
   void red_bwd(const RedMeta &, const t_nn3 &, const typename Base::t_nn_2d &, const t_nn3 &, const t_nn3 &,
                const t_nn3 &, const t_nn3 &);
   void stage_reduce_rho() override;
+  void stage_recompute_rho() override;
   void stage_rev_reduce_rho() override;
   void stage_zero_L1_adj() override;
   void stage_zero_L2_adj() override;
@@ -158,6 +205,7 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   void stage_reduce_B() override;
   void stage_rev_reduce_B() override;
   void stage_reduce_I1() override;
+  void reduce_I1(bool rho_only);
   void stage_rev_reduce_I1() override;
 };
 

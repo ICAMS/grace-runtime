@@ -7,6 +7,7 @@
 // r_ij = x[perm j] - x[perm i] + S cell.
 #pragma once
 
+#include "grace/cell_list.h"
 #include "grace/error.h"
 #include "grace/kk/support.h"
 
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace grace {
@@ -23,6 +25,12 @@ namespace kk {
 
 struct Mat3 {
   double a[9];
+};
+
+// bin grid of the structure of one atom: bins per direction, periodic flags, reach in bins, first bin (batches)
+struct BinGrid {
+  int64_t nbk[3], r[3], base;
+  int pp[3];
 };
 
 // every neighbour of new atom q within the cutoff, fn(p, S0, S1, S2) with S the image in the wrapped frame; the loop
@@ -39,6 +47,18 @@ template<class DeviceType> struct NeighborVisitor {
   double rc2;
 
   KOKKOS_INLINE_FUNCTION static int64_t fdiv(int64_t v, int64_t d) { return v >= 0 ? v / d : -((-v + d - 1) / d); }
+
+  KOKKOS_INLINE_FUNCTION BinGrid grid(int) const
+  {
+    BinGrid g;
+    for (int k = 0; k < 3; k++) {
+      g.nbk[k] = nbk[k];
+      g.r[k] = r[k];
+      g.pp[k] = pp[k];
+    }
+    g.base = 0;
+    return g;
+  }
 
   template<class F> KOKKOS_INLINE_FUNCTION void operator()(const int q, F &&fn) const
   {
@@ -88,6 +108,21 @@ template<class DeviceType> struct NeighborListKK {
   Kokkos::View<int64_t *, DeviceType> key;
   Kokkos::View<int64_t *, DeviceType> bin_start;
   Kokkos::View<int64_t *, DeviceType> nn;
+  // bin grid of the last build, for visitor()
+  Mat3 grid_H{};
+  int64_t grid_nbin[3] = {1, 1, 1};
+  double grid_width[3] = {1.0, 1.0, 1.0};
+  int grid_pbc[3] = {0, 0, 0};
+
+  // every neighbour within any radius rc of the positions of the last build (wrapped xw, images in the wrapped frame;
+  // img converts them to the caller's frame), over the bins of the last build; n > 0
+  NeighborVisitor<DeviceType> visitor(double rc) const
+  {
+    int64_t r[3];
+    for (int k = 0; k < 3; k++) r[k] = bin_reach(rc, grid_width[k], grid_nbin[k], grid_pbc[k]);
+    return NeighborVisitor<DeviceType>{perm, b3, bin_start, xw, grid_H, {grid_nbin[0], grid_nbin[1], grid_nbin[2]},
+                                       {grid_pbc[0], grid_pbc[1], grid_pbc[2]}, {r[0], r[1], r[2]}, rc * rc};
+  }
 
   // pos [>= n][3] (device, caller's order), cell rows = vectors (host, full rank), pbc (host)
   void build(const Kokkos::View<const double *[3], Kokkos::LayoutRight, DeviceType> &pos, int n_, const double *cell,
@@ -162,9 +197,12 @@ template<class DeviceType> struct NeighborListKK {
     int64_t reach[3];
     for (int k = 0; k < 3; k++) {
       const double w = span[k] * h[k] / (double) nbin[k];
-      reach[k] = (int64_t) std::ceil(cutoff / w - 1e-12);
-      if (!pbc[k]) reach[k] = std::min(reach[k], nbin[k] - 1);
+      reach[k] = bin_reach(cutoff, w, nbin[k], pbc[k]);
+      grid_nbin[k] = nbin[k];
+      grid_width[k] = w;
+      grid_pbc[k] = pbc[k] ? 1 : 0;
     }
+    grid_H = H;
     const int64_t nbt = nbin[0] * nbin[1] * nbin[2];
     const int64_t nb0 = nbin[0], nb1 = nbin[1], nb2 = nbin[2];
     const double lo0 = lo[0], lo1 = lo[1], lo2 = lo[2], sp0 = span[0], sp1 = span[1], sp2 = span[2];
@@ -223,6 +261,7 @@ template<class DeviceType> struct NeighborListKK {
     nb = total;
     Kokkos::parallel_reduce("nl:maxneigh", Kokkos::RangePolicy<DeviceType>(0, n),
         KOKKOS_LAMBDA(const int q, int &m) { if (cnt(q) > m) m = (int) cnt(q); }, Kokkos::Max<int>(maxneigh));
+    maxneigh = std::max(maxneigh, 0);    // Kokkos::Max over no atoms gives INT_MIN
     if ((int64_t) j.extent(0) < nb) {
       j = V1i("nl:j", nb + nb / 8 + 16);
       S = V3i("nl:S", nb + nb / 8 + 16);
@@ -256,6 +295,19 @@ template<class DeviceType> struct BatchNeighborVisitor {
   Kokkos::View<int64_t *[3], Kokkos::LayoutRight, DeviceType> nbk, r;
   Kokkos::View<int *[3], Kokkos::LayoutRight, DeviceType> pp;
   double rc2;
+
+  KOKKOS_INLINE_FUNCTION BinGrid grid(int q) const
+  {
+    const int s = sy(q);
+    BinGrid g;
+    for (int k = 0; k < 3; k++) {
+      g.nbk[k] = nbk(s, k);
+      g.r[k] = r(s, k);
+      g.pp[k] = pp(s, k);
+    }
+    g.base = base(s);
+    return g;
+  }
 
   template<class F> KOKKOS_INLINE_FUNCTION void operator()(const int q, F &&fn) const
   {
@@ -318,11 +370,38 @@ template<class DeviceType> struct BatchNeighborListKK {
   V3l nbk, reach;
   V1i sys_in;
   V1l start_d, base, key, bin_start, nn;
+  // bin grids of the last build per structure (host), for visitor()
+  std::vector<double> grid_width;     // [nsys][3]
+  std::vector<int64_t> grid_nbin;     // [nsys][3]
+  std::vector<int> grid_pbc;          // [nsys][3]
+
+  mutable std::vector<std::pair<double, V3l>> reach_rc;    // reach views of visitor(), kept per radius
+
+  // every neighbour within any radius rc of the positions of the last build (as NeighborListKK::visitor), with its
+  // own reach per structure; n > 0
+  BatchNeighborVisitor<DeviceType> visitor(double rc) const
+  {
+    auto it = std::find_if(reach_rc.begin(), reach_rc.end(), [&](const auto &e) { return e.first == rc; });
+    if (it == reach_rc.end() || (int) it->second.extent(0) < nsys) {
+      if (it != reach_rc.end()) reach_rc.erase(it);
+      reach_rc.emplace_back(rc, V3l("bnl:reach_rc", std::max(nsys, 1)));
+      it = reach_rc.end() - 1;
+    }
+    const V3l r = it->second;
+    auto hr = Kokkos::create_mirror_view(r);
+    for (int s = 0; s < nsys; s++)
+      for (int k = 0; k < 3; k++) {
+        const size_t g = 3 * (size_t) s + k;
+        hr(s, k) = bin_reach(rc, grid_width[g], grid_nbin[g], grid_pbc[g]);
+      }
+    Kokkos::deep_copy(r, hr);
+    return BatchNeighborVisitor<DeviceType>{perm, sys, b3, bin_start, base, xw, H, nbk, r, pp, rc * rc};
+  }
 
   // pos [>= start[nsys]][3] (device, caller's order); start [nsys + 1], cell [nsys][9] rows = vectors (full rank),
-  // pbc [nsys][3]: host
+  // pbc [nsys][3]: host. bins_only: the bins, order and images only, no CSR list (for visitor())
   void build(const Kokkos::View<const double *[3], Kokkos::LayoutRight, DeviceType> &pos, int nsys_,
-             const int64_t *start, const double *cell, const bool *pbc, double cutoff)
+             const int64_t *start, const double *cell, const bool *pbc, double cutoff, bool bins_only = false)
   {
     if (!(cutoff > 0.0) || !std::isfinite(cutoff)) throw Error("neighbour search: cutoff must be positive");
     if (nsys_ < 0) throw Error("neighbour search: negative number of structures");
@@ -452,6 +531,9 @@ template<class DeviceType> struct BatchNeighborListKK {
     auto hre = Kokkos::create_mirror_view(reach);
     auto hbase = Kokkos::create_mirror_view(base);
     int64_t total_bins = 0;
+    grid_width.assign(3 * (size_t) nsys, 1.0);
+    grid_nbin.assign(3 * (size_t) nsys, 1);
+    grid_pbc.assign(3 * (size_t) nsys, 0);
     for (int s = 0; s < nsys; s++) {
       const int64_t ns_at = start[s + 1] - start[s];
       int64_t nbin[3];
@@ -467,10 +549,11 @@ template<class DeviceType> struct BatchNeighborListKK {
       }
       for (int k = 0; k < 3; k++) {
         const double w = hspan(s, k) * hsp[3 * s + k] / (double) nbin[k];
-        int64_t rch = (int64_t) std::ceil(cutoff / w - 1e-12);
-        if (!hpp(s, k)) rch = std::min(rch, nbin[k] - 1);
         hnb(s, k) = nbin[k];
-        hre(s, k) = rch;
+        hre(s, k) = bin_reach(cutoff, w, nbin[k], hpp(s, k));
+        grid_width[3 * (size_t) s + k] = w;
+        grid_nbin[3 * (size_t) s + k] = nbin[k];
+        grid_pbc[3 * (size_t) s + k] = hpp(s, k);
       }
       hbase(s) = total_bins;
       total_bins += nbin[0] * nbin[1] * nbin[2];
@@ -525,6 +608,7 @@ template<class DeviceType> struct BatchNeighborListKK {
       const int a = pm(q), s = sy(q);
       for (int d = 0; d < 3; d++) x(q, d) = fr(a, 0) * HH(s, d) + fr(a, 1) * HH(s, 3 + d) + fr(a, 2) * HH(s, 6 + d);
     });
+    if (bins_only) return;
     const BatchNeighborVisitor<DeviceType> visit{pm, sy, bb, bs, base, x, H, nbk, reach, pp, cutoff * cutoff};
     auto cnt = nn;
     Kokkos::parallel_for("bnl:count", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(const int q) {
@@ -543,6 +627,7 @@ template<class DeviceType> struct BatchNeighborListKK {
     nb = total;
     Kokkos::parallel_reduce("bnl:maxneigh", Kokkos::RangePolicy<DeviceType>(0, n),
         KOKKOS_LAMBDA(const int q, int &mm) { if (cnt(q) > mm) mm = (int) cnt(q); }, Kokkos::Max<int>(maxneigh));
+    maxneigh = std::max(maxneigh, 0);    // Kokkos::Max over no atoms gives INT_MIN
     if ((int64_t) j.extent(0) < nb) {
       j = V1i("bnl:j", nb + nb / 8 + 16);
       S = V3i("bnl:S", nb + nb / 8 + 16);

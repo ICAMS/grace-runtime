@@ -4,7 +4,11 @@
 #   -march/-mtune from Kokkos), which is the default for consumers.
 #   GRACE_RUNTIME_STATIC_LIBRARY=ON (the top level sets it): also define the static library target libgrace.
 get_filename_component(GRACE_RUNTIME_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-find_package(OpenMP REQUIRED COMPONENTS CXX)
+find_package(OpenMP COMPONENTS CXX)
+if(NOT OpenMP_CXX_FOUND)
+  message(FATAL_ERROR "OpenMP not found: set OpenMP_ROOT to its prefix (macOS: `brew install libomp` and "
+                      "$(brew --prefix libomp), or `conda install -c conda-forge llvm-openmp` and $CONDA_PREFIX)")
+endif()
 file(GLOB GRACE_RUNTIME_SOURCES "${GRACE_RUNTIME_ROOT}/libgrace/src/*.cpp")
 list(APPEND GRACE_RUNTIME_SOURCES "${GRACE_RUNTIME_ROOT}/libgrace/third_party/grace_cnpy/cnpy.cpp")
 set(GRACE_RUNTIME_INCLUDE_DIRS "${GRACE_RUNTIME_ROOT}/libgrace/include")
@@ -15,7 +19,8 @@ if(GRACE_RUNTIME_STATIC_LIBRARY)
   target_include_directories(libgrace PUBLIC ${GRACE_RUNTIME_INCLUDE_DIRS} PRIVATE ${GRACE_RUNTIME_PRIVATE_INCLUDE_DIRS})
   target_link_libraries(libgrace PUBLIC OpenMP::OpenMP_CXX)
   # GRACE_BLAS: the GRACE-3L CPU GEMM calls cblas_sgemm (LP64) of a BLAS found by CMake; off: the built-in kernel
-  # (the Python wheels). LAMMPS sets the definition on its own target (ML-PACE.cmake).
+  # (the Linux Python wheels; the macOS ones use Accelerate: python/CMakeLists.txt). LAMMPS sets the definition on its
+  # own target (ML-PACE.cmake).
   option(GRACE_BLAS "GRACE-3L CPU GEMM through cblas_sgemm" OFF)
   if(GRACE_BLAS)
     find_package(BLAS REQUIRED)

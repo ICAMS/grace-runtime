@@ -4,12 +4,12 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "grace-runtime"
-version = "0.0.1.dev0"
+version = "0.0.1.dev1"
 description = "Native CPU inference of GRACE interatomic potentials with an ASE calculator"
 requires-python = ">=3.10"
 license = { text = "Academic Software License (ASL); bundled third-party code: see THIRD_PARTY_NOTICES.md" }
 classifiers = ["License :: Other/Proprietary License"]
-dependencies = ["numpy", "ase", "tqdm"]
+dependencies = ["numpy", "ase", "tqdm", "spglib>=2.5"]
 
 [project.scripts]
 grace-runtime = "grace_runtime.cli:main"
@@ -19,9 +19,9 @@ Homepage = "https://github.com/ICAMS/grace-runtime"
 Issues = "https://github.com/ICAMS/grace-runtime/issues"
 
 [project.optional-dependencies]
-matscipy = ["matscipy>=1.3"]
 torchsim = ["torch>=2; python_version >= '3.12'", "torch-sim-atomistic>=0.6; python_version >= '3.12'"]
-test = ["pytest", "matscipy>=1.3"]
+phonons = ["phonopy>=2.20"]
+test = ["pytest"]
 
 [tool.scikit-build]
 # pyproject at the repository root so the sdist carries libgrace/ and cmake/ next to python/
@@ -31,4 +31,4 @@ wheel.packages = ["python/grace_runtime"]
 wheel.py-api = "cp312"
 wheel.license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", "libgrace/third_party/grace_cnpy/LICENSE"]
 cmake.build-type = "Release"
-sdist.exclude = ["scripts", "internal", "ci", "knowledge", "AGENTS.md", "CLAUDE.md", ".gitlab-ci.yml"]
+sdist.exclude = ["python-rocm6", "scripts", "internal", "ci", "knowledge", "AGENTS.md", "CLAUDE.md", ".gitlab-ci.yml"]

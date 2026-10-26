@@ -6,12 +6,16 @@ bundled with it, in source form in this repository or compiled into the wheels; 
 | Component | Where | Licence | Text |
 |---|---|---|---|
 | cnpy (Carl Rogers) | `libgrace/third_party/grace_cnpy/`, compiled into libgrace and all wheels | MIT | `libgrace/third_party/grace_cnpy/LICENSE` |
-| Kokkos (National Technology & Engineering Solutions of Sandia, LLC) | compiled into the `grace-runtime-cuda12` wheels (`_kk_<arch>` modules) | Apache-2.0 WITH LLVM-exception | `python-cuda/LICENSE-Kokkos` |
+| DFT-D3 reference data of tad-dftd3 0.7.0 and tad-mctc 0.8.0 (Grimme Group): reference C6 coefficients and coordination numbers, <r4>/<r2> values, covalent radii, pairwise van der Waals radii | `libgrace/include/grace/d3_params.h` (generated, values verbatim; the pairwise radii rounded back to their 4 decimals in Angstrom), compiled into libgrace and all wheels | Apache-2.0 | `libgrace/third_party/d3_data/LICENSE` |
+| Kokkos (National Technology & Engineering Solutions of Sandia, LLC) | compiled into the `grace-runtime-cuda12` and `grace-runtime-rocm6` wheels (`_kk_<arch>` modules) | Apache-2.0 WITH LLVM-exception | `LICENSE-Kokkos` of each wheel (`python-cuda/`, `python-rocm6/`) |
 | nanobind (Wenzel Jakob) | compiled into the Python extension modules of all wheels | BSD-3-Clause | below |
 | tsl::robin_map (Thibaut Goetghebuer-Planchon), part of nanobind | compiled into the Python extension modules of all wheels | MIT | below |
+| rocPRIM, rocThrust (Advanced Micro Devices, Inc.), HIP headers | header code compiled into the `grace-runtime-rocm6` modules (Kokkos sort) | MIT (rocPRIM, HIP), Apache-2.0 (rocThrust) | https://github.com/ROCm/rocPRIM, https://github.com/ROCm/rocThrust, https://github.com/ROCm/HIP |
 | GCC runtime: libstdc++ (linked statically), libgomp (vendored by auditwheel) | all wheels | GPL-3.0 WITH GCC-exception-3.1 (GCC Runtime Library Exception) | https://www.gnu.org/licenses/gcc-exception-3.1.html |
 
-Not bundled, loaded at run time when present: the CUDA runtime and driver, cuBLAS (`nvidia-cublas-cu12`, UQ only).
+Not bundled, loaded at run time when present: the CUDA runtime and driver, cuBLAS (`nvidia-cublas-cu12`, UQ only),
+rocBLAS of the system ROCm. Not bundled and required by `grace-runtime-rocm6`: the ROCm HIP runtime
+(`libamdhip64.so.6`) of the system ROCm.
 
 ## nanobind
 

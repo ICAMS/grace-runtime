@@ -4,14 +4,18 @@
 // A Model holds the weights once and one driver per species list (created on first use); every call names its
 // species, so several calculators can share one Model from several threads. The GIL is released while drivers are
 // created and while they compute; each driver has its own mutex (its buffers are per call state).
+#include "grace/cell_list.h"
+#include "grace/d3.h"
 #include "grace/fused_1l.h"
 #include "grace/fused_2l.h"
 #include "grace/fused_3l.h"
+#include "dispersion_args.h"
 #include "neighbors.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -25,12 +29,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <sched.h>
 #include <stdexcept>
 #include <tuple>
 #include <set>
 #include <string>
 #include <vector>
+#ifdef __linux__
+#include <sched.h>
+#else
+#include <thread>
+#endif
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -43,9 +51,13 @@ int affinity_threads()
     const int v = std::atoi(e);
     if (v > 0) return v;
   }
+#ifdef __linux__
   cpu_set_t s;
   if (sched_getaffinity(0, sizeof(s), &s) == 0) return std::max(1, CPU_COUNT(&s));
   return 1;
+#else
+  return std::max(1u, std::thread::hardware_concurrency());   // no CPU affinity API (macOS)
+#endif
 }
 
 // member names of a zip archive from its central directory (only the end of the file is read)
@@ -154,12 +166,68 @@ nb::ndarray<nb::numpy, double> bond_vectors(HostArray<const double, nb::shape<-1
   return owned(std::move(r), {(size_t) nb_, 3});
 }
 
+// dispersion correction alone (grace/dispersion.h; the calculator adds it to the model): params a dict
+// (dispersion_args.h); numbers [n] atomic numbers, x [n, 3] in the caller's order, cell full rank (open directions
+// padded). energy, energies [n] and, unless energy_only, forces [n, 3], virial [6]
+// (xx yy zz xy xz yz, W = -dE/dstrain)
+nb::dict dispersion_compute(const nb::dict &params, HostArray<const int32_t, nb::ndim<1>> numbers,
+                            HostArray<const double, nb::shape<-1, 3>> x, HostArray<const double, nb::shape<3, 3>> cell,
+                            std::array<bool, 3> pbc, bool energy_only, int num_threads)
+{
+  const int64_t n = (int64_t) numbers.shape(0);
+  if ((int64_t) x.shape(0) != n) throw nb::value_error("positions and numbers differ in length");
+  const grace::DispersionParams p = dispersion_params(params);
+  std::vector<double> e(n, 0.0), f(energy_only ? 0 : 3 * n, 0.0);
+  double energy = 0.0, vir[6] = {0, 0, 0, 0, 0, 0};
+  {
+    nb::gil_scoped_release nogil;
+    try {
+      std::vector<int> type;
+      const auto species = grace::d3::species_of(numbers.data(), n, type);
+      const auto t = grace::d3::make_tables(species.data(), (int) species.size(), p);
+      grace::CellList cl;
+      cl.build(x.data(), n, cell.data(), pbc.data(), 0.5 * std::min(p.cutoff, p.cn_cutoff));
+      grace::d3::compute_cpu(t, type.data(), n, cl, num_threads > 0 ? num_threads : affinity_threads(), energy_only,
+                             energy, e.data(), energy_only ? nullptr : f.data(), energy_only ? nullptr : vir);
+    } catch (const std::invalid_argument &ex) {
+      throw grace::Error(ex.what());
+    }
+  }
+  nb::dict d;
+  d["energy"] = energy;
+  d["energies"] = from_vec(std::move(e), {(size_t) n});
+  if (!energy_only) {
+    d["forces"] = from_vec(std::move(f), {(size_t) n, 3});
+    d["virial"] = from_vec(std::vector<double>(vir, vir + 6), {6});
+  }
+  return d;
+}
+
+// the published D3(BJ) parameters of a functional (lower case), a2 in Bohr
+std::map<std::string, double> d3bj_preset(const std::string &name)
+{
+  try {
+    const auto &q = grace::d3bj_preset(name);
+    return {{"s6", q.s6}, {"a1", q.a1}, {"s8", q.s8}, {"a2_bohr", q.a2_bohr}};
+  } catch (const std::invalid_argument &ex) {
+    throw nb::value_error(ex.what());
+  }
+}
+
+std::vector<std::string> d3bj_presets()
+{
+  std::vector<std::string> v;
+  for (const auto &q : grace::kD3BJPresets) v.emplace_back(q.name);
+  return v;
+}
+
 }    // namespace
 
 class Model {
  public:
   Model(const std::string &path, int spline) : path_(path)
   {
+    if (spline < 16) throw nb::value_error("spline must be >= 16 (intervals of the radial tables)");
     arch_ = detect_arch(path);
     fs_.spline_n = spline;
     nb::gil_scoped_release nogil;
@@ -272,6 +340,7 @@ class Model {
   }
 
   bool has_uq() const { return m1_ ? m1_->has_uq : m3_ ? m3_->has_uq : m2_->has_uq; }
+  int spline() const { return fs_.spline_n; }
   // throws ValueError unless the model carries a usable uqv6 head
   void validate_uq() const
   {
@@ -363,11 +432,17 @@ NB_MODULE(GRACE_RUNTIME_MODULE, m)    // _core_x86_64_v3 / _core_x86_64_v4 / _co
   });
   m.def("neighbor_search", &neighbor_search, "x"_a, "cell"_a, "pbc"_a, "cutoff"_a, "num_threads"_a = 0);
   m.def("bond_vectors", &bond_vectors, "x"_a, "i"_a, "j"_a, "shift"_a, "num_threads"_a = 0);
+  m.def("dispersion_compute", &dispersion_compute, "params"_a, "numbers"_a, "x"_a, "cell"_a, "pbc"_a,
+        "energy_only"_a = false, "num_threads"_a = 0);
+  m.def("d3bj_preset", &d3bj_preset, "name"_a);
+  m.def("d3bj_presets", &d3bj_presets);
+  m.attr("BOHR") = grace::kBohr;
   nb::class_<Model>(m, "Model")
       .def(nb::init<const std::string &, int>(), "path"_a, "spline"_a = 1024)
       .def_ro("arch", &Model::arch_)
       .def_ro("path", &Model::path_)
       .def_ro("elements", &Model::names_)
+      .def_prop_ro("spline", &Model::spline)
       .def("cutoff_matrix", &Model::cutoff_matrix, "species"_a)
       .def_prop_ro("has_uq", &Model::has_uq)
       .def_prop_ro("cached_drivers", &Model::cached_drivers)

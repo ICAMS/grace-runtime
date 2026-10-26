@@ -90,8 +90,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN(
     const DeviceReduce &r, const t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR],
     const t_nn_3d &out)
 {
-#ifdef KOKKOS_ENABLE_CUDA
-  if (cublas_handle && sizeof(NNScalar) == 4) {
+#ifdef GRACE_KK_GEMM
+  if (blas_handle && sizeof(NNScalar) == 4) {
     const DeviceReduce *rbase = d_reduce;
     const int idx = (int) (&r - rbase);
     if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok && h_reduce[idx].grouped &&
@@ -110,9 +110,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN(
       Kokkos::RangePolicy<DeviceType, TagReduceN>(0, chunk_size * r.n_out), *this);
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 17: cuBLAS batched-GEMM ReduceN forward. out(a,k,f) = Σ_{c:tsi(c)=f} Σ_n
 // A(a,n,ci(c)) * Wsc[c](k,n), where Wsc already carries norm*norm_map(f). Zero `out`,
 // then issue one cublasSgemmBatched per round (each round has DISTINCT f -> the beta=1
@@ -167,11 +165,11 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_cubl
     const int off = hr.round_ptr[rr];
     const int bs = hr.round_ptr[rr + 1] - off;
     if (bs <= 0) continue;
-    cublasStatus_t st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+    blas::status_t st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_T,
         chunk_size, n_out, n_in, &alpha,
         Aarr + off, ldA, Barr + off, n_out, &beta,
         Carr + off, ldC, bs);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-3L/KK: reduceN fwd cublasSgemmBatched failed (status {})", (int) st);
   }
   return true;
@@ -250,20 +248,20 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_fc(
     const DeviceFC &f, const t_nn_3d &in_left, const t_nn_3d &in_right,
     const t_nn_3d &out)
 {
-#ifdef KOKKOS_ENABLE_CUDA
-  if (cublas_handle && sizeof(NNScalar) == 4 && f.gemm_ok) {
+#ifdef GRACE_KK_GEMM
+  if (blas_handle && sizeof(NNScalar) == 4 && f.gemm_ok) {
     // out = nof * left, then one strided-batched GEMM over w accumulates right(:,:,w) Bw[w]
     const int cs = chunk_size, no = f.n_out, nf = f.n_funcs_left, ni = f.n_in_right;
     auto L = in_left; auto O = out; auto nof = f.norm_out_factor;
     Kokkos::parallel_for("FCLeftScale", Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<3>>({0, 0, 0}, {cs, no, nf}),
       KOKKOS_LAMBDA(const int a, const int k, const int w) { O(a, k, w) = nof(w) * L(a, k, w); });
     const float one = 1.0f;
-    cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+    blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_N,
         cs, no, ni, &one,
         (const float*) in_right.data(), (int) in_right.extent(0), (long long) in_right.extent(0) * in_right.extent(1),
         (const float*) f.Bw.data(), ni, (long long) no * ni,
         &one, (float*) out.data(), (int) out.extent(0), (long long) out.extent(0) * out.extent(1), nf);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-3L/KK: FC forward cublas failed (status {})", (int) st);
     return;
   }
@@ -341,14 +339,16 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagEqNor
 // atom for the current chunk. Reused for eq1_norm/eq2_norm.
 // ======================================================================
 
-// The team EqNorm kernel sums over f with 32-lane warp shuffles: CUDA only (other backends use the per-atom
-// kernels; the shuffle helpers abort outside CUDA device code).
+// The team EqNorm kernel sums over f with 32-lane warp shuffles: CUDA and HIP only (other backends use the per-atom
+// kernels; the shuffle helpers abort outside CUDA / HIP device code).
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::eqnorm_team_ok(int M) const
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#if defined(KOKKOS_ENABLE_CUDA)
   return std::is_same<typename DeviceType::execution_space, Kokkos::Cuda>::value && sizeof(NNScalar) == 4 &&
          M <= GRACE3L_MAX_SPBF_NLMIND;
+#elif defined(KOKKOS_ENABLE_HIP)
+  return is_hip_v<DeviceType> && sizeof(NNScalar) == 4 && M <= GRACE3L_MAX_SPBF_NLMIND;
 #else
   (void) M;
   return false;
@@ -816,8 +816,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd(
     const DeviceReduce &r, const t_nn_3d &adj_out,
     const t_nn_3d adj_inputs[GRACE3L_MAX_REDUCE_INSTR])
 {
-#ifdef KOKKOS_ENABLE_CUDA
-  if (cublas_handle && sizeof(NNScalar) == 4) {
+#ifdef GRACE_KK_GEMM
+  if (blas_handle && sizeof(NNScalar) == 4) {
     const DeviceReduce *rbase = d_reduce;
     const int idx = (int) (&r - rbase);
     if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok && h_reduce[idx].grouped &&
@@ -847,10 +847,10 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_set(
     const DeviceReduce &r, const t_nn_3d &adj_out, const t_nn_3d &adj_in)
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   static const bool off = getenv("GRACE3L_REDUCE_BWD_ACC") != nullptr;
   const int idx = (int) (&r - d_reduce);
-  if (!off && cublas_handle && sizeof(NNScalar) == 4 && idx >= 0 && idx < n_reduces && r.n_instr == 1) {
+  if (!off && blas_handle && sizeof(NNScalar) == 4 && idx >= 0 && idx < n_reduces && r.n_instr == 1) {
     const ReduceHost &hr = h_reduce[idx];
     bool cover = hr.cublas_ok && hr.grouped && hr.n_conn == (int) adj_in.extent(2);
     for (size_t f = 0; cover && f < hr.gn.size(); f++)
@@ -865,9 +865,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_
   compute_reduceN_bwd(r, adj_out, a);
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 17: cuBLAS batched-GEMM ReduceN backward (VJP). adj_in(a,n,ci(c)) += Σ_k
 // adj_out(a,k,tsi(c)) * Wsc[c](k,n), Wsc carrying norm*norm_map(tsi(c)) (same fold as
 // forward). collect_ind is a bijection (enforced at setup: cublas_ok is cleared for any
@@ -899,20 +897,18 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_
   float** Carr       = (float**)       (P + 2 * nc);
   const float alpha = 1.0f, beta = 1.0f;
   const int ldAo = (int) adj_out.extent(0), ldAi = (int) adj_in.extent(0);
-  cublasStatus_t st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+  blas::status_t st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_N,
       chunk_size, n_in, n_out, &alpha,
       Aarr, ldAo, Barr, n_out, &beta,
       Carr, ldAi, nc);
-  if (st != CUBLAS_STATUS_SUCCESS)
+  if (st != blas::SUCCESS)
     GRACE_KK_ERROR("GRACE-3L/KK: reduceN bwd cublasSgemmBatched failed (status {})", (int) st);
   return true;
 }
 #endif
 
 
-#ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Grouped reduce with the input in d_spbf_T (row-major [ii][c * n_in + n], c the input column): block f is the
 // row-major [cs x gn n_in] matrix at column gstart f * n_in, i.e. a column-major [gn n_in x cs] one with ld =
 // row stride. Forward out(:,:,f) = block^T-op * Bg_f (OP_T); backward block^T = Bg_f * dout(:,:,f)^T, assigned
@@ -947,20 +943,20 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_grou
     const int cnt = (int) hr.gsets[g].size(), K = hr.gn[hr.gsets[g][0]] * n_in, o = start[g];
     float **Pin = (float **) (P + o), **Pw = (float **) (P + n_f + o);
     float **Pout = (float **) (P + 2 * n_f + o);
-    cublasStatus_t st;
+    blas::status_t st;
     if (!bwd)
-      st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, chunk_size, n_out, K, &one,
-                              (const float **) Pin, (int) ldT, (const float **) Pw, K, &zero, Pout, (int) E0o, cnt);
+      st = blas::sgemm_batched(blas_handle, blas::OP_T, blas::OP_N, chunk_size, n_out, K, &one,
+                               (const float **) Pin, (int) ldT, (const float **) Pw, K, &zero, Pout, (int) E0o, cnt);
     else
-      st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, K, chunk_size, n_out, &one,
-                              (const float **) Pw, K, (const float **) Pout, (int) E0o, &zero, Pin, (int) ldT, cnt);
-    if (st != CUBLAS_STATUS_SUCCESS)
+      st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_T, K, chunk_size, n_out, &one,
+                               (const float **) Pw, K, (const float **) Pout, (int) E0o, &zero, Pin, (int) ldT, cnt);
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-3L/KK: row-major grouped reduce cublasSgemmBatched failed (status {})", (int) st);
   }
 }
 
 #endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Grouped reduce: forward out(:,:,f) = in(:, :, gstart f .. +gn f) [cs x gn n_in] * Bg_f [gn n_in x n_out];
 // backward din(:, :, block f) += dout(:,:,f) * Bg_f^T. One cublasSgemmBatched per set of outputs with equal gn.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -994,15 +990,15 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_grou
     const int cnt = (int) hr.gsets[g].size(), K = hr.gn[hr.gsets[g][0]] * n_in, o = start[g];
     float **Pin = (float **) (P + o), **Pw = (float **) (P + n_f + o);
     float **Pout = (float **) (P + 2 * n_f + o);
-    cublasStatus_t st;
+    blas::status_t st;
     if (!bwd)
-      st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, chunk_size, n_out, K, &one,
-                              (const float **) Pin, (int) E0i, (const float **) Pw, K, &zero, Pout, (int) E0o, cnt);
+      st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_N, chunk_size, n_out, K, &one,
+                               (const float **) Pin, (int) E0i, (const float **) Pw, K, &zero, Pout, (int) E0o, cnt);
     else
-      st = cublasSgemmBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, chunk_size, K, n_out, &one,
-                              (const float **) Pout, (int) E0o, (const float **) Pw, K, assign ? &zero : &one, Pin,
-                              (int) E0i, cnt);
-    if (st != CUBLAS_STATUS_SUCCESS)
+      st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_T, chunk_size, K, n_out, &one,
+                               (const float **) Pout, (int) E0o, (const float **) Pw, K, assign ? &zero : &one, Pin,
+                               (int) E0i, cnt);
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-3L/KK: grouped reduce cublasSgemmBatched failed (status {})", (int) st);
   }
   return true;
@@ -1014,21 +1010,21 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_fc_bwd(
     const DeviceFC &f, const t_nn_3d &adj_out, const t_nn_3d &adj_left,
     const t_nn_3d &adj_right)
 {
-#ifdef KOKKOS_ENABLE_CUDA
-  if (cublas_handle && sizeof(NNScalar) == 4 && f.gemm_ok) {
+#ifdef GRACE_KK_GEMM
+  if (blas_handle && sizeof(NNScalar) == 4 && f.gemm_ok) {
     // adj_left += nof * adj_out; adj_right(:,:,w) += adj_out(:,:,w) Bw[w]^T (one strided-batched GEMM)
     const int cs = chunk_size, no = f.n_out, nf = f.n_funcs_left, ni = f.n_in_right;
     auto G = adj_out; auto dL = adj_left; auto nof = f.norm_out_factor;
     Kokkos::parallel_for("FCBwdLeftScale", Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<3>>({0, 0, 0}, {cs, no, nf}),
       KOKKOS_LAMBDA(const int a, const int k, const int w) { dL(a, k, w) += nof(w) * G(a, k, w); });
     const float one = 1.0f;
-    cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+    blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T,
         cs, ni, no, &one,
         (const float*) adj_out.data(), (int) adj_out.extent(0), (long long) adj_out.extent(0) * adj_out.extent(1),
         (const float*) f.Bw.data(), ni, (long long) no * ni,
         &one, (float*) adj_right.data(), (int) adj_right.extent(0),
         (long long) adj_right.extent(0) * adj_right.extent(1), nf);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-3L/KK: FC backward cublas failed (status {})", (int) st);
     return;
   }
@@ -1140,7 +1136,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::eqnorm_team(
   const int cs = chunk_size, F = n_out, M = M_;
   const bool c0 = center_l0 != 0;
   const float eps = eps_, invF = 1.0f / (float) F, Ff = (float) F;
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, NW * 32>>;
   using member = typename team_policy::member_type;
   team_policy pol((cs + NA - 1) / NA, NW * 32);
   pol = pol.set_scratch_size(0, Kokkos::PerTeam(SH));

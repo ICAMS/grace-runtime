@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-"""merge_cuda_wheels.py <outdir> <wheel>...: one grace-runtime-cuda12 wheel per CPython tag from wheels built for one GPU
-architecture each (GitHub workflow: one job per architecture). Wheels of the same file name are merged: the union of
-their files (every file they share must be identical; the _kk_<arch> modules differ), a new RECORD. Exit status 1 on a
-conflict."""
+"""merge_cuda_wheels.py <outdir> <wheel>...: one grace-runtime-cuda12 (or grace-runtime-rocm6) wheel per CPython tag
+from wheels built for one GPU architecture each (GitHub workflows: one job per architecture). Wheels of the same file
+name are merged: the union of their files (every file they share must be identical; the _kk_<arch> modules differ), a
+new RECORD. Exit status 1 on a conflict."""
 import base64
 import hashlib
 import sys

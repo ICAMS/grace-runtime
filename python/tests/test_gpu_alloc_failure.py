@@ -2,7 +2,7 @@
 """A device allocation failure part-way through a growth (injected with the module's _debug_fail_alloc: the nth
 allocation whose label matches throws "failed to allocate") must not leave a half-grown engine or System behind: the
 same calculator, and other calculators sharing the engine, give the result of a fresh calculator afterwards. Each case
-runs in its own process (a broken engine may lose the CUDA context)."""
+runs in its own process (a broken engine may lose the GPU context)."""
 import os
 import subprocess
 import sys
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from grace_runtime import _cuda
+from gpu_tools import NO_GPU, gpu_ok
 
 CACHE = Path(os.environ.get("GRACE_CACHE", Path.home() / ".cache" / "grace-runtime-test"))
 M2 = CACHE / "GRACE-2L-SMAX-OMAT-medium" / "kokkos.npz"
@@ -19,21 +19,15 @@ M1 = CACHE / "GRACE-1L-OMAT-large-base" / "kokkos.npz"
 M3 = CACHE / "GRACE-3L-OMAT-large" / "kokkos.npz"
 
 
-def _cuda_ok():
-    try:
-        _cuda.module_for(0)
-        return True
-    except (ImportError, ValueError):
-        return False
 
-
-pytestmark = pytest.mark.skipif(not _cuda_ok() or not (M1.exists() and M2.exists() and M3.exists()), reason="no GPU module / models")
+pytestmark = pytest.mark.skipif(not gpu_ok() or not (M1.exists() and M2.exists() and M3.exists()), reason=f"{NO_GPU} / models")
 
 PRELUDE = """
 import numpy as np
 from ase.build import bulk
-from grace_runtime import GRACERuntimeCalculator, _cuda
-kk = _cuda.ensure_init("cuda")
+from grace_runtime import GRACERuntimeCalculator, _gpu
+GPU = __import__("os").environ["GRACE_TEST_GPU"]
+kk = _gpu.ensure_init(GPU)
 small = bulk("W", "bcc", a=3.165, cubic=True).repeat(3)
 big = bulk("W", "bcc", a=3.165, cubic=True).repeat((10, 10, 10))
 big.rattle(0.02, seed=1)
@@ -62,41 +56,41 @@ CASES = {
     # fixed chunksize: the failed engine stays with the calculator
     "engine_2l_fixed": """
 m = "{M2}"
-c = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
+c = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
 ef(c, small)
 inject_and_fail(c, big, "g2l:A1", 1)
-check(c, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(c, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
     "engine_1l_fixed": """
 m = "{M1}"
-c = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
+c = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
 ef(c, small)
 inject_and_fail(c, big, "g1l:A1", 1)
-check(c, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(c, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
     "engine_3l_fixed": """
 m = "{M3}"
-c = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
+c = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
 ef(c, small)
 inject_and_fail(c, big, "g3l:A1", 1)
-check(c, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(c, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
     # a second calculator holding the same shared engine
     "engine_shared": """
 m = "{M2}"
-a = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
-b = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
+a = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
+b = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
 ef(a, small); ef(b, small)
 inject_and_fail(a, big, "g2l:A1", 1)
-check(b, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(b, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
     # auto chunksize below 2048 atoms: nothing smaller to try, the error goes out; the next call must work
     "engine_auto": """
 m = "{M2}"
-c = GRACERuntimeCalculator(m, device="cuda")
+c = GRACERuntimeCalculator(m, device=GPU)
 ef(c, small)
 inject_and_fail(c, big, "g2l:A1", 1)
-check(c, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(c, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
     # device="auto": the GPU engine cannot be set up (GPU memory held by another process): the CPU with a warning, not
     # remembered (a later calculator takes the GPU)
@@ -110,14 +104,14 @@ with warnings.catch_warnings(record=True) as w:
 kk._debug_fail_alloc("", 0)
 assert c.backend == "cpu", c.backend
 assert any("GPU memory" in str(x.message) for x in w), [str(x.message) for x in w]
-assert GRACERuntimeCalculator(m).backend.startswith("cuda"), "the failure was remembered"
+assert GRACERuntimeCalculator(m).backend.startswith(GPU.split(":")[0]), "the failure was remembered"
 """,
-    # device="cuda": the same is an error that says what happened
-    "cuda_setup_oom": """
+    # an explicit GPU device: the same is an error that says what happened
+    "gpu_setup_oom": """
 m = "{M2}"
 kk._debug_fail_alloc("g2l:", 1)
 try:
-    ef(GRACERuntimeCalculator(m, device="cuda"), small)
+    ef(GRACERuntimeCalculator(m, device=GPU), small)
     raise SystemExit("no error")
 except RuntimeError as e:
     assert "engine" in str(e) and "GPU memory" in str(e) and "0 atoms" not in str(e), e
@@ -127,10 +121,10 @@ finally:
     # the System's own buffers (positions, list)
     "system_buffers": """
 m = "{M2}"
-c = GRACERuntimeCalculator(m, device="cuda", chunksize=4096)
+c = GRACERuntimeCalculator(m, device=GPU, chunksize=4096)
 ef(c, small)
 inject_and_fail(c, big, "kk:pos_build", 1)
-check(c, big, GRACERuntimeCalculator(m, device="cuda", chunksize=2048))
+check(c, big, GRACERuntimeCalculator(m, device=GPU, chunksize=2048))
 """,
 }
 
