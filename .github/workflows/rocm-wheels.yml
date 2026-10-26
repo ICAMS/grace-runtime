@@ -1,0 +1,112 @@
+# AMD GPU package grace-runtime-rocm6, started by hand or from release.yml (not on pull requests).
+# One job per GPU architecture builds Kokkos (cached) and that architecture's module for CPython 3.10, 3.11 and >= 3.12
+# (abi3) in the manylinux_2_28 image (scripts/build_rocm_wheels.sh: the image's g++, ROCm 6.2.4 from AMD's RHEL 8
+# packages, unpacked without root); scripts/merge_cuda_wheels.py then makes one wheel per CPython tag with all modules.
+# The wheels need ROCm 6 on the user's machine (libamdhip64.so.6); they bundle no ROCm library (rocBLAS is loaded at run
+# time when present). The runners have no GPU: the check job tests the wheels' contents and that device="auto" runs on
+# the CPU without a GPU; the GPU tests are scripts/test_rocm_wheels.sh on an AMD GPU machine.
+# The wheels and the sdist are kept as the artifact "rocm-wheels".
+name: ROCm wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: 'GPU architectures, a JSON list, e.g. ["gfx90a","gfx942","gfx1100","gfx1201"]'
+        type: string
+        default: '["gfx90a","gfx942"]'
+  workflow_call:         # from release.yml
+    inputs:
+      archs:
+        type: string
+        default: '["gfx90a","gfx942"]'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.10.16-1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.archs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/grace-runtime/kokkos-rocm-wheel/install-*-${{ matrix.arch }}
+          key: kokkos-rocm-${{ matrix.arch }}-${{ env.IMAGE }}-${{ hashFiles('python-rocm6/CMakeLists.txt', 'scripts/build_rocm_wheels.sh') }}
+      - name: build (manylinux_2_28 image)
+        run: |
+          mkdir -p ~/.cache/grace-runtime
+          docker run --rm -v "$PWD:/io" -v "$HOME/.cache/grace-runtime:/root/.cache/grace-runtime" -w /io \
+            -e GRACE_KK_ARCHS=${{ matrix.arch }} -e NPROC="$(nproc)" "$IMAGE" \
+            bash scripts/build_rocm_wheels.sh dist/rocm-${{ matrix.arch }}
+          sudo chown -R "$(id -u):$(id -g)" dist ~/.cache/grace-runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm-${{ matrix.arch }}
+          path: |
+            dist/rocm-${{ matrix.arch }}/*.whl
+            dist/rocm-${{ matrix.arch }}/*.tar.gz
+          if-no-files-found: error
+
+  merge-and-check:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rocm-gfx*
+          path: dist/parts
+      - name: micromamba
+        run: |
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          { echo "MAMBA_EXE=$HOME/.mm/bin/micromamba"; echo "MAMBA_ROOT_PREFIX=$HOME/micromamba"
+            echo "GRACE_CACHE=$HOME/grace-cache"; } >> "$GITHUB_ENV"
+      - name: merge (one wheel per CPython tag with all modules)
+        run: |
+          "$MAMBA_EXE" create -y -q -n gn-rocmchk -c conda-forge python=3.12 pip numpy ase tqdm pytest auditwheel binutils
+          "$MAMBA_ROOT_PREFIX/envs/gn-rocmchk/bin/python" scripts/merge_cuda_wheels.py dist/rocm-wheelhouse dist/parts/rocm-gfx*/*.whl
+          cp "$(find dist/parts -name '*.tar.gz' | head -1)" dist/rocm-wheelhouse/
+          ls -la dist/rocm-wheelhouse
+      - name: check the wheels' contents
+        run: |
+          for w in dist/rocm-wheelhouse/*.whl; do
+            "$MAMBA_ROOT_PREFIX/envs/gn-rocmchk/bin/python" scripts/check_rocm_wheel.py "$w" "${{ join(fromJSON(inputs.archs), ',') }}"
+          done
+      - name: without a GPU, device="auto" runs on the CPU (no warning)
+        run: |
+          PYTHONS=3.12 bash scripts/build_wheels.sh dist/wheelhouse    # the CPU package it plugs into
+          P=$MAMBA_ROOT_PREFIX/envs/gn-rocmchk/bin
+          "$P/python" -m pip install -q dist/wheelhouse/*cp312-abi3*.whl dist/rocm-wheelhouse/*cp312-abi3*.whl
+          "$P/grace-runtime" models download GRACE-1L-OMAT-large-base
+          "$P/python" -m pytest -q -p no:cacheprovider python/tests/test_rocm_plugin.py
+          cd /tmp && "$P/python" -W error::RuntimeWarning - <<'PY'
+          import os, grace_runtime, grace_runtime._rocm as r
+          print("plug-ins:", [p.__name__ for p in r.plugins()], "modules:", r.available())
+          assert "grace_runtime_rocm6" in [p.__name__ for p in r.plugins()]
+          os.environ.pop("GRACE_RUNTIME_DEVICE", None)
+          calc = grace_runtime.GRACERuntimeCalculator("GRACE-1L-OMAT-large-base")
+          assert calc.backend == "cpu", calc.backend
+          print("no GPU: device='auto' ->", calc.backend)
+          try:
+              grace_runtime.GRACERuntimeCalculator("GRACE-1L-OMAT-large-base", device="rocm")
+              raise SystemExit("device='rocm' without a GPU did not fail")
+          except ImportError as e:
+              print("no GPU: device='rocm' ->", type(e).__name__, e)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm-wheels
+          path: |
+            dist/rocm-wheelhouse/*.whl
+            dist/rocm-wheelhouse/*.tar.gz
+          if-no-files-found: error
