@@ -507,7 +507,11 @@ void Grace3LFused::build_net()
     L.spl.assign((size_t) n.nsp * n.nsp * L.splpair, 0.0f);
     // species pairs in parallel when there are enough of them (25 species: 625 pairs, 9 GB), else the nodes of a pair
     const int npair = use_mlp ? 0 : n.nsp * n.nsp;
+#ifdef _OPENMP
     const bool par_pairs = npair >= omp_get_max_threads();
+#else
+    const bool par_pairs = false;
+#endif
 #pragma omp parallel for schedule(dynamic) if (par_pairs)
     for (int pr = 0; pr < npair; pr++) {
         const int si = pr / n.nsp, sj = pr % n.nsp;
@@ -1571,6 +1575,8 @@ void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   }
   g->fthr.ensure(nthreads, nmax_nodes);
   uq_on = fl.uq;
+  if (uq_on && inum > 0 && !(out.gamma && out.atomic_sigma && out.gmm_cluster))    // no atoms: nothing written
+    throw Error("grace/3l/fused: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
   if (uq_on) {
     g->uqz.assign((size_t) n_nodes * model->uq_rp_dim, 0.0f);
     g->uqn2.assign((size_t) n_nodes * 3, 0.0);

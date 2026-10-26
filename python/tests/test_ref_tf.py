@@ -2,7 +2,7 @@
 """Registry models against independent references: tensorpotential's TPCalculator on their -fp64 SavedModels, on the
 fixture cells (tests/fixtures/ref_tf/registry_tf_fp64.npz). Covers the
 GRACE-2L-SMAX-OMAT-large architecture, which the LAMMPS references (conftest TEST_MODELS) do not; the GPU side is
-python/tests/test_cuda_parity.py::test_against_tf_fp64. Thresholds: fp32 network against fp64 (test_vs_tp.py)."""
+python/tests/test_gpu_parity.py::test_against_tf_fp64. Thresholds: fp32 network against fp64 (test_vs_tp.py)."""
 import os
 
 import numpy as np

@@ -196,8 +196,6 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 #ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
 // ======================================================================
 // Opt 15 (value path): support kernels for the batched cuBLAS radial MLP.
 // TagMLPAssembleVal builds the tightly-packed row-major input matrix
@@ -464,15 +462,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_radial_splines
     budget = mb;    // auto: the tables of the last setup fit then, keep them (the last run's buffers are still held)
   } else if (budget < 0.0) {
     budget = 2048.0;
-#ifdef KOKKOS_ENABLE_CUDA
     size_t fr = 0, tot = 0;
-    if constexpr (is_cuda_v<DeviceType>)
-      if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+    if constexpr (is_gpu_v<DeviceType>)
+      if (device_mem_info(fr, tot)) {
         const double held = (double) d_splR.size() * sizeof(float);
         budget = std::max(budget, std::min(0.25 * (double) tot, (double) fr + held) /
                                       std::max(1, ranks_per_device) / 1048576.0);
       }
-#endif
   }
   if (mb > budget) {
       log.info(fmt("[GRACE-3L/KK] radial MLP by GEMM: tables for {} species pairs would need {:.0f} MB > "
@@ -599,10 +595,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_radial_splines
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::radial_from_splines(bool deriv)
 {
-  const int si = radial_mlp_spbf, N = spl_N[si], NT = spl_Ntot, off = spl_off[si], nsp = n_sp, ld = spl_ld;
+  const int si = radial_mlp_spbf, nsp = n_sp;
   const int d3 = grace_model->spbf[si].mlp.n_out[2];
   const int bs = (int) d_R1_nl.extent(1), ldR = (int) (d_R1_nl.extent(2) * d_R1_nl.extent(3));
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto rn = d_rnorms; auto bc = d_bond_cutoff;
+  const G3LTab tab = spl_tab(si);
+  auto spm = d_sp_of_mu; auto rn = d_rnorms; auto bc = d_bond_cutoff;
   auto mui = d_mu_i; auto muj = d_mu_j; auto nc = d_ncount;
   NNScalar *R = d_R1_nl.data(), *DR = d_DR1_nl.data();
   const bool dv = deriv;
@@ -612,14 +609,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::radial_from_splines(
     const int mi = mui(ii), mj = muj(ii, jj);
     const int p = spm(mi) * nsp + spm(mj);
     const GeomScalar rc = bc(mi, mj), x = GeomScalar(rn(ii, jj)) / rc;
-    const float s = (float) x * N;
-    int k = (int) s;
-    if (k > N - 1) k = N - 1;
-    const float t = s - k;
-    const G3F4 c = *reinterpret_cast<const G3F4 *>(tab.data() + (((size_t) p * NT + off + k) * ld + o) * 4);
-    R[(size_t) b * ldR + o] = c.x + t * (c.y + t * (c.z + t * c.w));
+    float t;
+    const long r0 = tab.row_s(p, (float) x * tab.N, t);
+    const G3F4 c = *reinterpret_cast<const G3F4 *>(tab.c + (r0 + o) * 4);
+    R[(size_t) b * ldR + o] = g3l_cubic(c, t);
     if (dv) {
-      DR[(size_t) b * ldR + o] = (NNScalar) ((c.y + t * (2.0f * c.z + 3.0f * t * c.w)) * (float) N / (float) rc);
+      // (dt N) / rc as before, not dt tab.dsdr(rc) (rounds differently)
+      DR[(size_t) b * ldR + o] = (NNScalar) (g3l_cubic_dt(c, t) * (float) tab.N / (float) rc);
     }
   });
 }
@@ -640,7 +636,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
   if (spline_on) { radial_from_splines(false); return; }
 #ifdef KOKKOS_ENABLE_CUDA
   const auto &hmlp = grace_model->spbf[radial_mlp_spbf].mlp;
-  if (cublas_handle && hmlp.n_layers == 3 && sizeof(NNScalar) == 4) {
+  if (blas_handle && hmlp.n_layers == 3 && sizeof(NNScalar) == 4) {
     const int si = radial_mlp_spbf;
     const int bond_stride = (int) d_R1_nl.extent(1);   // == d_radial_basis.extent(1)
     const int M = chunk_size * bond_stride;
@@ -703,9 +699,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
   Kokkos::parallel_for("ComputeMLPRadial", policy, *this);
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 15: true-fp32 batched SGEMM. Row-major C[M x n_out] = alpha*In[M x n_in]*Wg[n_in x n_out].
 // cuBLAS is column-major, so this equals the col-major product
 // C^T[n_out x M] = alpha * Wg^T[n_out x n_in] * In^T[n_in x M], i.e. OP_N/OP_N with
@@ -717,57 +711,36 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_sgemm(
     int n_out, int M, int n_in, int ldW, int ldIn, int ldC, NNScalar alpha)
 {
   const float a = (float) alpha, beta = 0.0f;
-  cublasStatus_t st = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+  blas::status_t st = blas::sgemm(blas_handle, blas::OP_N, blas::OP_N,
       n_out, M, n_in, &a,
       (const float*) Wg, ldW,
       (const float*) In, ldIn,
       &beta, (float*) C, ldC);
-  if (st != CUBLAS_STATUS_SUCCESS)
+  if (st != blas::SUCCESS)
     GRACE_KK_ERROR("GRACE-3L/KK: cublasSgemm failed (status {})", (int) st);
 }
 
 #endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 15 hard gate: verify the layer-0 SGEMM (transpose/leading-dim convention +
 // true-fp32 path) reproduces a host fp64 reference on a tiny deterministic batch
-// before the full chain is ever used. Aborts on gross mismatch (transpose bug ->
-// O(1) error); fp32 rounding over K~138 stays well under the 1e-4 gate.
+// before the full chain is ever used; gate: blas::selftest_error <= 1.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_cublas_selftest()
 {
   const auto &mlp = grace_model->spbf[0].mlp;   // A1
   if (mlp.n_layers < 1) return;
   const int n_in = mlp.n_in[0], n_out = mlp.n_out[0];
-  const int Mt = 4;
-  t_nn_2d_r X("g3l:selftest_X", Mt, n_in), C("g3l:selftest_C", Mt, n_out);
-  auto hX = Kokkos::create_mirror_view(X);
-  for (int b = 0; b < Mt; b++)
-    for (int k = 0; k < n_in; k++)
-      hX(b, k) = (NNScalar)(0.01 * (double)(((b * 7 + k * 3) % 13) - 6));
-  Kokkos::deep_copy(X, hX);
-
-  mlp_sgemm(d_mlp_Wg[0][0].data(), X.data(), C.data(), n_out, Mt, n_in,
-      (int)d_mlp_Wg[0][0].extent(1), (int)X.extent(1), (int)C.extent(1), NNScalar(1.0));
-  Kokkos::fence();
-
-  auto hC = Kokkos::create_mirror_view(C);
-  Kokkos::deep_copy(hC, C);
-  double maxrel = 0.0;
-  for (int b = 0; b < Mt; b++)
-    for (int j = 0; j < n_out; j++) {
-      double ref = 0.0;
-      for (int k = 0; k < n_in; k++)
-        ref += (double) hX(b, k) * mlp.W[0][(size_t) k * n_out + j];
-      const double rel = std::fabs((double) hC(b, j) - ref) / std::max(1e-6, std::fabs(ref));
-      maxrel = std::max(maxrel, rel);
-    }
-  // Threshold sized for the fp32 cublasSgemm this selftest exercises: correct
-  // fp32-GEMM rounding is ~a few e-4 for realistic MLP widths, while a
-  // transpose/leading-dim convention bug (what this gate guards against) yields
-  // O(0.1-1) error. 7e-4 passes the former and still catches the latter.
-  if (maxrel > 7e-4)
-    GRACE_KK_ERROR("GRACE-3L/KK: cuBLAS layer-0 selftest FAILED (max rel err {})", maxrel);
-    log.info(fmt("[GRACE-3L/KK] cuBLAS radial-MLP selftest OK (layer-0 max rel {:.2e})\n", maxrel));
+  const auto &Wg = d_mlp_Wg[0][0];
+  const double err = blas::gemm_selftest<NNScalar, DeviceType>("g3l", n_in, n_out, mlp.W[0].data(),
+      [&](const NNScalar *X, NNScalar *C, int M) {
+        mlp_sgemm(Wg.data(), X, C, n_out, M, n_in, (int) Wg.extent(1), n_in, n_out, NNScalar(1.0));
+      });
+  if (err > 1.0)
+    GRACE_KK_ERROR("GRACE-3L/KK: {} layer-0 selftest FAILED (max error {:.3g} x the fp32 rounding bound)",
+                   blas::name(), err);
+  log.info(fmt("[GRACE-3L/KK] {} radial-MLP selftest OK (layer-0 error {:.2f} x the fp32 rounding bound)\n",
+               blas::name(), err));
 }
 #endif
 
@@ -787,7 +760,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial_d
   if (spline_on) { radial_from_splines(true); return; }
 #ifdef KOKKOS_ENABLE_CUDA
   const auto &hmlp = grace_model->spbf[radial_mlp_spbf].mlp;
-  if (cublas_handle && hmlp.n_layers == 3 && sizeof(NNScalar) == 4) {
+  if (blas_handle && hmlp.n_layers == 3 && sizeof(NNScalar) == 4) {
     const int si = radial_mlp_spbf;
     const int bond_stride = (int) d_R1_nl.extent(1);
     const int M = chunk_size * bond_stride;

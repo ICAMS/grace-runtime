@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """Several GPU calculators in one process (README "Several calculators in one process"): one Kokkos for all of them,
 one kk.Model (weights, tables) per model file shared by its calculators, calculators of different models interleaved
-or called from two threads give what each gives alone, a second CUDA device is refused. GPU sums use atomics, so
+or called from two threads give what each gives alone, a second GPU is refused. GPU sums use atomics, so
 results are compared at the run-to-run level (energy 1e-6 eV/atom, forces 1e-5 eV/A). Each case in its own process
 (fresh Kokkos)."""
 import os
@@ -12,27 +12,22 @@ from pathlib import Path
 
 import pytest
 
-from grace_runtime import _cuda
+from gpu_tools import NO_GPU, gpu_count, gpu_ok
 
 CACHE = Path(os.environ.get("GRACE_CACHE", Path.home() / ".cache" / "grace-runtime-test"))
 M1 = CACHE / "GRACE-1L-OMAT-large-base" / "kokkos.npz"
 M2 = CACHE / "GRACE-2L-SMAX-OMAT-medium" / "kokkos.npz"
 
 
-def _cuda_ok():
-    try:
-        _cuda.module_for(0)
-        return True
-    except (ImportError, ValueError):
-        return False
 
-
-pytestmark = pytest.mark.skipif(not _cuda_ok() or not (M1.exists() and M2.exists()), reason="no GPU module / models")
+pytestmark = pytest.mark.skipif(not gpu_ok() or not (M1.exists() and M2.exists()), reason=f"{NO_GPU} / models")
 
 PRELUDE = """
 import threading, numpy as np
 from ase.build import bulk
-from grace_runtime import GRACERuntimeCalculator, _cuda
+from grace_runtime import GRACERuntimeCalculator
+GPU = __import__("os").environ["GRACE_TEST_GPU"]
+PLATFORM = GPU.split(":")[0]
 
 def structures():
     w = bulk("W", "bcc", a=3.165, cubic=True).repeat(4)
@@ -55,9 +50,9 @@ def same(a, b, n, what):
 CASES = {
     # one kk.Model per model file: the second calculator of a model shares the first one's weights and engine
     "same_model_shares_weights": """
-c1 = GRACERuntimeCalculator("{M2}", device="cuda")
-c2 = GRACERuntimeCalculator("{M2}", device="cuda")
-c3 = GRACERuntimeCalculator("{M1}", device="cuda")
+c1 = GRACERuntimeCalculator("{M2}", device=GPU)
+c2 = GRACERuntimeCalculator("{M2}", device=GPU)
+c3 = GRACERuntimeCalculator("{M1}", device=GPU)
 assert c1._kk is c2._kk is c3._kk    # one GPU module, one Kokkos
 assert c1._kk_model is c2._kk_model
 assert c3._kk_model is not c1._kk_model
@@ -67,9 +62,9 @@ assert c3._kk_model is not c1._kk_model
 s = structures()
 alone = {{}}
 for name, path in (("1l", "{M1}"), ("2l", "{M2}")):
-    c = GRACERuntimeCalculator(path, device="cuda")
+    c = GRACERuntimeCalculator(path, device=GPU)
     alone[name] = [run(c, at) for at in s]
-c1, c2 = GRACERuntimeCalculator("{M1}", device="cuda"), GRACERuntimeCalculator("{M2}", device="cuda")
+c1, c2 = GRACERuntimeCalculator("{M1}", device=GPU), GRACERuntimeCalculator("{M2}", device=GPU)
 cpu = GRACERuntimeCalculator("{M1}", device="cpu", num_threads=4)
 for rep in range(3):
     for k, at in enumerate(s):
@@ -82,7 +77,7 @@ for rep in range(3):
     "two_threads": """
 s = structures()
 for paths in (("{M2}", "{M2}"), ("{M1}", "{M2}")):
-    calcs = [GRACERuntimeCalculator(p, device="cuda") for p in paths]
+    calcs = [GRACERuntimeCalculator(p, device=GPU) for p in paths]
     ref = [[run(c, at) for at in s] for c in calcs]
     errors = []
     def work(i):
@@ -97,17 +92,15 @@ for paths in (("{M2}", "{M2}"), ("{M1}", "{M2}")):
     [t.join() for t in ts]
     assert not errors, errors
 """,
-    # Kokkos runs on one device per process: a calculator on another GPU is refused, the first one keeps working
+    # one CUDA device per process (the runtime's design): a calculator on another GPU is refused, the first one keeps working
     "second_device_refused": """
-import ctypes
-cu = ctypes.CDLL("libcuda.so.1"); cu.cuInit(0); n = ctypes.c_int(); cu.cuDeviceGetCount(ctypes.byref(n))
-c0 = GRACERuntimeCalculator("{M1}", device="cuda:0")
-if n.value > 1:
+c0 = GRACERuntimeCalculator("{M1}", device=PLATFORM + ":0")
+if {NGPU} > 1:
     try:
-        GRACERuntimeCalculator("{M1}", device="cuda:1")
-        raise AssertionError("cuda:1 accepted after cuda:0")
+        GRACERuntimeCalculator("{M1}", device=PLATFORM + ":1")
+        raise AssertionError(":1 accepted after :0")
     except ValueError as e:
-        assert "one CUDA device per process" in str(e), e
+        assert "one GPU per process" in str(e), e
 else:
     print("SKIP-PART one visible GPU")
 run(c0, structures()[0])
@@ -117,7 +110,7 @@ run(c0, structures()[0])
 
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_several_calculators(case):
-    code = PRELUDE + textwrap.dedent(CASES[case]).format(M1=M1, M2=M2)
+    code = PRELUDE + textwrap.dedent(CASES[case]).format(M1=M1, M2=M2, NGPU=gpu_count())
     env = {k: v for k, v in os.environ.items() if k != "GRACE_RUNTIME_DEVICE"}
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=900, env=env)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]

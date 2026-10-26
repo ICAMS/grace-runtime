@@ -7,13 +7,9 @@
 // stretched bonds of dE/dr' dr'/dlambda. Host and device (CUDA / HIP) code.
 #pragma once
 
-#include <cmath>
+#include "grace/hd.h"
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
-#define GRACE_HD __host__ __device__ inline
-#else
-#define GRACE_HD inline
-#endif
+#include <cmath>
 
 namespace grace {
 

@@ -49,7 +49,8 @@ def select(flags, forced, avail):
             raise ImportError(f"GRACE_RUNTIME_CPU={forced}: this CPU lacks {', '.join(miss)}")
         return isa
     if not avail:
-        raise ImportError("grace-runtime: no compiled extension (_core_x86_64_v3 / _v4) found; the installation is broken")
+        raise ImportError("grace-runtime: no compiled extension (_core_x86_64_v3 / _v4 / _native) found; "
+                          "the installation is broken")
     if "native" in avail:
         return "native"
     if not flags and "x86_64_v3" in avail:     # flags unknown: the most compatible build

@@ -6,10 +6,15 @@
 #include "grace/error.h"
 #include "grace/uq.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace grace {
+namespace cnpy {
+struct NpyArray;
+}
+
 
 // ============================================================================
 // GRACE2LModel: Host-side weight container loaded from .npz file
@@ -37,8 +42,7 @@ struct GRACE2LModel {
 
   // ---- Layer 1 ----
   int L1_nradmax = 42;
-  int L1_mlp_rad_n_layers = 0;
-  bool L1_mlp_rad_has_chem_emb = false;
+  int L1_mlp_rad_n_layers = 0;    // radial MLPs of the bond length only (the loader rejects chem-embedded ones)
   std::vector<MLPLayer> L1_mlp_rad_layers;  // R
 
   // A indicator transform
@@ -46,7 +50,7 @@ struct GRACE2LModel {
   double A_lin_transform_norm = 1.0;
   double A_inv_avg_n_neigh = 1.0;
 
-  // FC weights
+  // FC weights; left weights in every FC (left_coefs = 1, checked by the loader)
   struct FCWeights {
     std::vector<double> w_left, w_right;
     std::vector<int> w_tile_left, w_tile_right;
@@ -54,7 +58,6 @@ struct GRACE2LModel {
     std::vector<double> norm_out_factor;
     double norm_left = 1.0, norm_right = 1.0;
     int n_out = 0;
-    bool left_coefs = true;
     int n_funcs_left = 0, n_funcs_right = 0;
     int w_shape_left = 0, w_shape_right = 0;
   };
@@ -85,18 +88,15 @@ struct GRACE2LModel {
   ReduceWeights I1_reduce_A, I1_reduce_AA, I1_reduce_AAA, I1_reduce_AAAA;
   int I1_n_out = 12;
   int I1_n_funcs = 4;
-  bool I1_is_elem_dependent = true;
 
   // I reducer (equivariant, NOT element-dependent)
   ReduceWeights I_reduce_I1;
   int I_n_out = 32;
   int I_n_funcs = 4;
-  bool I_is_elem_dependent = false;
 
   // rho reducer (scalar, element-dependent) — same structure as 1L
   ReduceWeights rho_reduce_A, rho_reduce_AA, rho_reduce_AAA, rho_reduce_AAAA;
   int rho_n_out = 17;
-  bool rho_is_elem_dependent = true;
 
   // RMSNorm: I_nl_LN (only_nonlin: scale has n_out-1 elements, rho[0] passed through)
   std::vector<double> I_nl_LN_scale;  // [rho_n_out - 1] = [16]
@@ -120,7 +120,6 @@ struct GRACE2LModel {
     std::vector<double> cg_coeff; // [n_cg_terms]
     int n_output_funcs = 0;
     int n_cg_terms = 0;
-    int Lmax = 0;
     int n_rad_max = 0;
     double inv_avg_n_neigh = 1.0;
   } yi;
@@ -129,7 +128,6 @@ struct GRACE2LModel {
   ReduceWeights B_reduce_YI, B_reduce_B0;
   int B_n_out = 64;
   int B_n_funcs = 31;
-  bool B_is_elem_dependent = false;
 
   // Layer 2 FC/Products
   FCWeights fc_B1, fc_BB1, fc_BB2;
@@ -139,7 +137,6 @@ struct GRACE2LModel {
   // I2 reducer (scalar, element-dependent)
   ReduceWeights I2_reduce_B, I2_reduce_BB, I2_reduce_BBB, I2_reduce_BBBB;
   int I2_n_out = 17;
-  bool I2_is_elem_dependent = true;
 
   // RMSNorm: I_0_LN (full: scale has n_out elements, all scaled)
   std::vector<double> I_0_LN_scale;  // [I2_n_out] = [17]
@@ -182,6 +179,8 @@ struct GRACE2LModel {
   std::vector<double> uq_rp_matrix;          // [D_basis*rp_dim] row-major projection R
 
   void load(const std::string &filepath);
+  // load() of an archive already read (key -> array), e.g. a modified copy in a test
+  void load_arrays(const std::map<std::string, cnpy::NpyArray> &npz);
 
   // throws grace::Error unless the model carries a usable schema-6 UQ head
 

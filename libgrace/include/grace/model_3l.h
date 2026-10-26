@@ -6,10 +6,15 @@
 
 #include "grace/uq_head.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace grace {
+namespace cnpy {
+struct NpyArray;
+}
+
 
 // ============================================================================
 // GRACE3LModel: Host-side weight container loaded from .npz file.
@@ -36,7 +41,6 @@ struct GRACE3LModel : UqHead {
   int lmax = 0;                 // angular lmax (== SPBF _lmax; no bare npz key -> from A1_lmax)
   int nradbase = 0;             // Chebyshev basis count (== SPBF n_rad_basis)
   int radial_basis_p = 0;       // envelope polynomial order used by geometry (== SPBF p)
-  int radial_basis_p_global = 0; // the (unused-by-geometry) global radial_basis_p key
   double rcut = 0.0;
   bool has_bond_specific_cutoff = false;
   std::vector<double> bond_cutoff_map;   // [n_elements * n_elements]
@@ -103,14 +107,14 @@ struct GRACE3LModel : UqHead {
     std::vector<double> cg;               // [n_cg]
     std::vector<int> group_left, group_right;   // [n_lm_left], [n_lm_right]
     std::vector<int> left_ind, right_ind, m_sum_ind;  // [n_cg]
-    std::vector<int> out_l, out_parity;   // [nfunc]
+    std::vector<int> out_l;               // [nfunc]
     std::vector<int> newcol;              // [nfunc] file function -> output column (group_reduce_inputs), or empty
   };
 
   // ---- FunctionReduceN (metadata driven; per-instruction collectors) ----
   struct ReduceInstr {
     std::string name;
-    std::vector<double> W;                // flat: elem_dep [n_types,n_out,n_in,w_shape] else [1,n_out,n_in,w_shape]
+    std::vector<double> W;                // flat: elem_dep [n_types,n_out,n_in,w_shape] else [n_out,n_in,w_shape]
     double norm = 1.0;
     int n_in = 0, w_shape = 0, n_conn = 0;
     std::vector<int> collect_ind;         // [n_conn]
@@ -180,6 +184,8 @@ struct GRACE3LModel : UqHead {
   bool reduce_inputs_grouped = false;
 
   void load(const std::string &filepath);
+  // load() of an archive already read (key -> array), e.g. a modified copy in a test
+  void load_arrays(const std::map<std::string, cnpy::NpyArray> &npz);
 };
 
 }    // namespace grace

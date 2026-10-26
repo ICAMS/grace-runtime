@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """device="auto" (the default, as TensorFlow places work on a GPU when there is one): the GPU when a module for it is
 installed and the fused kernels take the model, else the CPU — silently without a GPU, with a RuntimeWarning naming
-the reason when a GPU is there but cannot be used. GRACE_RUNTIME_DEVICE overrides the choice; an explicit "cuda"
+the reason when a GPU is there but cannot be used. GRACE_RUNTIME_DEVICE overrides the choice; an explicit GPU device
 still raises."""
 import os
 import subprocess
@@ -14,21 +14,15 @@ from ase.io import read
 
 from grace_runtime import GRACERuntimeCalculator, _cuda, compute_batch
 
+from gpu_tools import GPU, NO_GPU, NO_MODULE_ARCH, NO_MODULE_ENV, PLATFORM, gpu_ok
+
 FX = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 CACHE = Path(os.environ.get("GRACE_CACHE", Path.home() / ".cache" / "grace-runtime-test"))
 M2 = CACHE / "GRACE-2L-OMAT-medium-ft-E" / "kokkos.npz"
 UNSUPPORTED = Path.home() / ".cache" / "grace" / "GRACE-2L-OMAT-large-mx" / "kokkos.npz"    # fused: ReduceN widths
 
 
-def _cuda_ok():
-    try:
-        _cuda.module_for(0)
-        return True
-    except (ImportError, ValueError):
-        return False
-
-
-pytestmark = [pytest.mark.skipif(not _cuda_ok(), reason="no CUDA module for this device"),
+pytestmark = [pytest.mark.skipif(not gpu_ok(), reason=NO_GPU),
               pytest.mark.skipif(not M2.exists(), reason="registry model missing")]
 
 
@@ -39,14 +33,14 @@ def wmo54():
 def test_auto_is_default_and_takes_the_gpu(monkeypatch):
     monkeypatch.delenv("GRACE_RUNTIME_DEVICE", raising=False)
     calc = GRACERuntimeCalculator(str(M2))
-    assert calc.backend.startswith("cuda:"), calc.backend
+    assert calc.backend.startswith(PLATFORM + ":"), calc.backend
     at = wmo54()
     at.calc = calc
     ref = wmo54()
-    ref.calc = GRACERuntimeCalculator(str(M2), device="cuda")
+    ref.calc = GRACERuntimeCalculator(str(M2), device=GPU)
     assert abs(at.get_potential_energy() - ref.get_potential_energy()) <= 1e-6 * len(at)
     a = compute_batch(str(M2), [wmo54()])[0]
-    b = compute_batch(str(M2), [wmo54()], device="cuda")[0]
+    b = compute_batch(str(M2), [wmo54()], device=GPU)[0]
     assert abs(a["energy"] - b["energy"]) <= 1e-6 * 54
 
 
@@ -61,8 +55,8 @@ def test_auto_falls_back_for_a_model_outside_the_fused_kernels(monkeypatch):
     with pytest.warns(RuntimeWarning, match="fused GPU kernels"):
         calc = GRACERuntimeCalculator(str(UNSUPPORTED))
     assert calc.backend == "cpu"
-    with pytest.raises(ValueError, match="not supported on device='cuda'"):
-        GRACERuntimeCalculator(str(UNSUPPORTED), device="cuda").get_potential_energy(wmo54())
+    with pytest.raises(ValueError, match=f"not supported on device='{PLATFORM}'"):
+        GRACERuntimeCalculator(str(UNSUPPORTED), device=GPU).get_potential_energy(wmo54())
     with pytest.warns(RuntimeWarning, match="fused GPU kernels"):
         r = compute_batch(str(UNSUPPORTED), [wmo54()])
     assert "energy" in r[0]
@@ -73,10 +67,10 @@ def test_auto_falls_back_without_a_module_for_the_gpu():
     code = ("import warnings, sys; warnings.simplefilter('error', RuntimeWarning)\n"
             "from grace_runtime import GRACERuntimeCalculator\n"
             "try:\n    GRACERuntimeCalculator(sys.argv[1])\nexcept RuntimeWarning as w:\n    print('WARN', w)\n")
-    env = dict(os.environ, GRACE_RUNTIME_CUDA_ARCH="sm00")
+    env = dict(os.environ, **NO_MODULE_ENV)
     env.pop("GRACE_RUNTIME_DEVICE", None)
     out = subprocess.run([sys.executable, "-c", code, str(M2)], env=env, capture_output=True, text=True, timeout=300)
-    assert "WARN" in out.stdout and "sm00" in out.stdout, out.stdout + out.stderr
+    assert "WARN" in out.stdout and NO_MODULE_ARCH in out.stdout, out.stdout + out.stderr
 
 
 def test_auto_runs_3l_on_the_gpu(monkeypatch, models):
@@ -88,7 +82,7 @@ def test_auto_runs_3l_on_the_gpu(monkeypatch, models):
         warnings.simplefilter("error", RuntimeWarning)
         calc = GRACERuntimeCalculator(str(M3))
         r = compute_batch(str(M3), [wmo54()])
-    assert calc.backend.startswith("cuda:"), calc.backend
+    assert calc.backend.startswith(PLATFORM + ":"), calc.backend
     at = wmo54()
     at.calc = calc
     ref = wmo54()
@@ -96,7 +90,7 @@ def test_auto_runs_3l_on_the_gpu(monkeypatch, models):
     e_ref = ref.get_potential_energy()
     assert abs(at.get_potential_energy() - e_ref) <= 2e-6 * len(at)
     assert abs(r[0]["energy"] - e_ref) <= 2e-6 * 54
-    assert GRACERuntimeCalculator(str(M3), device="cuda").backend.startswith("cuda:")
+    assert GRACERuntimeCalculator(str(M3), device=GPU).backend.startswith(PLATFORM + ":")
 
 
 def _fresh(code, *args):
@@ -112,9 +106,9 @@ def test_compute_batch_on_the_cpu_stays_there():
     """compute_batch(device="cpu") must not start the GPU backend"""
     out = _fresh("import sys\n"
                  "from ase.build import bulk\n"
-                 "from grace_runtime import compute_batch, _cuda\n"
+                 "from grace_runtime import compute_batch, _gpu\n"
                  "compute_batch(sys.argv[1], [bulk('W', 'bcc', a=3.165, cubic=True)], device='cpu')\n"
-                 "print('KK', _cuda._state['module'] is not None)\n", M2)
+                 "print('KK', _gpu._state['module'] is not None)\n", M2)
     assert "KK False" in out, out
 
 
@@ -128,21 +122,21 @@ def _run(code, **env_extra):
 def test_backend_info_of_a_native_module(monkeypatch):
     monkeypatch.delenv("GRACE_RUNTIME_DEVICE", raising=False)
     i = GRACERuntimeCalculator(str(M2)).backend_info
-    assert i["native"] is True and i["fallback"] is None and i["device"].startswith("cuda:"), i
+    assert i["native"] is True and i["fallback"] is None and i["device"].startswith(PLATFORM + ":"), i
 
 
 def test_cpu_fallback_is_announced_on_stderr_and_in_backend_info():
     code = ("import warnings, sys; warnings.simplefilter('ignore')\n"
             "from grace_runtime import GRACERuntimeCalculator\n"
             "c = GRACERuntimeCalculator(sys.argv[1]); print('INFO', c.backend, c.backend_info['fallback'])\n")
-    r = _run(code, GRACE_RUNTIME_CUDA_ARCH="sm00")
-    assert "INFO cpu" in r.stdout and "sm00" in r.stdout, r.stdout + r.stderr
+    r = _run(code, **NO_MODULE_ENV)
+    assert "INFO cpu" in r.stdout and NO_MODULE_ARCH in r.stdout, r.stdout + r.stderr
     assert "grace-runtime WARNING: device='auto'" in r.stderr and "running on the CPU" in r.stderr, r.stderr
 
 
 def test_strict_mode_makes_the_cpu_fallback_an_error():
     code = "import sys\nfrom grace_runtime import GRACERuntimeCalculator\nGRACERuntimeCalculator(sys.argv[1])\n"
-    r = _run(code, GRACE_RUNTIME_CUDA_ARCH="sm00", GRACE_RUNTIME_STRICT="1")
+    r = _run(code, GRACE_RUNTIME_STRICT="1", **NO_MODULE_ENV)
     assert r.returncode != 0 and "GRACE_RUNTIME_STRICT=1" in r.stderr, r.stdout + r.stderr
 
 
@@ -153,7 +147,8 @@ def _older_family_module():
     return max(older, key=lambda a: int(a[2:])) if older else None
 
 
-@pytest.mark.skipif(_cuda_ok() and _older_family_module() is None, reason="no module of an older GPU family installed")
+@pytest.mark.skipif(PLATFORM != "cuda" or _older_family_module() is None,
+                    reason="no module of an older GPU family installed (NVIDIA: PTX; AMD has no such fallback)")
 def test_ptx_of_an_older_module_gives_the_same_results(tmp_path):
     """the PTX path (forced here with GRACE_RUNTIME_CUDA_ARCH; real use: GRACE_RUNTIME_ALLOW_PTX=1 on a GPU without a
     module of its family): announced, visible in backend / backend_info, same energy and forces as the native module;
@@ -170,6 +165,9 @@ def test_ptx_of_an_older_module_gives_the_same_results(tmp_path):
     older = _older_family_module()
     cache = str(tmp_path / "jit-cache")
     ptx = _run(code, GRACE_RUNTIME_CUDA_ARCH=older, CUDA_CACHE_PATH=cache)
+    if _cuda._state["driver"] < _cuda.PTX_DRIVER:    # the driver cannot compile the modules' PTX: refused, no abort
+        assert ptx.returncode == 1 and "update the driver" in ptx.stderr, ptx.stderr
+        return
     assert ptx.returncode == 0, ptx.stderr
     b = json.loads(ptx.stdout.splitlines()[-1])
     assert "PTX" in b["backend"] and b["info"]["native"] is False and b["info"]["fallback"] == "ptx", b

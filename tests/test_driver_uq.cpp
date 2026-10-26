@@ -171,6 +171,37 @@ int main()
     CHECK(std::isfinite(r1.gamma[0]) && std::isfinite(r2.gamma[0]) && std::isfinite(r3.gamma[0]));
     std::printf("isolated W: gamma 1L %.4g 2L %.4g 3L %.4g\n", r1.gamma[0], r2.gamma[0], r3.gamma[0]);
   }
+  {    // no atoms (a LAMMPS rank without local atoms): UQ on with null outputs is fine, nothing is written
+    Cell none;
+    none.offset = {0};
+    grace::Outputs out;    // all outputs null
+    std::vector<double> f(3, 0.0);
+    out.f = f.data();
+    grace::ComputeFlags fl;
+    fl.uq = true;
+    grace::CsrBonds src{nullptr, none.offset.data(), nullptr, nullptr};
+    grace::NoExchange ex;
+    out.energy = 0.0;    // compute adds to it: nothing to add without atoms
+    d1.compute(0, nullptr, 0, 1, src, out, fl, 1);
+    CHECK(out.energy == 0.0);
+    out.energy = 0.0;
+    d2.compute(0, nullptr, 0, 1, src, ex, out, fl, 1);
+    CHECK(out.energy == 0.0);
+    out.energy = 0.0;
+    d3.compute(0, nullptr, 0, 1, src, ex, out, fl, 1);
+    CHECK(out.energy == 0.0);
+    // with atoms the null outputs are an error (1L, 2L, 3L)
+    const Cell cw = load_cell(fx + "/WMo54.npz");
+    grace::CsrBonds csrc{cw.type.data(), cw.offset.data(), cw.j.data(), cw.rij.data()};
+    std::vector<double> fc(3 * cw.n, 0.0);
+    out.f = fc.data();
+    int threw_null = 0;
+    try { d1.compute(cw.n, nullptr, cw.n, cw.n, csrc, out, fl, 1); } catch (const grace::Error &) { threw_null++; }
+    try { d2.compute(cw.n, nullptr, cw.n, cw.n, csrc, ex, out, fl, 1); } catch (const grace::Error &) { threw_null++; }
+    try { d3.compute(cw.n, nullptr, cw.n, cw.n, csrc, ex, out, fl, 1); } catch (const grace::Error &) { threw_null++; }
+    CHECK(threw_null == 3);
+    std::printf("UQ with null outputs: no atoms fine, with atoms an error (1L/2L/3L)\n");
+  }
   if (*p2n && exists(p2n)) {    // a model without a UQ head
     auto mn = std::make_shared<grace::GRACE2LModel>();
     mn->load(p2n);

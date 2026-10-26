@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // grace_runtime._kk_<arch>: Python binding of the GPU backend (kk_api.h). Host compiler only, no Kokkos headers.
+#include "dispersion_args.h"
 #include "kk_api.h"
 
 #include <nanobind/nanobind.h>
@@ -28,6 +29,18 @@ nb::ndarray<nb::numpy, double> from_vec(std::vector<double> &&v, std::initialize
   return nb::ndarray<nb::numpy, double>(p->data(), shape, own);
 }
 
+template<class S> void set_dispersion(S &s, std::optional<nb::dict> params, const std::vector<int> &atomic_numbers)
+{
+  if (!params) {
+    nb::gil_scoped_release nogil;
+    s.set_dispersion(nullptr, atomic_numbers);
+    return;
+  }
+  const auto p = dispersion_params(*params);
+  nb::gil_scoped_release nogil;
+  s.set_dispersion(&p, atomic_numbers);
+}
+
 nb::dict compute(gk::System &s, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> types,
                  nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> pos,
                  nb::ndarray<const double, nb::shape<3, 3>, nb::c_contig, nb::device::cpu> cell, std::array<bool, 3> pbc, bool energies,
@@ -42,6 +55,14 @@ nb::dict compute(gk::System &s, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_co
   }
   nb::dict d;
   d["energy"] = r.energy;
+  if (r.dispersion) {    // set_dispersion: its share of the outputs
+    d["dispersion_energy"] = r.dispersion_energy;
+    d["dispersion_energies"] = from_vec(std::move(r.dispersion_energies), {(size_t) n});
+    if (!energy_only) {
+      d["dispersion_virial"] = from_vec(std::vector<double>(r.dispersion_virial, r.dispersion_virial + 6), {6});
+      d["dispersion_forces"] = from_vec(std::move(r.dispersion_forces), {(size_t) n, 3});
+    }
+  }
   if (!energy_only) {
     d["virial"] = from_vec(std::vector<double>(r.virial, r.virial + 6), {6});
     d["forces"] = from_vec(std::move(r.forces), {(size_t) n, 3});
@@ -63,7 +84,7 @@ nb::dict compute_batch(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, nb:
                        nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> pos,
                        nb::ndarray<const double, nb::shape<-1, 3, 3>, nb::c_contig, nb::device::cpu> cells,
                        nb::ndarray<const bool, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> pbc, bool energies, bool uq,
-                       bool energy_only, int num_threads, int64_t max_nall)
+                       bool energy_only, int64_t max_nall, bool dispersion_parts)
 {
   const size_t nsys = natoms.shape(0), n = types.shape(0);
   if (pos.shape(0) != n) throw nb::value_error("positions and types differ in length");
@@ -72,10 +93,18 @@ nb::dict compute_batch(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, nb:
   {
     nb::gil_scoped_release nogil;
     r = b.compute((int) nsys, natoms.data(), (int64_t) n, types.data(), pos.data(), cells.data(), pbc.data(),
-                  energies, uq, energy_only, num_threads, max_nall);
+                  energies, uq, energy_only, max_nall, dispersion_parts);
   }
   nb::dict d;
   d["energy"] = from_vec(std::move(r.energy), {nsys});
+  if (r.dispersion) d["dispersion_energy"] = from_vec(std::move(r.dispersion_energy), {nsys});
+  if (r.dispersion && dispersion_parts) {
+    d["dispersion_energies"] = from_vec(std::move(r.dispersion_energies), {n});
+    if (!energy_only) {
+      d["dispersion_virial"] = from_vec(std::move(r.dispersion_virial), {nsys, 6});
+      d["dispersion_forces"] = from_vec(std::move(r.dispersion_forces), {n, 3});
+    }
+  }
   if (!energy_only) {
     d["virial"] = from_vec(std::move(r.virial), {nsys, 6});
     d["forces"] = from_vec(std::move(r.forces), {n, 3});
@@ -88,24 +117,34 @@ nb::dict compute_batch(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, nb:
   }
   return d;
 }
+// DLPack device type of the module's GPU: kDLCUDA, or kDLROCM for AMD GPUs (ROCm builds of torch / CuPy)
+#ifdef GRACE_KK_PLATFORM_HIP
+using GpuDev = nb::device::rocm;
+#else
+using GpuDev = nb::device::cuda;
+#endif
+
 template<class A> void on_device(const A &a, const char *name)
 {
-  if (a.device_type() != nb::device::cuda::value || a.device_id() != gk::device())
-    throw nb::value_error((std::string(name) + " must be on the module's CUDA device").c_str());
+  if (a.device_type() != GpuDev::value || a.device_id() != gk::device())
+    throw nb::value_error((std::string(name) + " must be on the module's GPU (" + gk::platform() + ":" +
+                           std::to_string(gk::device()) + ")").c_str());
 }
 
-using DevD1 = nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
-using DevD2 = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+using DevD1 = nb::ndarray<double, nb::ndim<1>, nb::c_contig, GpuDev>;
+using DevD2 = nb::ndarray<double, nb::ndim<2>, nb::c_contig, GpuDev>;
 
 // device inputs / outputs (DLPack: torch / CuPy arrays of the module's GPU, no copies); natoms, cells, pbc on the host
 void compute_batch_device(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> natoms,
-                          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda> types,
-                          nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cuda> pos,
+                          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, GpuDev> types,
+                          nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, GpuDev> pos,
                           nb::ndarray<const double, nb::shape<-1, 3, 3>, nb::c_contig, nb::device::cpu> cells,
                           nb::ndarray<const bool, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> pbc, DevD1 energy,
                           std::optional<DevD2> forces, std::optional<DevD2> virial, std::optional<DevD1> energies,
                           std::optional<DevD1> gamma, std::optional<DevD1> sigma, std::optional<DevD1> cluster,
-                          bool energy_only, int64_t max_nall)
+                          bool energy_only, int64_t max_nall, std::optional<DevD1> dispersion_energy,
+                          std::optional<DevD2> dispersion_forces, std::optional<DevD2> dispersion_virial,
+                          std::optional<DevD1> dispersion_energies)
 {
   const size_t nsys = natoms.shape(0), n = types.shape(0);
   if (pos.shape(0) != n) throw nb::value_error("positions and types differ in length");
@@ -134,6 +173,15 @@ void compute_batch_device(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, 
   o.gamma = out1(gamma, "gamma");
   o.sigma = out1(sigma, "atomic_sigma");
   o.cluster = out1(cluster, "gmm_cluster");
+  if (dispersion_energy) {
+    on_device(*dispersion_energy, "dispersion_energy");
+    if (dispersion_energy->shape(0) != nsys)
+      throw nb::value_error("dispersion_energy must have one value per structure");
+    o.dispersion_energy = dispersion_energy->data();
+  }
+  o.dispersion_forces = out2(dispersion_forces, n, 3, "dispersion_forces");
+  o.dispersion_virial = out2(dispersion_virial, nsys, 6, "dispersion_virial");
+  o.dispersion_energies = out1(dispersion_energies, "dispersion_energies");
   const bool want_uq = o.gamma || o.sigma || o.cluster;
   if (want_uq && !(o.gamma && o.sigma && o.cluster)) throw nb::value_error("uq needs gamma, atomic_sigma and gmm_cluster");
   nb::gil_scoped_release nogil;
@@ -160,8 +208,11 @@ NB_MODULE(GRACE_KK_MODULE, m)
   m.def("initialized", &gk::initialized);
   m.def("device", &gk::device);
   m.def("arch", [] { return std::string(gk::arch()); });
+  m.def("platform", [] { return std::string(gk::platform()); }, "\"cuda\" (NVIDIA) or \"rocm\" (AMD)");
+  m.def("blas", [] { return std::string(gk::blas()); },
+        "GEMM library of the engines: \"cublas\", \"rocblas\", \"kkgemm\" (hand-written Kokkos GEMMs) or \"\"");
   m.def("cublas", &gk::cublas);
-  m.def("memory_info", &gk::memory_info, "(free, total) bytes of the GPU (cudaMemGetInfo)");
+  m.def("memory_info", &gk::memory_info, "(free, total) bytes of the GPU (cudaMemGetInfo / hipMemGetInfo)");
   m.def("_debug_fail_alloc", &gk::debug_fail_alloc, "label"_a, "nth"_a);
   m.def("_debug_track_alloc", &gk::debug_track_alloc, "on"_a);
   m.def("_debug_live_alloc", &gk::debug_live_alloc);
@@ -182,6 +233,9 @@ NB_MODULE(GRACE_KK_MODULE, m)
       .def_prop_ro("chunksize", &gk::System::chunksize)
       .def("release_buffers", &gk::System::release_device_buffers, nb::call_guard<nb::gil_scoped_release>(),
            "return the system's and its engine's per-atom device buffers now (they grow again on the next compute)")
+      .def("set_dispersion", &set_dispersion<gk::System>, "params"_a.none(), "atomic_numbers"_a,
+           "dispersion correction of every compute from now on: params a dict (kind, s6, s8, a1, a2 [A], cutoff, "
+           "cutoff_on, cn_cutoff [A]) or None (off); atomic_numbers: Z of the species")
       .def("compute", &compute, "types"_a, "positions"_a, "cell"_a, "pbc"_a, "energies"_a = false, "uq"_a = false,
            "energy_only"_a = false);
   nb::class_<gk::Batch>(m, "Batch")
@@ -200,12 +254,16 @@ NB_MODULE(GRACE_KK_MODULE, m)
            "virial"_a.noconvert().none() = nb::none(), "energies"_a.noconvert().none() = nb::none(),
            "gamma"_a.noconvert().none() = nb::none(), "atomic_sigma"_a.noconvert().none() = nb::none(),
            "gmm_cluster"_a.noconvert().none() = nb::none(), "energy_only"_a = false,
-           "max_nall"_a = (int64_t) 1 << 21,
+           "max_nall"_a = (int64_t) 1 << 21, "dispersion_energy"_a.noconvert().none() = nb::none(),
+           "dispersion_forces"_a.noconvert().none() = nb::none(), "dispersion_virial"_a.noconvert().none() = nb::none(),
+           "dispersion_energies"_a.noconvert().none() = nb::none(),
            "compute with device inputs and outputs: types int32 [N], positions float64 [N, 3] and the outputs "
-           "(float64; energy [S], forces [N, 3], virial [S, 6], per-atom [N]) on the module's GPU (DLPack); natoms, "
-           "cells, pbc on the host")
+           "(float64; energy [S], forces [N, 3], virial [S, 6], per-atom [N]; the dispersion's share of them, with "
+           "set_dispersion) on the module's GPU (DLPack); natoms, cells, pbc on the host")
+      .def("set_dispersion", &set_dispersion<gk::Batch>, "params"_a.none(), "atomic_numbers"_a,
+           "as System.set_dispersion")
       .def_prop_ro("chunksize", &gk::Batch::chunksize)
       .def("compute", &compute_batch, "natoms"_a, "types"_a, "positions"_a, "cells"_a, "pbc"_a, "energies"_a = false,
-           "uq"_a = false, "energy_only"_a = false, "num_threads"_a = 0,
-           "max_nall"_a = 2097152);
+           "uq"_a = false, "energy_only"_a = false, "max_nall"_a = 2097152, "dispersion_parts"_a = false,
+           "compute with host (numpy) inputs and outputs; neighbour lists and images built on the GPU");
 }

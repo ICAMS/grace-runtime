@@ -109,6 +109,7 @@ int main(int argc, char **argv)
   auto m3b = std::make_shared<grace::GRACE3LModel>();
   m3b->load(test_model("GRACE_TEST_M3B", "GRACE-3L-OMAT-large-ft-AM"));
   check_second_model(m3, m3b, fx);
+  check_empty_list<E3>(m3, "3L kk", fx);
   std::printf("kk csr 3l ok\n");
   return 0;
 }

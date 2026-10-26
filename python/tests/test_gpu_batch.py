@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """grace_runtime._kk_<arch>.Batch: many structures in one engine run (concatenated CSR with per-structure
 ghost images, per-system energy / virial sums) against System on each structure alone: energy 2e-6 eV/atom, forces
-2e-5 eV/A + 1e-6 max|F| (fp32, other summation order), virial 2e-5 eV/atom, UQ 1e-5 relative."""
+2e-5 eV/A + 1e-6 max|F| (fp32, other summation order), virial 2e-5 eV/atom, UQ 1e-5 relative. Neighbour lists built
+on the GPU from the host arrays (against the CPU calculator: test_batch.py::test_cpu_device_matches_gpu)."""
 import os
 from pathlib import Path
 
@@ -12,8 +13,10 @@ from ase.build import bulk
 from ase.cluster import Icosahedron
 from ase.io import read
 
-from grace_runtime import _cuda
+from grace_runtime import _gpu
 from grace_runtime.neighbors import _padded_cell
+
+from gpu_tools import GPU, NO_GPU
 
 ROOT = Path(__file__).resolve().parents[2]
 FX = ROOT / "tests" / "fixtures"
@@ -25,13 +28,13 @@ SPECIES = ["Mo", "W"]
 
 def _module():
     try:
-        return _cuda.ensure_init("cuda")
+        return _gpu.ensure_init(GPU) if GPU else None
     except (ImportError, ValueError):
         return None
 
 
 pytestmark = pytest.mark.skipif(_module() is None or not all(p.exists() for p in MODELS.values()),
-                                reason="no CUDA module for this device or registry models missing")
+                                reason=f"{NO_GPU} / registry models missing")
 
 
 @pytest.fixture(scope="module")
@@ -145,11 +148,32 @@ def test_batch_errors_leave_batch_usable(mod):
     far[0] += 600 * cells[0][0]
     with pytest.raises(ValueError, match="511"):
         b.compute(natoms, types, far, cells, pbc)
+    nan = pos.copy()
+    nan[3, 1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        b.compute(natoms, types, nan, cells, pbc)
     with pytest.raises(ValueError, match="natoms"):
         b.compute(natoms + 1, types, pos, cells, pbc)
     again = b.compute(natoms, types, pos, cells, pbc)
     assert np.abs(again["energy"] - ref["energy"]).max() <= 1e-4
     assert np.abs(again["forces"] - ref["forces"]).max() <= 2e-5
+
+
+def test_batch_keep_buffers_device_neighbors(mod):
+    """keep_buffers (MD / relaxation loops): the device inputs and outputs are reused across calls of other sizes,
+    results as a fresh batch; release_buffers in between does not change them"""
+    m = mod.Model(str(MODELS["2l"]))
+    b = mod.Batch(m, SPECIES)
+    b.keep_buffers = True
+    big, small = concat(structures(), b.cutoff), concat([lmp("W2tri"), lmp("WMo54")], b.cutoff)
+    ref_big, ref_small = mod.Batch(m, SPECIES).compute(*big), mod.Batch(m, SPECIES).compute(*small)
+    for args, ref in ((big, ref_big), (small, ref_small), (big, ref_big), (small, ref_small)):
+        got = b.compute(*args)
+        assert np.abs(got["energy"] - ref["energy"]).max() / 54 <= 1e-6
+        assert np.abs(got["forces"] - ref["forces"]).max() <= 1e-5
+    b.release_buffers()
+    got = b.compute(*small, energies=True)
+    assert np.abs(got["forces"] - ref_small["forces"]).max() <= 1e-5 and got["energies"].shape == (56,)
 
 
 def test_batch_unknown_element(mod):
@@ -171,6 +195,14 @@ def test_batch_passes_bounded_by_atoms_and_images(mod):
     assert np.abs(many["energy"] - one["energy"]).max() / 54 <= 1e-6
     assert np.abs(many["forces"] - one["forces"]).max() <= 1e-5
     assert np.abs(many["virial"] - one["virial"]).max() <= 1e-4
+    # one-atom cells (hundreds of images each): grouped by the images estimated from the cells before the
+    # neighbour lists are built, then split by the real counts
+    small = [bulk("W", "bcc", a=3.165 + 0.002 * k) for k in range(40)]
+    one = b.compute(*concat(small, b.cutoff))
+    many = b.compute(*concat(small, b.cutoff), max_nall=1500)
+    assert b.passes > 4
+    assert np.abs(many["energy"] - one["energy"]).max() <= 1e-6
+    assert np.abs(many["forces"]).max() <= 1e-5 and np.abs(many["virial"] - one["virial"]).max() <= 1e-5
 
 
 def test_batch_concurrent_threads(mod):
@@ -201,8 +233,8 @@ def test_batch_3l_many_small_cells_fit(mod):
         a = base.copy()
         a.rattle(0.03, seed=k)
         ats.append(a)
-    r = compute_batch(str(MODELS["3l"]), ats, device="cuda")
-    one = compute_batch(str(MODELS["3l"]), [ats[0], ats[999]], device="cuda")
+    r = compute_batch(str(MODELS["3l"]), ats, device=GPU)
+    one = compute_batch(str(MODELS["3l"]), [ats[0], ats[999]], device=GPU)
     for k, o in ((0, one[0]), (999, one[1])):
         assert abs(r[k]["energy"] - o["energy"]) <= 1e-6 * 54
         assert np.abs(r[k]["forces"] - o["forces"]).max() <= 2e-5

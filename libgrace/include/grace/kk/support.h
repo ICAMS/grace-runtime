@@ -6,10 +6,16 @@
 #include "grace/error.h"
 
 #include <Kokkos_Core.hpp>
+#ifdef KOKKOS_ENABLE_HIP
+#include <hip/hip_runtime_api.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -25,6 +31,157 @@ template<class D> inline constexpr bool is_cuda_v = std::is_same_v<typename D::e
 #else
 template<class D> inline constexpr bool is_cuda_v = false;
 #endif
+#ifdef KOKKOS_ENABLE_HIP
+template<class D> inline constexpr bool is_hip_v = std::is_same_v<typename D::execution_space, Kokkos::HIP>;
+#else
+template<class D> inline constexpr bool is_hip_v = false;
+#endif
+// the device is a GPU whose free memory device_mem_info() reports
+template<class D> inline constexpr bool is_gpu_v = is_cuda_v<D> || is_hip_v<D>;
+// An on / off kernel switch from the environment (GRACE3L_SPBF_MFMA, GRACE_FUSED_MFMA, ...): 1, 0, or -1 when unset or
+// empty (the build's default). Other values: a note on stderr, then -1. The callers read it once per process.
+inline int env_switch(const char *name)
+{
+  const char *e = std::getenv(name);
+  if (e == nullptr || *e == '\0') return -1;
+  if (std::strcmp(e, "0") == 0) return 0;
+  if (std::strcmp(e, "1") == 0) return 1;
+  std::fprintf(stderr, "grace kk: %s=%s ignored (expected 0 or 1)\n", name, e);
+  return -1;
+}
+// Launch bounds of a kernel launched with blocks of N threads: on HIP Kokkos::LaunchBounds<N, 1>, elsewhere the default
+// (none, as before). Without them Kokkos compiles every HIP kernel for 1024-thread blocks, i.e. at most 128 VGPRs per
+// lane, and the register-heavy fused kernels spilled 0.2 - 1 KB per lane to scratch on gfx90a.
+// M: minimum number of waves per SIMD the compiler keeps registers for (HIP __launch_bounds__): 1 lets a kernel use
+// all 512 registers per lane (one wave per SIMD), 2 caps it at 256, 3 at 168 (gfx90a / gfx94x; gfx906 / gfx908 have
+// 256 per lane).
+template<class D, unsigned N, unsigned M = 1>
+using hip_lb_t = std::conditional_t<is_hip_v<D>, Kokkos::LaunchBounds<N, M>, Kokkos::LaunchBounds<>>;
+// A team launch with launch bounds and a fallback launch (the body without them, or another kernel): whether Kokkos
+// admits teams of `team` threads with the bounded policy (team_size_max, as checked at launch: the registers and the
+// shared memory of the bounded number of teams per SM). GRACE_LB_FALLBACK=1: never, i.e. always the fallback (tests).
+inline bool lb_fallback_forced()
+{
+  static const bool forced = env_switch("GRACE_LB_FALLBACK") == 1;
+  return forced;
+}
+template<class Policy, class Body> bool launch_bounds_fit(const Policy &pol, const Body &body, int team)
+{
+  return !lb_fallback_forced() && pol.team_size_max(body, Kokkos::ParallelForTag()) >= team;
+}
+
+// GPU: the level-0 team scratch (bytes) a launch with teams of `team` threads can have, as Kokkos checks it at launch:
+// the shared memory of a block less the (team + 2) doubles of the team reductions. CUDA: Kokkos' own limit,
+// TeamPolicy::scratch_size_max(0) (it assumes teams of 1024): 48 KB per block with Kokkos 5.1 (LAMMPS' bundled one),
+// the opt-in above that from Kokkos 5.2 on. Host backends: no limit here.
+template<class D> size_t team_scratch_max(int team)
+{
+#if defined(KOKKOS_ENABLE_HIP)
+  if constexpr (is_hip_v<D>) return Kokkos::HIP::hip_device_prop().sharedMemPerBlock - (size_t) (team + 2) * sizeof(double);
+#endif
+#if defined(KOKKOS_ENABLE_CUDA)
+  if constexpr (is_cuda_v<D>)
+    return (size_t) Kokkos::TeamPolicy<D>::scratch_size_max(0) + (size_t) (1024 - team) * sizeof(double);
+#endif
+  (void) team;
+  return SIZE_MAX;
+}
+// CUDA: teams of `team` threads with `shmem` bytes of team scratch each that the shared memory of an SM holds: per
+// block the scratch, Kokkos' team-reduction doubles and its static 8-byte team id, rounded to the 128-byte allocation
+// unit, plus the driver's reservation per block. Shared memory only (the caller's kernel must not be limited by
+// registers first). 0: not known (other backends, a failed query) or not even one team.
+template<class D> int teams_per_sm_by_scratch(size_t shmem, int team)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+  if constexpr (is_cuda_v<D>) {
+    static const std::pair<int, int> sm = [] {
+      const int dev = Kokkos::Cuda().cuda_device();
+      int per_sm = 0, reserved = 0;
+      if (cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess ||
+          cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev) != cudaSuccess) {
+        (void) cudaGetLastError();    // not left pending for the next launch check
+        return std::make_pair(0, 0);
+      }
+      return std::make_pair(per_sm, reserved);
+    }();
+    const size_t block = (shmem + (size_t) (team + 2) * sizeof(double) + sizeof(int64_t) + 127) / 128 * 128;
+    return (int) ((size_t) sm.first / (block + (size_t) sm.second));
+  }
+#endif
+  (void) shmem;
+  (void) team;
+  return 0;
+}
+
+// (free, total) bytes of the current GPU of this build (cudaMemGetInfo / hipMemGetInfo); false (both 0 unless the
+// runtime wrote them) without a GPU backend or when the query fails
+inline bool device_mem_info(size_t &free_b, size_t &total_b)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+  return cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+#elif defined(KOKKOS_ENABLE_HIP)
+  return hipMemGetInfo(&free_b, &total_b) == hipSuccess;
+#else
+  (void) free_b;
+  (void) total_b;
+  return false;
+#endif
+}
+
+// Identity of the GPU of this process's Kokkos device instance, unique on the node: "uuid-<32 hex digits>" (the
+// device UUID: CUDA cudaDeviceProp::uuid, which also tells MIG instances apart; HIP hipDeviceGetUuid, one per GCD of an
+// MI250X), or "pci-<PCI bus id>" when the UUID query fails or returns zeros. Processes on the same GPU get the same
+// string whatever their CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES; compare the strings exactly. The device is the
+// runtime ordinal of the default Kokkos instance (Kokkos::Cuda().cuda_device(), Kokkos::HIP().hip_device()), not
+// Kokkos::device_id() (an index into KOKKOS_VISIBLE_DEVICES). Empty without a GPU backend or when both queries fail.
+// Only a failed call's own error is cleared (cudaGetLastError / hipGetLastError right after it), so an error pending
+// from elsewhere stays pending unless that call failed. Call after Kokkos::initialize.
+inline std::string device_key()
+{
+  auto hex = [](const char *bytes) {
+    static const char digits[] = "0123456789abcdef";
+    std::string s = "uuid-";
+    bool nonzero = false;
+    for (int i = 0; i < 16; i++) {
+      const unsigned char b = (unsigned char) bytes[i];
+      nonzero = nonzero || b != 0;
+      s += digits[b >> 4];
+      s += digits[b & 15];
+    }
+    return nonzero ? s : std::string();
+  };
+  char bus[64] = {0};
+#if defined(KOKKOS_ENABLE_CUDA)
+  const int dev = Kokkos::Cuda().cuda_device();
+  cudaDeviceProp prop;
+  if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+    const std::string key = hex(prop.uuid.bytes);
+    if (!key.empty()) return key;
+  } else {
+    (void) cudaGetLastError();
+  }
+  if (cudaDeviceGetPCIBusId(bus, (int) sizeof(bus), dev) == cudaSuccess) return std::string("pci-") + bus;
+  (void) cudaGetLastError();
+  return std::string();
+#elif defined(KOKKOS_ENABLE_HIP)
+  const int dev = Kokkos::HIP().hip_device();
+  hipDevice_t hd;
+  hipUUID uuid;
+  if (hipDeviceGet(&hd, dev) == hipSuccess && hipDeviceGetUuid(&uuid, hd) == hipSuccess) {
+    const std::string key = hex(uuid.bytes);
+    if (!key.empty()) return key;
+  } else {
+    (void) hipGetLastError();
+  }
+  if (hipDeviceGetPCIBusId(bus, (int) sizeof(bus), dev) == hipSuccess) return std::string("pci-") + bus;
+  (void) hipGetLastError();
+  return std::string();
+#else
+  (void) hex;
+  (void) bus;
+  return std::string();
+#endif
+}
 
 // real spherical harmonics normalisation constants of the engines (shared: one translation unit may hold several)
 namespace sph_const {
@@ -112,12 +269,31 @@ template<class Member> KOKKOS_INLINE_FUNCTION BondSlot bond_slot(const Member &t
 // more than 2^31 elements: the GRACE-3L [nall][64][50] message rows from nall = 671089 (issue #1). The views with a
 // row per atom of nall (local + ghost) are View64; every other view stays below 2^31 elements (MemKK::realloc_kokkos
 // checks it, chunksize auto picks the chunk below that).
-template<class V> struct View64 : V {
+template<class V> class View64 : V {    // private base: a View64 never passes as a plain V (int offsets again)
+ public:
+  using view_type = V;
+  using typename V::data_type;
+  using typename V::value_type;
+  using typename V::non_const_value_type;
+  using typename V::reference_type;
+  using typename V::memory_space;
+  using typename V::execution_space;
+  using typename V::host_mirror_type;
+  using V::rank;
+  using V::rank_dynamic;
   using V::V;
   View64() = default;
   View64(const V &v) : V(v) {}
+  // the plain view, for what takes one by design: deep_copy, subview, create_mirror_view
+  KOKKOS_FORCEINLINE_FUNCTION const V &base() const { return *this; }
+  using V::data;
+  using V::extent;
+  using V::span;
+  using V::size;
+  using V::label;
+  using V::stride;
   template<class... I>
-  KOKKOS_FORCEINLINE_FUNCTION typename V::reference_type operator()(const size_t i0, const I... i) const
+  KOKKOS_FORCEINLINE_FUNCTION reference_type operator()(const size_t i0, const I... i) const
   {
     return V::operator()(i0, static_cast<size_t>(i)...);
   }
@@ -151,6 +327,8 @@ struct MemKK {
       max_span = std::max(max_span, (double) data.span());
     }
   }
+  // the views emptied: an allocation goes with its last reference
+  template<class... V> static void drop(V &...v) { ((v = V()), ...); }
   template<typename TYPE> static double memory_usage(const TYPE &data)
   {
     return (double) data.span() * sizeof(typename TYPE::value_type);
@@ -219,12 +397,11 @@ int auto_chunk(int n, int mn, int ranks_per_device, Grow &&grow, Stored &&stored
   }
   MemKK::count = nullptr;
   size_t free_b = 0, total_b = 0;
-#ifdef KOKKOS_ENABLE_CUDA
-  if (std::is_same<typename DeviceType::execution_space, Kokkos::Cuda>::value) cudaMemGetInfo(&free_b, &total_b);
-#endif
+  if (is_gpu_v<DeviceType>) device_mem_info(free_b, total_b);
   if (kept_fits) *kept_fits = true;
   // the largest work buffer stays below 2^31 elements (MemKK::realloc_kokkos)
-  const double span_atom = MemKK::max_span / c0, cmax = span_atom > 0 ? (double) INT32_MAX / span_atom : (double) n;
+  // (256 rows of margin: the HIP 3L engine pads the chunk's rows to a multiple of 128 that is not a power of two)
+  const double span_atom = MemKK::max_span / c0, cmax = span_atom > 0 ? (double) INT32_MAX / span_atom - 256 : (double) n;
   if (total_b == 0) return n > cmax ? std::max(1, (int) cmax) : n;    // no device memory budget (host backends)
   const double per_atom = bytes / c0, kept = stored();
   const double budget = 0.7 * ((double) free_b + bytes) / std::max(1, ranks_per_device);
@@ -258,6 +435,34 @@ std::pair<int, bool> auto_chunk_keep(int n, int mn, int ranks_per_device, Grow &
   const bool keep = fits && 2.0 * with >= std::min(without, sat);
   const int c = auto_chunk<DeviceType>(n, mn, ranks_per_device, grow, [&] { return keep ? stored() : 0.0; }, log, tag);
   return {c, keep};
+}
+
+// Throws grace::Error when a GPU kernel launch (or another CUDA / HIP runtime call) failed since the last check.
+// Kokkos checks kernel launches only with KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK: in a release build a launch that fails,
+// e.g. out of memory for the kernel's code (lazy module loading) or its local memory when the GPU is nearly full,
+// leaves the kernel's outputs unwritten without any error, and the next fence still succeeds (such errors are not
+// sticky). The engines call this at the end of setup() and run(): one cudaGetLastError per step.
+template<class DeviceType> void check_kernel_launches(const char *who)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+  if constexpr (is_cuda_v<DeviceType>) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+      throw grace::Error(fmt("{}: a GPU kernel launch or runtime call failed ({}: {}); the results of this step are "
+                             "invalid. With 'out of memory': free GPU memory (other processes, fewer MPI ranks per "
+                             "GPU, smaller chunksize)", who, cudaGetErrorName(e), cudaGetErrorString(e)));
+  }
+#elif defined(KOKKOS_ENABLE_HIP)
+  if constexpr (is_hip_v<DeviceType>) {
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess)
+      throw grace::Error(fmt("{}: a GPU kernel launch or runtime call failed ({}: {}); the results of this step are "
+                             "invalid. With 'out of memory': free GPU memory (other processes, fewer MPI ranks per "
+                             "GPU, smaller chunksize)", who, hipGetErrorName(e), hipGetErrorString(e)));
+  }
+#else
+  (void) who;
+#endif
 }
 
 }    // namespace kk

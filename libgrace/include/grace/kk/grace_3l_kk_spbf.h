@@ -5,10 +5,13 @@
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
+#include "grace/kk/grace_3l_kk_spbf_mfma.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -847,8 +850,10 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fast_ok(int idx) const
 {
   static const bool off = getenv("GRACE3L_GENERIC_SPBF") != nullptr;
-#ifdef KOKKOS_ENABLE_CUDA
+#if defined(KOKKOS_ENABLE_CUDA)
   if (!std::is_same<typename DeviceType::execution_space, Kokkos::Cuda>::value) return false;
+#elif defined(KOKKOS_ENABLE_HIP)
+  if (!is_hip_v<DeviceType>) return false;
 #else
   return false;
 #endif
@@ -865,9 +870,9 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fast_ok(int idx
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_rm_ok(int si, int ridx) const
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   static const bool off = getenv("GRACE3L_SPBF_TRANSPOSE") != nullptr;
-  if (off || !spbf_fast_ok(si) || !cublas_handle || ridx < 0 || ridx >= n_reduces) return false;
+  if (off || !spbf_fast_ok(si) || !blas_handle || ridx < 0 || ridx >= n_reduces) return false;
   const ReduceHost &hr = h_reduce[ridx];
   const DeviceSPBF &sp = d_spbf[si];
   if (!hr.cublas_ok || !hr.grouped || hr.n_in != sp.n_rad_max || hr.n_conn != sp.nfunc) return false;
@@ -882,14 +887,18 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_rm_ok(int si, i
 
 
 
-// fuse_radial applies: the layer-1 tables exist and the CUDA fp32 fast kernels (ForceL1F) run
+// fuse_radial applies: the layer-1 tables exist and the CUDA / HIP fp32 fast kernels (ForceL1F) run
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l1_radial_fused() const
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#if defined(KOKKOS_ENABLE_CUDA)
   static const bool generic = getenv("GRACE3L_GENERIC_SPBF") != nullptr;
   return fuse_radial && spline_on && std::is_same<typename DeviceType::execution_space, Kokkos::Cuda>::value &&
          sizeof(NNScalar) == 4 && d_spbf[0].n_rad_max <= 64 && lmax <= 4 && spbf_ltile_std[0] && !generic;
+#elif defined(KOKKOS_ENABLE_HIP)
+  static const bool generic = getenv("GRACE3L_GENERIC_SPBF") != nullptr;
+  return fuse_radial && spline_on && is_hip_v<DeviceType> && sizeof(NNScalar) == 4 && d_spbf[0].n_rad_max <= 64 &&
+         lmax <= 4 && spbf_ltile_std[0] && !generic;
 #else
   return false;
 #endif
@@ -901,9 +910,10 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_A1_tables()
 {
   const DeviceSPBF &sp = d_spbf[0];
-  const int NR = L1_nradmax, lmx = lmax, N = spl_N[0], NT = spl_Ntot, nsp = n_sp, ld = spl_ld;
+  const int NR = L1_nradmax, lmx = lmax, nsp = n_sp;
   const float inv = (float) sp.inv_avg_n_neigh;
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i; auto muj = d_mu_j;
+  const G3LTab tab = spl_tab(0);
+  auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i; auto muj = d_mu_j;
   auto nc = d_ncount; auto rn = d_rnorms; auto Y = d_Y_bond; auto env = d_env; auto ztr = sp.z_tr; auto A1 = d_A1;
   Kokkos::parallel_for("ComputeA1T", Kokkos::RangePolicy<DeviceType>(0, chunk_size * NR), KOKKOS_LAMBDA(const int q) {
     const int ii = q / NR, n = q - ii * NR;
@@ -911,34 +921,88 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_A1_tables()
 #pragma unroll
     for (int lm = 0; lm < 25; lm++) acc[lm] = 0.0f;
     const int mi = mui(ii), nct = nc(ii);
-    const size_t pb = (size_t) spm(mi) * nsp;
+    const long pb = (long) spm(mi) * nsp;
     for (int jj = 0; jj < nct; jj++) {
       const int mj = muj(ii, jj);
-      const float rc = bc(mi, mj), s = (float) rn(ii, jj) / rc * N;
-      int k = (int) s;
-      if (k > N - 1) k = N - 1;
-      const float t = s - k, w = ztr(mj, n) * (float) env(ii, jj);
-      const float *c4 = tab.data() + (((pb + spm(mj)) * NT + k) * ld + (size_t) n * (lmx + 1)) * 4;    // layer 1: offset 0
+      const float rc = bc(mi, mj);
+      float t;
+      const long r0 = tab.row(pb + spm(mj), (float) rn(ii, jj), rc, t);
+      const float w = ztr(mj, n) * (float) env(ii, jj);
+      const float *c4 = tab.c + (r0 + (long) n * (lmx + 1)) * 4;
+      // l guarded, not broken out of: the loops unroll fully and acc stays in registers
 #pragma unroll
       for (int l = 0; l < 5; l++) {
-        if (l > lmx) break;
-        const G3F4 c = *reinterpret_cast<const G3F4 *>(c4 + 4 * l);
-        const float R = (c.x + t * (c.y + t * (c.z + t * c.w))) * w;
+        if (l <= lmx) {
+          const G3F4 c = *reinterpret_cast<const G3F4 *>(c4 + 4 * l);
+          const float R = g3l_cubic(c, t) * w;
 #pragma unroll
-        for (int m = 0; m < 2 * l + 1; m++) acc[l * l + m] += R * (float) Y(ii, jj, l * l + m);
+          for (int m = 0; m < 2 * l + 1; m++) acc[l * l + m] += R * (float) Y(ii, jj, l * l + m);
+        }
       }
     }
     const int nlm = (lmx + 1) * (lmx + 1);
-    for (int lm = 0; lm < nlm; lm++) A1(ii, n, lm) = acc[lm] * inv;
+#pragma unroll
+    for (int lm = 0; lm < 25; lm++)
+      if (lm < nlm) A1(ii, n, lm) = acc[lm] * inv;
   });
 }
 
-// L1 geometry force, team per atom: warp per bond, lane = channels (lane, lane + 32) with their dE/dA1 rows in
-// registers; f = sum_n sum_lm w z (d(R env)/dr Y rhat + (R env) DY / r) from d_Y_bond / d_dY_bond, the channel
-// sum by warp shuffles. One warp per bond -> plain += into d_f_ij.
+#if defined(KOKKOS_ENABLE_HIP)
+// The environment variable GRACE3L_FORCE_L1_WAVE (0 / 1), read once per process: whether the layer-1 force runs on
+// the 64-lane kernel (force_L1_fast_t<64>; CDNA builds, default on); one line on stderr per process says which
+inline bool g3l_force_l1_wave()
+{
+  static const KernelChoice c = wave64_switch("GRACE3L_FORCE_L1_WAVE", env_switch("GRACE3L_FORCE_L1_WAVE"));
+  static std::once_flag logged;
+  std::call_once(logged, [&] {
+    std::fprintf(stderr, "grace kk: GRACE-3L layer-1 forces on the %s kernel (%s)\n",
+                 c.on ? "wavefront-per-bond (64-lane)" : "warp-per-bond (32-lane)", c.why.c_str());
+  });
+  return c.on;
+}
+#endif
+
+// sum over the W lanes of a warp (W = 32) or wavefront (W = 64)
+template<int W, class T>
+KOKKOS_INLINE_FUNCTION T g3l_lane_sum(T v)
+{
+#pragma unroll
+  for (int o = W / 2; o > 0; o >>= 1) {
+    if constexpr (W == 64) v += wave_shfl_xor(v, o);
+    else v += g3l_shfl_xor(v, o);
+  }
+  return v;
+}
+
+// L1 geometry force: f = sum_n sum_lm w z (d(R env)/dr Y rhat + (R env) DY / r) from d_Y_bond / d_dY_bond, plain +=
+// into d_f_ij (one group of lanes per bond). Kokkos::HIP of a CDNA build: the 64-lane kernel unless
+// GRACE3L_FORCE_L1_WAVE=0; otherwise the 32-lane one.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::force_L1_fast()
 {
+#if defined(KOKKOS_ENABLE_HIP)
+  if constexpr (is_hip_v<DeviceType>) {
+    if (g3l_force_l1_wave()) {
+#if GRACE_KK_WAVE64
+      force_L1_fast_t<64>();
+      return;
+#endif
+    }
+  }
+#endif
+  force_L1_fast_t<32>();
+}
+
+// Team per atom, 4 groups of W lanes (a warp, W = 32, or a 64-lane wavefront), group per bond, lane = channels
+// (lane + W h, h < 64 / W) with their dE/dA1 rows in registers, the channel sum by shuffles. W = 64: the bond index
+// is wavefront-uniform and the bond's Y / dY rows are three loads broadcast from their lanes (wave_readlane).
+template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
+template<int W>
+void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::force_L1_fast_t()
+{
+  constexpr int H = 64 / W, TEAM = 4 * W;
+  static_assert(std::is_same_v<typename decltype(d_Y_bond)::array_layout, Kokkos::LayoutRight> &&
+                std::is_same_v<typename decltype(d_dY_bond)::array_layout, Kokkos::LayoutRight>);
   const DeviceSPBF &sp = d_spbf[0];
   const int NR = sp.n_rad_max, lmx = lmax, nlm = (lmax + 1) * (lmax + 1);
   const float inv = (float) sp.inv_avg_n_neigh;
@@ -947,73 +1011,85 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::force_L1_fast()
   auto fij = d_f_ij;
   // fuse_radial: R and dR/dr of layer 1 from the cubic tables (as radial_from_splines), not from d_R1_nl / d_DR1_nl
   const bool tabr = l1_radial_fused();
-  const int N = spl_N[0], NT = spl_Ntot, nsp = n_sp, ld = spl_ld;
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  const int nsp = n_sp;
+  const G3LTab tab = spl_tab(0);
+  auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, TEAM>>;
   using member = typename team_policy::member_type;
-  Kokkos::parallel_for("ForceL1F", team_policy(chunk_size, 128), KOKKOS_LAMBDA(const member &t) {
-    const int ii = t.league_rank(), tid = t.team_rank(), w = tid / 32, lane = tid - 32 * w;
-    float wt[2][25];
+  Kokkos::parallel_for(W == 64 ? "ForceL1FW" : "ForceL1F", team_policy(chunk_size, TEAM), KOKKOS_LAMBDA(const member &t) {
+    const int ii = t.league_rank(), tid = t.team_rank(), lane = tid % W;
+    const int w = W == 64 ? wave_uniform(tid / W) : tid / W;
+    float wt[H][25];
 #pragma unroll
-    for (int h = 0; h < 2; h++) {
-      const int n = lane + 32 * h;
+    for (int h = 0; h < H; h++) {
+      const int n = lane + W * h;
 #pragma unroll
       for (int lm = 0; lm < 25; lm++) wt[h][lm] = (n < NR && lm < nlm) ? A1a(ii, n, lm) * inv : 0.0f;
     }
-    const int nct = ncount(ii);
+    const int nct = ncount(ii), mi = mui(ii);
+    const long pb = tabr ? (long) spm(mi) * nsp : 0;    // d_sp_of_mu exists with the tables only
     for (int jj = w; jj < nct; jj += 4) {
       const int mu = muj(ii, jj);
-      const GeomScalar ev = env(ii, jj), dev = denv(ii, jj);
+      const GeomScalar ev = env(ii, jj), dev = denv(ii, jj), r_ij = rn(ii, jj);
       GeomScalar sA = GeomScalar(0.0), sBx = GeomScalar(0.0), sBy = GeomScalar(0.0), sBz = GeomScalar(0.0);
       const float *trow = nullptr;
       float tt = 0.0f, dxs = 0.0f;
       if (tabr) {
-        const int mi = mui(ii);
-        const float rc = bc(mi, mu), s = (float) rn(ii, jj) / rc * N;
-        int k = (int) s;
-        if (k > N - 1) k = N - 1;
-        tt = s - k;
-        dxs = (float) N / rc;
-        trow = tab.data() + (((size_t) (spm(mi) * nsp + spm(mu)) * NT + k) * ld) * 4;    // layer 1: offset 0
+        const float rc = bc(mi, mu);
+        dxs = tab.dsdr(rc);
+        trow = tab.c + tab.row(pb + spm(mu), (float) r_ij, rc, tt) * 4;
+      }
+      // the bond's Y and dY rows; W = 64: lane lm holds Y_lm, lanes 3 lm + k (then 64 + ...) dY_lm,k
+      const GeomScalar *Yr = &Y(ii, jj, 0), *dYr = &dY(ii, jj, 0, 0);
+      GeomScalar yv = GeomScalar(0.0), dv0 = GeomScalar(0.0), dv1 = GeomScalar(0.0);
+      if constexpr (W == 64) {
+        if (lane < nlm) yv = Yr[lane];
+        if (lane < 3 * nlm) dv0 = dYr[lane];
+        if (lane + 64 < 3 * nlm) dv1 = dYr[lane + 64];
       }
 #pragma unroll
-      for (int h = 0; h < 2; h++) {
-        const int n = lane + 32 * h;
+      for (int h = 0; h < H; h++) {
+        const int n = lane + W * h;
         const float z = (n < NR) ? ztr(mu, n) : 0.0f;
 #pragma unroll
         for (int l = 0; l < 5; l++) {
-          if (l > lmx) break;
-          float r = 0.0f, dr = 0.0f;
-          if (n < NR) {
-            if (tabr) {
-              const G3F4 c = *reinterpret_cast<const G3F4 *>(trow + (size_t) (n * (lmx + 1) + l) * 4);
-              r = c.x + tt * (c.y + tt * (c.z + tt * c.w));
-              dr = (c.y + tt * (2.0f * c.z + 3.0f * tt * c.w)) * dxs;
-            } else {
-              r = R(ii, jj, n, l);
-              dr = DR(ii, jj, n, l);
+          if (l <= lmx) {
+            float r = 0.0f, dr = 0.0f;
+            if (n < NR) {
+              if (tabr) {
+                const G3F4 c = *reinterpret_cast<const G3F4 *>(trow + (size_t) (n * (lmx + 1) + l) * 4);
+                r = g3l_cubic(c, tt);
+                dr = g3l_cubic_dt(c, tt) * dxs;
+              } else {
+                r = R(ii, jj, n, l);
+                dr = DR(ii, jj, n, l);
+              }
             }
-          }
-          const GeomScalar Re = (GeomScalar) r * ev, DRe = (GeomScalar) dr * ev + (GeomScalar) r * dev;
+            const GeomScalar Re = (GeomScalar) r * ev, DRe = (GeomScalar) dr * ev + (GeomScalar) r * dev;
 #pragma unroll
-          for (int m = 0; m < 2 * l + 1; m++) {
-            const int lm = l * l + m;
-            const GeomScalar wz = (GeomScalar) (wt[h][lm] * z);
-            sA += wz * DRe * Y(ii, jj, lm);
-            const GeomScalar tz = wz * Re;
-            sBx += tz * dY(ii, jj, lm, 0); sBy += tz * dY(ii, jj, lm, 1); sBz += tz * dY(ii, jj, lm, 2);
+            for (int m = 0; m < 2 * l + 1; m++) {
+              const int lm = l * l + m;
+              GeomScalar y, d[3];
+              if constexpr (W == 64) {
+                y = wave_readlane(yv, lm);
+#pragma unroll
+                for (int k = 0; k < 3; k++) d[k] = 3 * lm + k < 64 ? wave_readlane(dv0, 3 * lm + k) : wave_readlane(dv1, 3 * lm + k - 64);
+              } else {
+                y = Yr[lm];
+#pragma unroll
+                for (int k = 0; k < 3; k++) d[k] = dYr[3 * lm + k];
+              }
+              const GeomScalar wz = (GeomScalar) (wt[h][lm] * z);
+              sA += wz * DRe * y;
+              const GeomScalar tz = wz * Re;
+              sBx += tz * d[0]; sBy += tz * d[1]; sBz += tz * d[2];
+            }
           }
         }
       }
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) {
-        sA += g3l_shfl_xor(sA, o);
-        sBx += g3l_shfl_xor(sBx, o);
-        sBy += g3l_shfl_xor(sBy, o);
-        sBz += g3l_shfl_xor(sBz, o);
-      }
+      sA = g3l_lane_sum<W>(sA); sBx = g3l_lane_sum<W>(sBx); sBy = g3l_lane_sum<W>(sBy); sBz = g3l_lane_sum<W>(sBz);
       if (lane == 0) {
-        const GeomScalar rinv = GeomScalar(1.0) / GeomScalar(rn(ii, jj));
+        const GeomScalar rinv = GeomScalar(1.0) / r_ij;
         fij(ii, jj, 0) += sA * GeomScalar(rh(ii, jj, 0)) + rinv * sBx;
         fij(ii, jj, 1) += sA * GeomScalar(rh(ii, jj, 1)) + rinv * sBy;
         fij(ii, jj, 2) += sA * GeomScalar(rh(ii, jj, 2)) + rinv * sBz;
@@ -1034,7 +1110,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_transpose(const
   const long lda = (long) A.extent(0);
   auto T = d_spbf_T;
   const bool fwd = to_rowmajor;
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, 256>>;
   using member = typename team_policy::member_type;
   team_policy pol(nti * ntq, 256);
   pol = pol.set_scratch_size(0, Kokkos::PerTeam(32 * 33 * sizeof(float)));
@@ -1071,6 +1147,13 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast(
     int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out, bool rm)
 {
+  if (spbf_use_mfma(idx)) {    // false outside CDNA builds
+#if GRACE3L_SPBF_MFMA
+    if (d_spbf[idx].n_lm_ind == 25) spbf_fwd_mfma_t<25>(idx, indicator, out, rm);
+    else spbf_fwd_mfma_t<50>(idx, indicator, out, rm);
+    return;
+#endif
+  }
   if (d_spbf[idx].n_lm_ind == 25) spbf_fwd_fast_t<5>(idx, indicator, out, rm);
   else spbf_fwd_fast_t<10>(idx, indicator, out, rm);
 }
@@ -1083,8 +1166,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
     int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out, bool rm)
 {
   // shared rows padded for 16-byte loads: a tile [5 -> 8], b tile [TR -> TRP]
-  constexpr int CB = 4, NB = 16, NY = 25, TY = 5, NLI = 5 * TR, TRP = (TR + 3) / 4 * 4, TEAM = 128;
-  constexpr int ASZ = NB * CB * 5 * 8, BSZ = NB * CB * 5 * TRP, QSZ = CB * NY * NLI;
+  // HIP: rounds of 8 bonds and Q to shared in two halves of the channels (QP): 10-13 KB of team scratch instead of
+  // 20-26 KB, i.e. four to six teams per CU of MI250X (64 KB) instead of two (one wave per SIMD: latency-bound);
+  // registers for two waves per SIMD (launch bounds M = 2: 256 per lane; with M = 4, i.e. 128, TR = 10 spilled)
+  constexpr bool hip = is_hip_v<DeviceType>;
+  constexpr int CB = 4, NB = hip ? 8 : 16, NY = 25, TY = 5, NLI = 5 * TR, TRP = (TR + 3) / 4 * 4, TEAM = 128;
+  static_assert(CB == 4, "SPBFFwdT: the CB channels of a Q entry / output function as one G3F4");
+  constexpr int QP = hip ? 2 : 1, CQ = CB / QP;
+  constexpr int ASZ = NB * CB * 5 * 8, BSZ = NB * CB * 5 * TRP, QSZ = CQ * NY * NLI;
   constexpr int SHF = (ASZ + BSZ > QSZ) ? ASZ + BSZ : QSZ;
   const DeviceSPBF &sp = d_spbf[idx];
   const int nblk = sp.n_rad_max / CB, nfunc = sp.nfunc;
@@ -1097,13 +1186,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
   const int NR = sp.n_rad_max;
   // fuse_radial: R of this layer from the cubic tables, staged per round in shared (Rs[b][cc][l]), not from d_R1_nl
   const bool tabr = fuse_radial && spline_on;
-  const int TN = spl_N[idx], TNT = spl_Ntot, TOFF = spl_off[idx], tnsp = n_sp, tld = spl_ld, tlm = lmax + 1;
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i; auto rn = d_rnorms;
+  const int tnsp = n_sp, tlm = lmax + 1;
+  const G3LTab tab = spl_tab(idx);
+  auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i; auto rn = d_rnorms;
 
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, TEAM, 2>>;
   using member = typename team_policy::member_type;
   const size_t shb = (size_t) SHF * sizeof(float) + NB * (2 * sizeof(int) + sizeof(float)) +
-                     (tabr ? NB * CB * 5 * sizeof(float) : 0) + 64;
+                     (tabr ? NB * CB * 5 * sizeof(float) + NB * (sizeof(long) + sizeof(float)) + 8 : 0) + 64;
   team_policy pol(chunk_size * nblk, TEAM);
   pol = pol.set_scratch_size(0, Kokkos::PerTeam(shb));
   Kokkos::parallel_for("SPBFFwdT", pol, KOKKOS_LAMBDA(const member &t) {
@@ -1112,7 +1202,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
     int *jgs = (int *) t.team_shmem().get_shmem(NB * sizeof(int));
     int *mus = (int *) t.team_shmem().get_shmem(NB * sizeof(int));
     float *evs = (float *) t.team_shmem().get_shmem(NB * sizeof(float));
-    float *Rs = tabr ? (float *) t.team_shmem().get_shmem(NB * CB * 5 * sizeof(float)) : nullptr;
+    // tabr: R of the round's (bond, channel, l); per bond its radial table row (offset up to the channel) and t
+    float *Rs = nullptr;
+    long *tbs = nullptr;
+    float *tts = nullptr;
+    if (tabr) {
+      Rs = (float *) t.team_shmem().get_shmem(NB * CB * 5 * sizeof(float));
+      tbs = (long *) t.team_shmem().get_shmem_aligned(NB * sizeof(long), 8);
+      tts = (float *) t.team_shmem().get_shmem(NB * sizeof(float));
+    }
     float *as = sh, *bs = sh + ASZ;
     const int tid = t.team_rank(), c = tid / 32, lane = tid - c * 32;
     const bool act = lane < 25;
@@ -1130,21 +1228,34 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
       Kokkos::parallel_for(Kokkos::TeamThreadRange(t, NB), [&](const int b) {
         const int jq = jb + (b < nb ? b : nb - 1);
         jgs[b] = nearest(ii, jq); mus[b] = muj(ii, jq); evs[b] = (b < nb) ? (float) env(ii, jq) : 0.0f;
+        if (tabr) {
+          const int mi = mui(ii), mj = mus[b];
+          const float rc = bc(mi, mj);
+          tbs[b] = tab.row(spm(mi) * tnsp + spm(mj), (float) rn(ii, jq), rc, tts[b]);
+        }
       });
       t.team_barrier();
       if (tabr) {
-        const int mi = mui(ii);
-        for (int pos = tid; pos < NB * CB * 5; pos += TEAM) {
-          const int b = pos / (CB * 5), cl = pos - b * CB * 5, cc = cl / 5, l = cl - 5 * cc;
-          const int jq = jb + (b < nb ? b : nb - 1), mj = mus[b];
-          const float rc = bc(mi, mj), sx = (float) rn(ii, jq) / rc * TN;
-          int k = (int) sx;
-          if (k > TN - 1) k = TN - 1;
-          const float tt = sx - k;
-          const G3F4 c = *reinterpret_cast<const G3F4 *>(
-              tab.data() + (((size_t) (spm(mi) * tnsp + spm(mj)) * TNT + TOFF + k) * tld +
-                            (size_t) (c0 + cc) * tlm + l) * 4);
-          Rs[pos] = c.x + tt * (c.y + tt * (c.z + tt * c.w));
+        // the table rows' loads of all (bond, channel, l) of the thread issued together (they depend only on
+        // the step above)
+        constexpr int NRS = (NB * CB * 5 + TEAM - 1) / TEAM;
+        G3F4 cf[NRS];
+#pragma unroll
+        for (int u = 0; u < NRS; u++) {
+          const int pos = tid + u * TEAM;
+          cf[u] = G3F4{0.0f, 0.0f, 0.0f, 0.0f};
+          if (pos < NB * CB * 5) {
+            const int b = pos / (CB * 5), cl = pos - b * CB * 5, cc = cl / 5, l = cl - 5 * cc;
+            cf[u] = *reinterpret_cast<const G3F4 *>(tab.c + (tbs[b] + (size_t) (c0 + cc) * tlm + l) * 4);
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < NRS; u++) {
+          const int pos = tid + u * TEAM;
+          if (pos < NB * CB * 5) {
+            const float tt = tts[pos / (CB * 5)];
+            Rs[pos] = g3l_cubic(cf[u], tt);
+          }
         }
         t.team_barrier();
       }
@@ -1190,11 +1301,46 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
       }
       t.team_barrier();
     }
+    if (hip) {
+      // Q of channels qp CQ .. qp CQ + CQ - 1 to shared, the CG step for them (same entries, order and sums as below)
+      float *Ao = &AT(ii, c0);
+#pragma unroll
+      for (int qp = 0; qp < QP; qp++) {
+        if (act && c / CQ == qp)
+#pragma unroll
+          for (int i = 0; i < TY; i++)
+#pragma unroll
+            for (int k = 0; k < TR; k++) sh[((c - qp * CQ) * NY + ty * TY + i) * NLI + tr * TR + k] = acc[i][k];
+        t.team_barrier();
+        for (int f = tid; f < nfunc; f += TEAM) {
+          float s[CQ];
+#pragma unroll
+          for (int cc = 0; cc < CQ; cc++) s[cc] = 0.0f;
+          const int e0 = cptr(f), e1 = cptr(f + 1);
+          for (int e = e0; e < e1; e += 4) {
+            G3I2 en[4];
+#pragma unroll
+            for (int u = 0; u < 4; u++) en[u] = (e + u < e1) ? csc2[e + u] : G3I2{0, 0.0f};
+#pragma unroll
+            for (int u = 0; u < 4; u++)
+              if (e + u < e1) {
+#pragma unroll
+                for (int cc = 0; cc < CQ; cc++) s[cc] += sh[cc * NY * NLI + en[u].i] * en[u].v;
+              }
+          }
+#pragma unroll
+          for (int cc = 0; cc < CQ; cc++) Ao[(long) f * NR + qp * CQ + cc] = s[cc] * inv;
+        }
+        if (qp + 1 < QP) t.team_barrier();
+      }
+    } else {
+    // Q of the CB channels interleaved (sh[p CB + c]): the CG step below reads an entry's CB values as one 16-byte load
+    // (as the dE/dA staging of spbf_bwd_fast2_t)
     if (act)
 #pragma unroll
       for (int i = 0; i < TY; i++)
 #pragma unroll
-        for (int k = 0; k < TR; k++) sh[(c * NY + ty * TY + i) * NLI + tr * TR + k] = acc[i][k];
+        for (int k = 0; k < TR; k++) sh[((ty * TY + i) * NLI + tr * TR + k) * CB + c] = acc[i][k];
     t.team_barrier();
     // CG step, thread per output function f for all CB channels (one CSC index load per entry); the CB channels
     // of f are contiguous in d_spbf_T (one 16-byte store)
@@ -1213,12 +1359,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_fwd_fast_t(
 #pragma unroll
           for (int u = 0; u < 4; u++)
             if (e + u < e1) {
-#pragma unroll
-              for (int cc = 0; cc < CB; cc++) s[cc] += sh[cc * NY * NLI + en[u].i] * en[u].v;
+              const G3F4 q = *reinterpret_cast<const G3F4 *>(sh + en[u].i * CB);
+              s[0] += q.x * en[u].v; s[1] += q.y * en[u].v; s[2] += q.z * en[u].v; s[3] += q.w * en[u].v;
             }
         }
         *reinterpret_cast<G3F4 *>(Ao + (long) f * NR) = G3F4{s[0] * inv, s[1] * inv, s[2] * inv, s[3] * inv};
       }
+    }
     }
   });
   if (!rm) spbf_transpose(out, NR, nfunc, false);
@@ -1228,7 +1375,18 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast(
     int idx, const t_nn_3d &A_adj, const t_nn_3d_rg &indicator, const t_nn_3d_rg &target, bool rm)
 {
-  static const bool v1 = getenv("GRACE3L_SPBF_BWD1") != nullptr;
+  if (spbf_use_mfma(idx)) {    // false outside CDNA builds
+#if GRACE3L_SPBF_MFMA
+    if (d_spbf[idx].n_lm_ind == 25) spbf_bwd_mfma_t<25>(idx, A_adj, indicator, target, rm);
+    else spbf_bwd_mfma_t<50>(idx, A_adj, indicator, target, rm);
+    return;
+#endif
+  }
+  static const bool v1_env = getenv("GRACE3L_SPBF_BWD1") != nullptr;
+  // HIP: the one-pass kernel by default (MI250X, 3L W-bcc-5k: 83.2 vs 86.7 us/atom with spbf_bwd_fast2_t<., 0>);
+  // GRACE3L_SPBF_BWD2 selects spbf_bwd_fast2_t there (the vector-ALU kernels only: with GRACE3L_SPBF_MFMA=0 on gfx90a)
+  static const bool v2_env = getenv("GRACE3L_SPBF_BWD2") != nullptr;
+  const bool v1 = v1_env || (is_hip_v<DeviceType> && !v2_env);
   const bool h1 = d_spbf[idx].n_lm_ind == 25;
   if (v1) {
     if (h1) spbf_bwd_fast_t<1>(idx, A_adj, indicator, target, rm);
@@ -1285,21 +1443,28 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast_t(
   const int mn = (int) d_Y_bond.extent(1);
   // fuse_radial: R and dR/dr of this layer from the cubic tables (as radial_from_splines), not from d_R1_nl / d_DR1_nl
   const bool tabr = fuse_radial && spline_on;
-  const int TN = spl_N[idx], TNT = spl_Ntot, TOFF = spl_off[idx], tnsp = n_sp, tld = spl_ld, tlm = lmax + 1;
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
+  const int tnsp = n_sp, tlm = lmax + 1;
+  const G3LTab tab = spl_tab(idx);
+  auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
   // the dE/dA rows of cpp channels at a time are staged in the (then unused) Y / dY region
   const size_t gbytes = (size_t) GSZ * sizeof(GeomScalar);
   const int cpp = std::max(1, std::min(CB, (int) (gbytes / ((size_t) nfunc * sizeof(float)))));
   const size_t gsh = std::max(gbytes, (size_t) cpp * nfunc * sizeof(float));
+  const G3I2 *ell2 = reinterpret_cast<const G3I2 *>(sp.cg_ell2.data());
+  constexpr int MU = 4;    // HIP: CG rows per thread in flight while building M
 
-  using team_policy = Kokkos::TeamPolicy<DeviceType>;
+  using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, TEAM>>;
   using member = typename team_policy::member_type;
+  constexpr bool hip = is_hip_v<DeviceType>;
+  static_assert(!hip || GSZ * sizeof(GeomScalar) >= NBR * CB * NLH * sizeof(float), "dE/dI slice > Y / dY region");
   team_policy pol(chunk_size * nblk, TEAM);
-  pol = pol.set_scratch_size(0, Kokkos::PerTeam((size_t) MSZ * sizeof(float) + gsh + 64));
+  pol = pol.set_scratch_size(0, Kokkos::PerTeam((size_t) MSZ * sizeof(float) + gsh + (hip ? NBR * sizeof(int) : 0) + 64));
   Kokkos::parallel_for("SPBFBwdT", pol, KOKKOS_LAMBDA(const member &t) {
     const int ii = t.league_rank() / nblk, c0 = (t.league_rank() - ii * nblk) * CB;
     float *Ms = (float *) t.team_shmem().get_shmem_aligned((size_t) MSZ * sizeof(float), 16);
     GeomScalar *Gs = (GeomScalar *) t.team_shmem().get_shmem_aligned(gsh, 16);
+    int *jgs = nullptr;    // HIP: the round's neighbour indices (dE/dI scatter)
+    if (hip) jgs = (int *) t.team_shmem().get_shmem(NBR * sizeof(int));
     const int tid = t.team_rank(), c = tid / 32, lane = tid - c * 32;
     const int h = lane / NBR, bl = lane - h * NBR, n = c0 + c;
 
@@ -1320,6 +1485,33 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast_t(
         for (int cc = 0; cc < nc; cc++) St[cc * nfunc + f] = av[cb + cc];
       }
       t.team_barrier();
+      if (is_hip_v<DeviceType>) {
+        // HIP: MU rows per thread at a time, their packed ELL entries (one 8-byte load each, the same values) all
+        // loaded before the sums (the loop below waited for each row's loads: one exposed latency per row)
+        for (int p0 = tid; p0 < NP; p0 += MU * TEAM) {
+          G3I2 en[MU][EW];
+#pragma unroll
+          for (int u = 0; u < MU; u++)
+#pragma unroll
+            for (int e = 0; e < EW; e++) {
+              const int p = p0 + u * TEAM;
+              en[u][e] = (e < ew && p < NP) ? ell2[e * NP + p] : G3I2{0, 0.0f};
+            }
+#pragma unroll
+          for (int u = 0; u < MU; u++) {
+            const int p = p0 + u * TEAM;
+            if (p >= NP) break;
+            const int y = p / NLI, rem = p - y * NLI, hh = rem / NLH, k = rem - hh * NLH;
+            for (int cc = 0; cc < nc; cc++) {
+              const float *Sc = St + cc * nfunc;
+              float s = 0.0f;
+#pragma unroll
+              for (int e = 0; e < EW; e++) if (e < ew) s += Sc[en[u][e].i] * en[u][e].v;
+              Ms[(((cb + cc) * NY + y) * H + hh) * NLHP + k] = s * inv;
+            }
+          }
+        }
+      } else {
       for (int p = tid; p < NP; p += TEAM) {
         int col[EW]; float val[EW];
 #pragma unroll
@@ -1336,12 +1528,38 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast_t(
           Ms[(((cb + cc) * NY + y) * H + hh) * NLHP + k] = s * inv;
         }
       }
+      }
       t.team_barrier();
     }
 
     const int nct = ncount(ii);
     for (int jb = 0; jb < nct; jb += NBR) {
       // stage [bond][y][Y, dYx, dYy, dYz] of this round (rows jb.. are contiguous in d_Y_bond / d_dY_bond)
+      if (hip) {
+        // HIP: thread per (bond, y) pair, a fixed number of pairs per thread with all their loads issued before
+        // the stores (the loop below has a thread-dependent trip count and waited for each iteration's loads)
+        constexpr int NPR = (NBR * NY + TEAM - 1) / TEAM;
+        GeomScalar v[NPR][4];
+#pragma unroll
+        for (int u = 0; u < NPR; u++) {
+          const int pr = tid + u * TEAM, b = pr / NY, y = pr - b * NY, jj = jb + b;
+#pragma unroll
+          for (int k = 0; k < 4; k++) v[u][k] = GeomScalar(0.0);
+          if (pr < NBR * NY && jj < mn) {
+            v[u][0] = Y(ii, jj, y); v[u][1] = dY(ii, jj, y, 0); v[u][2] = dY(ii, jj, y, 1); v[u][3] = dY(ii, jj, y, 2);
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < NPR; u++) {
+          const int pr = tid + u * TEAM;
+          if (pr < NBR * NY) {
+            GeomScalar *gp = Gs + 4 * pr;
+            if constexpr (sizeof(GeomScalar) == 4)
+              *reinterpret_cast<G3F4 *>(gp) = G3F4{(float) v[u][0], (float) v[u][1], (float) v[u][2], (float) v[u][3]};
+            else { gp[0] = v[u][0]; gp[1] = v[u][1]; gp[2] = v[u][2]; gp[3] = v[u][3]; }
+          }
+        }
+      } else
       for (int q0 = tid; q0 < GSZ; q0 += TEAM * 4) {
         GeomScalar v[4];
 #pragma unroll
@@ -1375,21 +1593,18 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast_t(
         float tt = 0.0f, dxs = 0.0f;
         if (tabr) {
           const int mi = mui(ii), mj = muj(ii, jj);
-          const float rc = bc(mi, mj), sx = (float) rn(ii, jj) / rc * TN;
-          int k = (int) sx;
-          if (k > TN - 1) k = TN - 1;
-          tt = sx - k;
-          dxs = (float) TN / rc;
-          trow = tab.data() +
-                 (((size_t) (spm(mi) * tnsp + spm(mj)) * TNT + TOFF + k) * tld + (size_t) n * tlm) * 4;
+          const float rc = bc(mi, mj);
+          dxs = tab.dsdr(rc);
+          const long r0 = tab.row(spm(mi) * tnsp + spm(mj), (float) rn(ii, jj), rc, tt);
+          trow = tab.c + (r0 + (long) n * tlm) * 4;
         }
 #pragma unroll
         for (int l = 0; l < 5; l++) {
           float r, dr;
           if (tabr) {
             const G3F4 c = *reinterpret_cast<const G3F4 *>(trow + 4 * l);
-            r = c.x + tt * (c.y + tt * (c.z + tt * c.w));
-            dr = (c.y + tt * (2.0f * c.z + 3.0f * tt * c.w)) * dxs;
+            r = g3l_cubic(c, tt);
+            dr = g3l_cubic_dt(c, tt) * dxs;
           } else {
             r = R(ii, jj, n, l);
             dr = DR(ii, jj, n, l);
@@ -1432,10 +1647,40 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast_t(
           sBx += vr * gx; sBy += vr * gy; sBz += vr * gz;
         }
       }
+      if (hip) {
+        // HIP: dE/dI through the (now free) Y / dY region, one half h at a time: [bond][channel][k] of the round
+        // is written by the lanes, then added by consecutive threads on consecutive (channel, k), i.e. along the
+        // contiguous rows (jg, c0 .. c0 + 3) of the target, instead of one row per lane (the same values; zeros
+        // skipped as below)
+        float *Ws = (float *) Gs;
+        if (h == 0 && bl < NBR) jgs[bl] = jg;
+        t.team_barrier();
+        constexpr int NW = NBR * CB * NLH, NWT = (NW + TEAM - 1) / TEAM;
+        const int nbr = (nct - jb < NBR) ? nct - jb : NBR;
+#pragma unroll
+        for (int ph = 0; ph < H; ph++) {
+          if (h == ph) {
+#pragma unroll
+            for (int k = 0; k < NLH; k++) Ws[(bl * CB + c) * NLH + k] = valid ? gI[k] : 0.0f;
+          }
+          t.team_barrier();
+#pragma unroll
+          for (int u = 0; u < NWT; u++) {
+            const int e = tid + u * TEAM, b = e / (CB * NLH), r = e - b * (CB * NLH), cc = r / NLH, k = r - cc * NLH;
+            if (e < NW && b < nbr) {
+              const float g = Ws[e];
+              if (g != 0.0f) Kokkos::atomic_add(&tgt(jgs[b], c0 + cc, ph * NLH + k), g);
+            }
+          }
+          if (ph + 1 < H) t.team_barrier();
+        }
+      }
       if (valid) {
+        if (!hip) {
 #pragma unroll
         for (int k = 0; k < NLH; k++)
           if (gI[k] != 0.0f) Kokkos::atomic_add(&tgt(jg, n, h * NLH + k), gI[k]);
+        }
         if (h == 0) {
           const GeomScalar rinv = GeomScalar(1.0) / GeomScalar(rn(ii, jj));
           Kokkos::atomic_add(&fij(ii, jj, 0), sA * GeomScalar(rh(ii, jj, 0)) + rinv * sBx);
@@ -1478,8 +1723,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast2_t(
   auto fij = d_f_ij;
   // fuse_radial: R and dR/dr of this layer from the cubic tables (as radial_from_splines), not from d_R1_nl / d_DR1_nl
   const bool tabr = fuse_radial && spline_on;
-  const int TN = spl_N[idx], TNT = spl_Ntot, TOFF = spl_off[idx], tnsp = n_sp, tld = spl_ld, tlm = lmax + 1;
-  auto tab = d_splR; auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
+  const int tnsp = n_sp, tlm = lmax + 1;
+  const G3LTab tab = spl_tab(idx);
+  auto spm = d_sp_of_mu; auto bc = d_bond_cutoff; auto mui = d_mu_i;
   const size_t gbytes = (size_t) GSZ * sizeof(GeomScalar), fbytes = (size_t) CB * NBR * 4 * sizeof(GeomScalar);
   const bool stage_a = (size_t) nfunc * CB * sizeof(float) <= gbytes;
   // raw pointers and strides: the per-bond loads and atomics below without the views' index arithmetic. The Y / dY
@@ -1595,21 +1841,18 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast2_t(
         float tt = 0.0f, dxs = 0.0f;
         if (tabr) {
           const int mi = mui(ii);
-          const float rc = bc(mi, mj), sx = (float) rn(ii, jj) / rc * TN;
-          int k = (int) sx;
-          if (k > TN - 1) k = TN - 1;
-          tt = sx - k;
-          dxs = (float) TN / rc;
-          trow = tab.data() +
-                 (((size_t) (spm(mi) * tnsp + spm(mj)) * TNT + TOFF + k) * tld + (size_t) n * tlm) * 4;
+          const float rc = bc(mi, mj);
+          dxs = tab.dsdr(rc);
+          const long r0 = tab.row(spm(mi) * tnsp + spm(mj), (float) rn(ii, jj), rc, tt);
+          trow = tab.c + (r0 + (long) n * tlm) * 4;
         }
 #pragma unroll
         for (int l = 0; l < 5; l++) {
           float r, dr;
           if (tabr) {
             const G3F4 c = *reinterpret_cast<const G3F4 *>(trow + 4 * l);
-            r = c.x + tt * (c.y + tt * (c.z + tt * c.w));
-            dr = (c.y + tt * (2.0f * c.z + 3.0f * tt * c.w)) * dxs;
+            r = g3l_cubic(c, tt);
+            dr = g3l_cubic_dt(c, tt) * dxs;
           } else {
             r = Rp[ii * rsi + jj * rsj + n * rsn + l];
             dr = DRp[ii * rsi + jj * rsj + n * rsn + l];
@@ -1721,11 +1964,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast2_t(
 #pragma unroll
         for (int s = 0; s < 16; s++) gw[s] = kl ? Wf[s * NLH + lane] : 0.0f;
         g3l_syncwarp();
+        // the pass's half sh = 16 ps / NBR (ps for H = 2, 0 for H = 1): kuse by constant index (kept in registers;
+        // the ps loop is not unrolled)
+        static_assert(16 / NBR == (H == 2 ? 1 : 0), "SPBFBwdT2: pass ps covers the half sh = ps (H = 2) / 0 (H = 1)");
+        const bool ku = (H == 2 && ps == 1) ? kuse[H - 1] : kuse[0];
 #pragma unroll
         for (int s = 0; s < 16; s++) {
           const int ln = 16 * ps + s, sh = ln / NBR, sb = ln - sh * NBR;
           const int g = g3l_shfl(jg, sb);
-          if (g >= 0 && kuse[sh]) Kokkos::atomic_add(tgtn + (long) g * tsg + sh * NLH, gw[s]);
+          if (g >= 0 && ku) Kokkos::atomic_add(tgtn + (long) g * tsg + sh * NLH, gw[s]);
         }
       }
       // per-bond force: sum of the team's channels, then one atomic per component
@@ -1746,7 +1993,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_bwd_fast2_t(
     }
   };
   // four teams per SM only when their scratch fits (a double Y / dY staging may not)
-  if (MB && pol.team_size_max(body, Kokkos::ParallelForTag()) < TEAM) {
+  if (MB && !launch_bounds_fit(pol, body, TEAM)) {
     spbf_bwd_fast2_t<H, 0>(idx, A_adj, indicator, target, true);    // dE/dA already row-major in d_spbf_T
     return;
   }
@@ -1759,6 +2006,12 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_force_L1()
 #ifdef KOKKOS_ENABLE_CUDA
   if (std::is_same<typename DeviceType::execution_space, Kokkos::Cuda>::value && sizeof(NNScalar) == 4 &&
       d_spbf[0].n_rad_max <= 64 && lmax <= 4 && spbf_ltile_std[0] && !getenv("GRACE3L_GENERIC_SPBF")) {
+    force_L1_fast();
+    return;
+  }
+#elif defined(KOKKOS_ENABLE_HIP)
+  if (is_hip_v<DeviceType> && sizeof(NNScalar) == 4 && d_spbf[0].n_rad_max <= 64 && lmax <= 4 && spbf_ltile_std[0] &&
+      !getenv("GRACE3L_GENERIC_SPBF")) {
     force_L1_fast();
     return;
   }

@@ -209,12 +209,16 @@ def test_bundled_registry_is_well_formed():
     assert not set(names) & set(e.get("unsupported", {}))
 
 
-def test_calculator_resolves_registry_names(monkeypatch, models):
-    import grace_runtime.calculator as gc
+def test_model_and_calculator_resolve_registry_names(monkeypatch, models, tmp_path):
+    from grace_runtime import GRACERuntimeCalculator, Model
     seen = []
-    monkeypatch.setattr(gc.registry, "resolve", lambda name, **k: seen.append(name) or models["1l"])
-    gc.GRACERuntimeCalculator("GRACE-1L-OMAT-large-base")
-    assert seen == ["GRACE-1L-OMAT-large-base"]
+    monkeypatch.setattr(registry, "resolve", lambda name, **k: seen.append(name) or models["1l"])
+    assert Model("GRACE-1L-OMAT-large-base").path == models["1l"]
+    GRACERuntimeCalculator("GRACE-1L-OMAT-large-base")
+    assert seen == ["GRACE-1L-OMAT-large-base"] * 2
+    assert Model(models["1l"]).path == models["1l"] and len(seen) == 2    # a path is never looked up
+    with pytest.raises(ValueError, match="cannot open"):    # a mistyped path is not reported as an unknown model
+        Model(str(tmp_path / "missing" / "kokkos.npz"))
 
 
 def test_cli_list_and_download(server, tmp_path, monkeypatch, capsys):
@@ -238,3 +242,4 @@ def test_3l_models_are_listed():
     names = {m["name"]: m for m in registry.list_models()}
     for n in ("GRACE-3L-OMAT-large", "GRACE-3L-OMAT-large-ft-AM"):
         assert names[n]["arch"] == "3L" and names[n]["url"].endswith("kokkos.npz")
+

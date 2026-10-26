@@ -12,11 +12,14 @@
 #pragma once
 
 #include "grace/kk/fused_common.h"
+#include "grace/kk/kk_mfma.h"    // GRACE_KK_GEMM_MFMA, mfma_16x16x4
+#include "grace/kk/fused_hip_bonds.h"    // fused_mfma (GRACE_FUSED_MFMA, read once per process)
 #include "grace/kk/support.h"
 
 
 #include <algorithm>
 #include <array>
+#include <type_traits>
 #include <vector>
 
 namespace grace {
@@ -31,6 +34,10 @@ struct FCMetaT {
   int no = 0, nf = 0, nil = 0, nir = 0, nsrc = 0, nlive = 0;
   int nirp = 0, hr = 1;                   // WrT: right input width padded to 4 hr; hr threads per (atom pair, source)
   GFV3<float, DeviceType> Wl, Wr, WrT;    // Wl/Wr [tile][n_in][n_out pad 4], norm folded in; WrT [tile][n_out][nirp]
+  GFV3<float, DeviceType> WlT;            // with mfma_l: [tile][n_out][nil] (reverse left part)
+  // HIP CDNA: the FCs on the matrix cores (GRACE_FUSED_MFMA, default on gfx90a): forward; reverse left / right part
+  // (inputs up to FC_MFMA_MAXIN)
+  bool mfma_f = false, mfma_l = false, mfma_r = false;
   GFV1<int, DeviceType> flive, tl, toff, tsrc, ttile, soff, stgt, stile;
   GFV1<float, DeviceType> nof;
 };
@@ -43,6 +50,8 @@ struct ProdMetaT {
   GFV1<int, DeviceType> foff, fa, fb, loff, la, lb, roff, ra, rb;
   GFV1<float, DeviceType> fc, lc, rc;
 };
+
+constexpr int FC_MFMA_MAXIN = 64;    // reverse FC on the matrix cores: inputs as 4 column blocks of 16 (NJM = 4)
 
 template<class DeviceType, class FCW>
 void build_fc_meta(FCMetaT<DeviceType> &m, const FCW &fc, const std::vector<int> &used, const char *who)
@@ -78,6 +87,17 @@ void build_fc_meta(FCMetaT<DeviceType> &m, const FCW &fc, const std::vector<int>
     for (int k = 0; k < no; k++)
       for (int n = 0; n < m.nirp; n++) hWrT(t, k, n) = n < m.nir ? hWr(t, n, k) : (F) 0;
   Kokkos::deep_copy(m.WrT, hWrT);
+  m.mfma_f = is_hip_v<DeviceType> && fused_mfma(true).on;
+  m.mfma_l = m.mfma_f && m.nil <= FC_MFMA_MAXIN;
+  m.mfma_r = m.mfma_f && m.nir <= FC_MFMA_MAXIN;
+  if (m.mfma_l) {
+    m.WlT = GFV3<float, DeviceType>("gfused:fcWlT", ntl, no, m.nil);
+    auto hWlT = Kokkos::create_mirror_view(m.WlT);
+    for (int t = 0; t < ntl; t++)
+      for (int k = 0; k < no; k++)
+        for (int n = 0; n < m.nil; n++) hWlT(t, k, n) = hWl(t, n, k);
+    Kokkos::deep_copy(m.WlT, hWlT);
+  }
 
   m.tl = GFV1<int, DeviceType>("gfused:fc_tl", m.nf); m.nof = GFV1<float, DeviceType>("gfused:fc_nof", m.nf);
   auto htl = Kokkos::create_mirror_view(m.tl); auto hnof = Kokkos::create_mirror_view(m.nof);
@@ -180,18 +200,210 @@ void build_prod_meta(ProdMetaT<DeviceType> &m, const CGP &p, bool self)
   }
 }
 
+#if GRACE_KK_GEMM_MFMA
+// The FCs on the CDNA matrix cores (v_mfma_f32_16x16x4f32), for atom-fastest (LayoutLeft) activations. Per function
+// the FC is a GEMM over the atoms; a wavefront takes 64 consecutive atoms of one function (consecutive wavefronts:
+// consecutive atom blocks of the same function). Lane (li, g) loads atoms a4 .. a4 + 3 (a4 = a0 + 4 li) of input row
+// n0 + g with one float4 load; value u is column li of the u-th 16-atom B operand, the A operand is 16 outputs x 4
+// inputs of the weights (rows = outputs), so the D blocks are [16 outputs][16 atoms] and are written back as float4
+// rows of 4 atoms too: 256 contiguous bytes per wavefront and row in both directions. The vector-ALU kernels below
+// (fc_fwd4, fc_bwd) were bound by the many short strided accesses: 2x slower per call at the same bytes moved.
+template<class V3T> inline constexpr bool fc_mfma_layout_v = std::is_same_v<typename V3T::array_layout, Kokkos::LayoutLeft>;
+
+// rows start at any atom (cs need not be a multiple of 4): 4-byte aligned float4 (the compiler keeps dwordx4 where
+// the target allows unaligned accesses, else splits it)
+typedef float fc_f4u __attribute__((ext_vector_type(4), aligned(4)));
+
+// atoms a4 .. a4 + 3 of row p; past the chunk (only in the last block) the atom cs - 1
+KOKKOS_INLINE_FUNCTION mfma_f4v fc_ld4(const float *p, int a4, int cs, bool full)
+{
+  if (full) return *reinterpret_cast<const fc_f4u *>(p + a4);
+  mfma_f4v v;
+  v[0] = p[a4 < cs ? a4 : cs - 1]; v[1] = p[a4 + 1 < cs ? a4 + 1 : cs - 1];
+  v[2] = p[a4 + 2 < cs ? a4 + 2 : cs - 1]; v[3] = p[a4 + 3 < cs ? a4 + 3 : cs - 1];
+  return v;
+}
+
+// forward: out[a][k][f] = nof(f) (sum_n in_l[a][n][f] Wl[tl(f)][n][k] + sum_c sum_n in_r[a][n][tsrc(c)] Wr[ttile(c)][n][k])
+template<class DeviceType, int NO, class V3T>
+void fc_fwd_mfma(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in_r, const V3T &out)
+{
+  using F = float;
+  constexpr int NJ = (NO + 15) / 16;
+  const int nlive = m.nlive, nil = m.nil, nir = m.nir, nab = (cs + 63) / 64, nw = nab * nlive;
+  if (nw == 0) return;
+  const size_t ll = in_l.stride(1), fl = in_l.stride(2), lr = in_r.stride(1), fr = in_r.stride(2);
+  const size_t lo = out.stride(1), fo = out.stride(2);
+  const F *pl = in_l.data(), *pr = in_r.data();
+  F *po = out.data();
+  auto Wl = m.Wl; auto Wr = m.Wr; auto tl = m.tl; auto nof = m.nof; auto flive = m.flive;
+  auto toff = m.toff; auto tsrc = m.tsrc; auto ttile = m.ttile;
+  using pol_t = Kokkos::TeamPolicy<DeviceType, Kokkos::LaunchBounds<256, 2>>;
+  using member = typename pol_t::member_type;
+  Kokkos::parallel_for("gfused:FC_mfma", pol_t((nw + 3) / 4, 256), KOKKOS_LAMBDA(const member &tm) {
+    const int w = tm.league_rank() * 4 + (tm.team_rank() >> 6), lane = tm.team_rank() & 63, li = lane & 15, g = lane >> 4;
+    if (w >= nw) return;    // uniform over the wavefront
+    const int fi = w / nab, ab = w - fi * nab, f = flive(fi), a4 = 64 * ab + 4 * li;
+    const bool full = a4 + 3 < cs;
+    mfma_f4v acc[4][NJ];
+#pragma unroll
+    for (int u = 0; u < 4; u++)
+#pragma unroll
+      for (int j = 0; j < NJ; j++) acc[u][j] = mfma_f4v{0.0f, 0.0f, 0.0f, 0.0f};
+    {
+      const int t = tl(f);
+      const F *x = pl + f * fl;
+#pragma unroll 2
+      for (int n0 = 0; n0 < nil; n0 += 4) {
+        const bool nok = n0 + g < nil;
+        const int n = nok ? n0 + g : 0;
+        const mfma_f4v xv = fc_ld4(x + n * ll, a4, cs, full);
+        F b[NJ];
+#pragma unroll
+        for (int j = 0; j < NJ; j++) { const int k = 16 * j + li; b[j] = (nok && (NO % 16 == 0 || k < NO)) ? Wl(t, n, k) : 0.0f; }
+#pragma unroll
+        for (int j = 0; j < NJ; j++)
+#pragma unroll
+          for (int u = 0; u < 4; u++) mfma_16x16x4(b[j], xv[u], acc[u][j]);
+      }
+    }
+    for (int c = toff(f); c < toff(f + 1); c++) {
+      const int sr = tsrc(c), tr = ttile(c);
+      const F *x = pr + sr * fr;
+#pragma unroll 2
+      for (int n0 = 0; n0 < nir; n0 += 4) {
+        const bool nok = n0 + g < nir;
+        const int n = nok ? n0 + g : 0;
+        const mfma_f4v xv = fc_ld4(x + n * lr, a4, cs, full);
+        F b[NJ];
+#pragma unroll
+        for (int j = 0; j < NJ; j++) { const int k = 16 * j + li; b[j] = (nok && (NO % 16 == 0 || k < NO)) ? Wr(tr, n, k) : 0.0f; }
+#pragma unroll
+        for (int j = 0; j < NJ; j++)
+#pragma unroll
+          for (int u = 0; u < 4; u++) mfma_16x16x4(b[j], xv[u], acc[u][j]);
+      }
+    }
+    // D block (j, u): register q of lane (li, g) = (output 16 j + 4 g + q, atom a4 + u)
+    const F sc = nof(f);
+    F *o = po + f * fo;
+#pragma unroll
+    for (int j = 0; j < NJ; j++)
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        const int k = 16 * j + 4 * g + q;
+        if (NO % 16 != 0 && k >= NO) continue;
+        const mfma_f4v v{acc[0][j][q] * sc, acc[1][j][q] * sc, acc[2][j][q] * sc, acc[3][j][q] * sc};
+        F *ok = o + k * lo;
+        if (full) *reinterpret_cast<fc_f4u *>(ok + a4) = v;
+        else
+          for (int u = 0; u < 4; u++) if (a4 + u < cs) ok[a4 + u] = v[u];
+      }
+  });
+}
+
+// reverse: din[a][n][key] += sum_terms nof(tg) sum_k dout[a][k][tg] WT[tile][k][n], 64 atoms per wavefront as above.
+// RT false: left part, key = live function f, one term (f, tl(f)), WT = WlT, n < nil;
+// RT true: right part, key = source s, terms (stgt, stile) of soff(s) .. soff(s + 1), WT = WrT, n < nir.
+// NJM: 16-column blocks of n (n_in <= 16 NJM).
+template<class DeviceType, int NO, int NJM, bool RT, class V3T>
+void fc_bwd_mfma(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T &din)
+{
+  using F = float;
+  const int nkey = RT ? m.nsrc : m.nlive, ncol = RT ? m.nir : m.nil, nab = (cs + 63) / 64, nw = nab * nkey;
+  if (nw == 0) return;
+  const size_t ld = dout.stride(1), fd = dout.stride(2), lx = din.stride(1), fx = din.stride(2);
+  const F *pd = dout.data();
+  F *px = din.data();
+  auto WT = RT ? m.WrT : m.WlT;
+  auto tl = m.tl; auto nof = m.nof; auto flive = m.flive; auto soff = m.soff; auto stgt = m.stgt; auto stile = m.stile;
+  using pol_t = Kokkos::TeamPolicy<DeviceType, Kokkos::LaunchBounds<256, 2>>;
+  using member = typename pol_t::member_type;
+  Kokkos::parallel_for(RT ? "gfused:RevFC_RT_mfma" : "gfused:RevFC_L_mfma", pol_t((nw + 3) / 4, 256), KOKKOS_LAMBDA(const member &tm) {
+    const int w = tm.league_rank() * 4 + (tm.team_rank() >> 6), lane = tm.team_rank() & 63, li = lane & 15, g = lane >> 4;
+    if (w >= nw) return;    // uniform over the wavefront
+    const int ki = w / nab, ab = w - ki * nab, key = RT ? ki : flive(ki), a4 = 64 * ab + 4 * li;
+    const int c0 = RT ? soff(key) : 0, c1 = RT ? soff(key + 1) : 1;
+    if (c0 == c1) return;
+    const bool full = a4 + 3 < cs;
+    mfma_f4v acc[4][NJM];
+#pragma unroll
+    for (int u = 0; u < 4; u++)
+#pragma unroll
+      for (int j = 0; j < NJM; j++) acc[u][j] = mfma_f4v{0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = c0; c < c1; c++) {
+      const int tg = RT ? stgt(c) : key, tile = RT ? stile(c) : tl(key);
+      const F sc = nof(tg);
+      const F *d = pd + tg * fd;
+#pragma unroll 2
+      for (int k0 = 0; k0 < NO; k0 += 4) {
+        const bool kok = NO % 4 == 0 || k0 + g < NO;
+        const int k = kok ? k0 + g : NO - 1;
+        const mfma_f4v dv = fc_ld4(d + k * ld, a4, cs, full) * (kok ? sc : 0.0f);
+        F b[NJM];
+#pragma unroll
+        for (int j = 0; j < NJM; j++) { const int n = 16 * j + li; b[j] = n < ncol ? WT(tile, k, n) : 0.0f; }
+#pragma unroll
+        for (int j = 0; j < NJM; j++) {
+          if (16 * j >= ncol) continue;    // uniform
+#pragma unroll
+          for (int u = 0; u < 4; u++) mfma_16x16x4(b[j], dv[u], acc[u][j]);
+        }
+      }
+    }
+    F *o = px + key * fx;
+#pragma unroll
+    for (int j = 0; j < NJM; j++)
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        const int n = 16 * j + 4 * g + q;
+        if (n >= ncol) continue;
+        F *on = o + n * lx;
+        const mfma_f4v v{acc[0][j][q], acc[1][j][q], acc[2][j][q], acc[3][j][q]};
+        if (full) { fc_f4u *p4 = reinterpret_cast<fc_f4u *>(on + a4); *p4 = *p4 + v; }
+        else
+          for (int u = 0; u < 4; u++) if (a4 + u < cs) on[a4 + u] += v[u];
+      }
+  });
+}
+#endif
+
+// the FCs on the matrix cores where the engine chose them (FCMetaT::mfma_*) and the activations are atom-fastest
+// (LayoutLeft); false: the caller runs its vector-ALU kernel
+template<class DeviceType, int NO, class V3T>
+bool fc_fwd_on_mfma(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in_r, const V3T &out)
+{
+#if GRACE_KK_GEMM_MFMA
+  if constexpr (is_hip_v<DeviceType> && fc_mfma_layout_v<V3T>)
+    if (m.mfma_f) { fc_fwd_mfma<DeviceType, NO>(m, cs, in_l, in_r, out); return true; }
+#endif
+  (void) m; (void) cs; (void) in_l; (void) in_r; (void) out;
+  return false;
+}
+template<class DeviceType, int NO, bool RT, class V3T>
+bool fc_bwd_on_mfma(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T &din)
+{
+#if GRACE_KK_GEMM_MFMA
+  if constexpr (is_hip_v<DeviceType> && fc_mfma_layout_v<V3T>)
+    if (RT ? m.mfma_r : m.mfma_l) { fc_bwd_mfma<DeviceType, NO, FC_MFMA_MAXIN / 16, RT>(m, cs, dout, din); return true; }
+#endif
+  (void) m; (void) cs; (void) dout; (void) din;
+  return false;
+}
+
 // forward FC: two atoms per thread, weights as float4 along n_out
 template<class DeviceType, int NO, class V3T>
 void fc_fwd(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in_r, const V3T &out)
 {
   using F = float;
+  if (fc_fwd_on_mfma<DeviceType, NO>(m, cs, in_l, in_r, out)) return;
   // two atoms (ii, ii + half) per thread, weights as float4 along n_out: 8 FMA per weight load
   constexpr int NQ = (NO + 3) / 4;
   const int nlive = m.nlive, nil = m.nil, nir = m.nir;
   const int half = (cs + 1) / 2;
   auto Wl = m.Wl; auto Wr = m.Wr; auto tl = m.tl; auto nof = m.nof; auto flive = m.flive;
   auto toff = m.toff; auto tsrc = m.tsrc; auto ttile = m.ttile;
-  Kokkos::parallel_for("gfused:FC", Kokkos::RangePolicy<DeviceType>(0, half * nlive), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("gfused:FC", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, half * nlive), KOKKOS_LAMBDA(const int q) {
     const int fi = q / half, i0 = q - fi * half, i1 = i0 + half, f = flive(fi);
     const bool two = i1 < cs;
     F4 a0[NQ], a1[NQ];
@@ -226,12 +438,13 @@ template<class DeviceType, int NO, class V3T>
 void fc_fwd4(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in_r, const V3T &out)
 {
   using F = float;
+  if (fc_fwd_on_mfma<DeviceType, NO>(m, cs, in_l, in_r, out)) return;
   constexpr int NH = NO / 2, NQ = NH / 4;
   const int nlive = m.nlive, nil = m.nil, nir = m.nir;
   const int qa = (cs + 3) / 4;
   auto Wl = m.Wl; auto Wr = m.Wr; auto tl = m.tl; auto nof = m.nof; auto flive = m.flive;
   auto toff = m.toff; auto tsrc = m.tsrc; auto ttile = m.ttile;
-  Kokkos::parallel_for("gfused:FC4", Kokkos::RangePolicy<DeviceType>(0, qa * 2 * nlive), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("gfused:FC4", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, qa * 2 * nlive), KOKKOS_LAMBDA(const int q) {
     const int fh = q / qa, i0 = q - fh * qa, fi = fh >> 1, h = fh & 1, f = flive(fi);
     int ia[4];
     bool ok[4];
@@ -283,7 +496,7 @@ void fc_bwd_rt(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T 
   const int nsrc = m.nsrc, nir = m.nir;
   const int half = (cs + 1) / 2;
   auto WrT = m.WrT; auto nof = m.nof; auto soff = m.soff; auto stgt = m.stgt; auto stile = m.stile;
-  Kokkos::parallel_for("gfused:RevFC_RT", Kokkos::RangePolicy<DeviceType>(0, half * nsrc * H), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("gfused:RevFC_RT", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, half * nsrc * H), KOKKOS_LAMBDA(const int q) {
     const int sh = q / half, i0 = q - sh * half, i1 = i0 + half, sidx = sh / H, h = sh - sidx * H;
     if (soff(sidx) == soff(sidx + 1)) return;
     const bool two = i1 < cs;
@@ -320,7 +533,8 @@ void fc_bwd(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T &di
   const int half = (cs + 1) / 2;
   auto Wl = m.Wl; auto Wr = m.Wr; auto tl = m.tl; auto nof = m.nof; auto flive = m.flive;
   auto soff = m.soff; auto stgt = m.stgt; auto stile = m.stile;
-  Kokkos::parallel_for("gfused:RevFC_L", Kokkos::RangePolicy<DeviceType>(0, half * nlive), KOKKOS_LAMBDA(const int q) {
+  if (!fc_bwd_on_mfma<DeviceType, NO, false>(m, cs, dout, din_l)) {
+  Kokkos::parallel_for("gfused:RevFC_L", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, half * nlive), KOKKOS_LAMBDA(const int q) {
     const int fi = q / half, i0 = q - fi * half, i1 = i0 + half, f = flive(fi);
     const bool two = i1 < cs;
     const F sc = nof(f);
@@ -343,11 +557,13 @@ void fc_bwd(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T &di
       if (two) din_l(i1, n, f) += s1;
     }
   });
+  }
   if (nsrc == 0) return;
+  if (fc_bwd_on_mfma<DeviceType, NO, true>(m, cs, dout, din_r)) return;
   if (m.hr == 1 && m.nirp == 32) { fc_bwd_rt<DeviceType, NO, 32, 1>(m, cs, dout, din_r); return; }
   if (m.hr == 1 && m.nirp == 44) { fc_bwd_rt<DeviceType, NO, 44, 1>(m, cs, dout, din_r); return; }
   if (m.hr == 2 && m.nirp == 64) { fc_bwd_rt<DeviceType, NO, 64, 2>(m, cs, dout, din_r); return; }
-  Kokkos::parallel_for("gfused:RevFC_R", Kokkos::RangePolicy<DeviceType>(0, cs * nsrc), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("gfused:RevFC_R", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nsrc), KOKKOS_LAMBDA(const int q) {
     const int sidx = q / cs, ii = q - sidx * cs;
     if (soff(sidx) == soff(sidx + 1)) return;
     F acc[NIRMAX];
@@ -381,7 +597,7 @@ void prod_fwd(const ProdMetaT<DeviceType> &m, int cs, const V3T &L, const V3T &R
   using F = float;
   const int nc = (int) out.extent(1), nout = m.nout;
   auto off = m.foff; auto ia = m.fa; auto ib = m.fb; auto cg = m.fc;
-  Kokkos::parallel_for("gfused:Prod", Kokkos::RangePolicy<DeviceType>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("gfused:Prod", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
     const int k = q / cs, ii = q - k * cs;
     for (int o = 0; o < nout; o++) {
       F s = 0.0f;
@@ -401,7 +617,7 @@ void prod_rev(const ProdMetaT<DeviceType> &m, int cs, const V3T &L, const V3T &R
   const int nlx = (int) dL.extent(2), nl = m.nl;
   {
     auto off = m.loff; auto io = m.la; auto ib = m.lb; auto cg = m.lc;
-    Kokkos::parallel_for("gfused:RevProd_L", Kokkos::RangePolicy<DeviceType>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
+    Kokkos::parallel_for("gfused:RevProd_L", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
       const int k = q / cs, ii = q - k * cs;
       for (int x = 0; x < nlx; x++) {
         F s = 0.0f;
@@ -416,7 +632,7 @@ void prod_rev(const ProdMetaT<DeviceType> &m, int cs, const V3T &L, const V3T &R
   {
     const int nr = m.nr;
     auto off = m.roff; auto io = m.ra; auto ib = m.rb; auto cg = m.rc;
-    Kokkos::parallel_for("gfused:RevProd_R", Kokkos::RangePolicy<DeviceType>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
+    Kokkos::parallel_for("gfused:RevProd_R", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
       const int k = q / cs, ii = q - k * cs;
       for (int x = 0; x < nr; x++) {
         if (off(x) == off(x + 1)) continue;

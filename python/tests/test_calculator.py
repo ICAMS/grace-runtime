@@ -4,8 +4,8 @@ MD with neighbour-list rebuilds."""
 import numpy as np
 import pytest
 
-from grace_runtime.neighbors import matscipy_usable
-from ase import units
+from grace_runtime.neighbors import NeighborList
+from ase import Atoms, units
 from ase.build import bulk, molecule
 from ase.io import read
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
@@ -67,17 +67,13 @@ def test_pbc_variants(mdl):
     slab = bulk("Al", "fcc", a=4.05, cubic=True).repeat((2, 2, 3))
     slab.center(vacuum=8.0, axis=2)              # vacuum 16 A > cutoff + skin: no z-images in range
     slab.rattle(0.03, seed=3)
-    for nb in (("matscipy", "native") if matscipy_usable() else ("native",)):
-        a, b = slab.copy(), slab.copy()
-        a.pbc, b.pbc = (True, True, False), (True, True, True)
-        a.calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1, neighbor_backend=nb)
-        b.calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1, neighbor_backend=nb)
-        if nb == "matscipy":     # same bonds in the same order
-            assert np.array_equal(a.get_forces(), b.get_forces())
-            assert a.get_potential_energy() == b.get_potential_energy()
-        else:                    # same bonds; the open direction is binned over its occupied range: another order
-            assert np.abs(a.get_forces() - b.get_forces()).max() < 1e-5
-            assert abs(a.get_potential_energy() - b.get_potential_energy()) / len(a) < 1e-7
+    a, b = slab.copy(), slab.copy()
+    a.pbc, b.pbc = (True, True, False), (True, True, True)
+    a.calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1)
+    b.calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1)
+    # same bonds; the open direction is binned over its occupied range: another order
+    assert np.abs(a.get_forces() - b.get_forces()).max() < 1e-5
+    assert abs(a.get_potential_energy() - b.get_potential_energy()) / len(a) < 1e-7
 
 
 def test_unknown_element(mdl):
@@ -96,6 +92,20 @@ def test_system_change(mdl, fixtures):
         fresh = at.copy()
         fresh.calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1)
         assert np.array_equal(f, fresh.get_forces())
+
+
+def test_failed_gpu_system_is_not_kept(mdl):
+    """A GPU System that cannot be built (an engine self-test, device memory) raises its own error on every
+    calculation; the calculator keeps no species setup without it (before: AttributeError _kk_cellkey on the next)."""
+    class FailingModule:
+        def System(self, *args, **kwargs):
+            raise RuntimeError("engine self-test failed")
+    calc = GRACERuntimeCalculator(mdl["2l"], num_threads=1, device="cpu")
+    calc._kk, calc._kk_model = FailingModule(), None
+    at = bulk("W", "bcc", a=3.165, cubic=True)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="self-test"):
+            calc.get_potential_energy(at)
 
 
 @pytest.mark.parametrize("arch", ["2l", "1l", "3l"])
@@ -146,7 +156,7 @@ def test_md_with_rebuilds(mdl, fixtures):
 
     dyn.attach(check, interval=1)
     dyn.run(300)
-    assert calc._nl.nbuild >= 3
+    assert calc._cpu.nl.nbuild >= 3
     assert worst[0] < 1e-5
 
 
@@ -169,36 +179,11 @@ def test_physical_cores_counts_distinct_cores(tmp_path):
     assert physical_cores({0, 1}, tmp_path / "missing") is None
 
 
-@pytest.mark.parametrize("arch", ["2l", "1l", "3l"])
-def test_native_neighbor_backend_matches_matscipy(mdl, fixtures, arch):
-    if not matscipy_usable():
-        pytest.skip("matscipy >= 1.3 not installed")
-    at = fixture_atoms(fixtures, "WMo54")
-    at.rattle(0.05, seed=4)
-    res = {}
-    for nb in ("matscipy", "native"):
-        a = at.copy()
-        a.calc = GRACERuntimeCalculator(mdl[arch], num_threads=2, neighbor_backend=nb)
-        res[nb] = a.get_potential_energy(), a.get_forces(), a.get_stress()
-        assert a.calc._nl.backend == nb
-    (e0, f0, s0), (e1, f1, s1) = res["matscipy"], res["native"]
-    assert abs(e0 - e1) / len(at) < 1e-6           # same bonds, other order within a row: fp32 round-off only
-    assert np.abs(f0 - f1).max() < 1e-5
-    assert np.abs(s0 - s1).max() / np.abs(s0).max() < 1e-5
-
-
 def test_unknown_neighbor_backend(mdl):
     with pytest.raises(ValueError, match="backend"):
         GRACERuntimeCalculator(mdl["2l"], neighbor_backend="ase")
-
-
-def test_default_neighbor_backend_is_native(mdl):
-    from grace_runtime.neighbors import NeighborList
-    assert NeighborList(5.0).backend == "native"
-    at = bulk("W", "bcc", a=3.165, cubic=True).repeat(2)
-    at.calc = GRACERuntimeCalculator(mdl["1l"], num_threads=1)
-    at.get_potential_energy()
-    assert at.calc._nl.backend == "native"
+    with pytest.raises(ValueError, match="removed"):
+        GRACERuntimeCalculator(mdl["2l"], neighbor_backend="matscipy")
 
 
 def test_3l_species_subset_and_unknown(mdl, fixtures):
@@ -272,3 +257,38 @@ def test_driver_cache_is_bounded(models):
     at = bulk("W", "bcc", a=3.1, cubic=True)
     at.calc = calc
     assert at.get_potential_energy() == e["W"]
+
+
+def test_skin_validation(models):
+    """a negative skin dropped bonds inside the cutoff (W pair 5.5 A apart, cutoff 6 A: zero forces); now an error.
+    Valid skins keep every bond inside the cutoff: the same energy and forces."""
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="skin"):
+            GRACERuntimeCalculator(models["1l"], skin=bad)
+        with pytest.raises(ValueError, match="skin"):
+            NeighborList(6.0, skin=bad)
+    out = []
+    for skin in (0.0, 0.5, 2.0):
+        at = Atoms("W2", positions=[(0, 0, 0), (5.5, 0, 0)], cell=[30, 30, 30], pbc=False)
+        at.calc = GRACERuntimeCalculator(models["1l"], skin=skin, num_threads=1)
+        out.append((at.get_potential_energy(), at.get_forces()))
+    assert np.abs(out[0][1]).max() > 1e-4    # the pair interacts
+    for e, f in out[1:]:
+        assert abs(e - out[0][0]) < 1e-9 and np.allclose(f, out[0][1], atol=1e-9)
+
+
+def test_strict_mode_without_a_gpu(models):
+    """GRACE_RUNTIME_STRICT=1: device="auto" without a usable GPU is an error (a native GPU or nothing); an explicit
+    device="cpu" or GRACE_RUNTIME_DEVICE=cpu still runs on the CPU."""
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k != "GRACE_RUNTIME_DEVICE"}
+    env.update(GRACE_RUNTIME_STRICT="1", CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="", ROCR_VISIBLE_DEVICES="")
+    code = "import sys\nfrom grace_runtime import GRACERuntimeCalculator\nGRACERuntimeCalculator(sys.argv[1]{})\n"
+    r = subprocess.run([sys.executable, "-c", code.format(""), models["1l"]], capture_output=True, text=True, env=env)
+    assert r.returncode != 0 and "found no usable GPU" in r.stderr, r.stderr[-2000:]
+    for extra, e in ((", device='cpu'", env), ("", dict(env, GRACE_RUNTIME_DEVICE="cpu"))):    # the explicit CPU
+        r = subprocess.run([sys.executable, "-c", code.format(extra), models["1l"]], capture_output=True, text=True,
+                           env=e)
+        assert r.returncode == 0, r.stderr[-2000:]

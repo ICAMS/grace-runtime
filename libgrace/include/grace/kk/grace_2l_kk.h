@@ -15,10 +15,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_DualView.hpp>
 #include <Kokkos_ScatterView.hpp>
-#ifdef KOKKOS_ENABLE_CUDA
-#include <cublas_v2.h>
-#include "grace/kk/cublas_guard.h"
-#endif
+#include "grace/kk/blas.h"
 
 #include <memory>
 #include <type_traits>
@@ -51,7 +48,7 @@ class Grace2LKK {
   struct TagComputeAi{};            // Layer 1 single particle basis
   struct TagComputeAi_B0{};         // Layer 2 single particle basis
   struct TagComputeYI{};            // Layer 2 equivariant indicator basis
-  struct TagComputeMLPEnergy{};
+  struct TagComputeMLPEnergyR{};    // the energy MLP, a thread per atom
   struct TagComputeDerivative_L1{}; // Layer 1 force computation
   struct TagComputeUQ_L1basis{};    // basis-RP: L1 part of z = b_inv*R, captured in Phase 1 (d_A.. current)
   struct TagComputeUQ{};            // basis-RP: add L2 part + GMM (gamma/sigma/gmm_cluster) in Phase 3 — forward only
@@ -149,6 +146,8 @@ class Grace2LKK {
   void unpack_forward(int n, int first, const typename Traits::t_double_1d &buf);
   int pack_reverse(int n, int first, const typename Traits::t_double_1d &buf);
   void unpack_reverse(int n, const typename Traits::t_int_1d &sendlist, const typename Traits::t_double_1d &buf);
+  // HIP: the four device pack / unpack kernels as 64 x 64 tiles through shared memory (coalesced on both sides)
+  void comm_rows_hip(int mode, int n);
   // host buffers (LAMMPS legacy pair comm, MPI without GPU support) on host copies of the rows: copy_rows_to_host
   // before packing, copy_rows_from_host after unpacking; forward: the I rows, reverse: the dE/dI rows
   void copy_rows_to_host(bool reverse);
@@ -190,7 +189,7 @@ class Grace2LKK {
   void operator() (TagComputeYI, const typename Kokkos::TeamPolicy<DeviceType, TagComputeYI>::member_type& team) const;
 
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagComputeMLPEnergy, const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPEnergy>::member_type& team) const;
+  void operator() (TagComputeMLPEnergyR, const int ii) const;
 
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeDerivative_L1, const typename Kokkos::TeamPolicy<DeviceType, TagComputeDerivative_L1>::member_type& team) const;
@@ -251,6 +250,9 @@ class Grace2LKK {
   bool setup_done = false;    // setup() after the last set_model(): run() refuses otherwise
   void set_type_map(const std::vector<int> &type2mu);    // h_type2model, d_map, cutsq
   virtual void retype() {}    // type-dependent parts of the derived engines (after set_type_map)
+  // run(): x, the neighbour list, ilist (type-sorted) and maxneigh are set, before the chunk decision and the first
+  // stage (the fused engines build their run-wide bond list and buffers here, so the chunk decision sees them)
+  virtual void begin_run() {}
   // chunksize auto: bytes per atom kept for all atoms when there is more than one chunk (after grow)
   virtual double kept_bytes_per_atom() const { return 0.0; }
   virtual void use_kept(bool) {}    // chunksize auto decided with (true) or without (false) the kept state
@@ -304,10 +306,13 @@ class Grace2LKK {
   TypeTables type_tables() const { return {h_type2model, d_map, k_cutsq, save_derived_types()}; }
   // the per-atom buffers (chunk work buffers, the per-image rows, kept state) shrunk to one atom; weights and type
   // tables stay, the next run() grows the buffers again (callers between independent jobs: free the device memory)
-  void release_buffers()
+  virtual void release_buffers()
   {
     if (!setup_done) return;
     use_kept(false);
+    // the caller's views of the last run() (positions, forces, neighbour list, outputs) and the per-atom type order
+    MemKK::drop(x, f, type, d_numneigh, d_neighbors, d_ilist, d_mask, d_eatom, d_vatom, d_cvatom, d_ilist_sorted,
+                d_type_key);
     v_buf = decltype(v_buf)();    // the caller's exchange buffer, kept by the last pack / unpack
     realloc_all = true;
     grow(1, 1);
@@ -566,12 +571,10 @@ class Grace2LKK {
   // Active only for the CUDA device instantiation with NNScalar=float (fp32 &
   // Mixed styles). The fp64 device style and all host/non-CUDA backends keep the
   // hand kernels (handle stays null -> compute_mlp_radial() takes the fallback).
-  cublasHandle_t cublas_handle = nullptr;
-  bool fc_fused = false;    // a derived engine does the FC layers itself (no cuBLAS needed)
-  bool fc_ops_on() const { return cublas_handle != nullptr || fc_fused; }
-  // owner of cublas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
+  blas::handle_t blas_handle = nullptr;
+  // owner of blas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
   // copy it too): the last copy destroys the handle
-  std::shared_ptr<std::remove_pointer_t<cublasHandle_t>> cublas_owner;
+  std::shared_ptr<std::remove_pointer_t<blas::handle_t>> blas_owner;
   typedef Kokkos::View<NNScalar**, Kokkos::LayoutRight, DeviceType> t_nn_2d_r; // row-major [M x dim]
   // Per-(which,layer) weights repacked TIGHTLY row-major [n_in x n_out] at load
   // time (the native padded d_mlp_rad_R{,1}_W is LayoutLeft -> a fixed layer's
@@ -790,6 +793,9 @@ class Grace2LKK {
   virtual void stage_rev_reduce_I1();
   virtual void stage_zero_L1_adj();
   virtual void stage_reduce_rho();
+  // the L1 recompute's rho, summed in the order of the forward rho (a derived engine whose stage_reduce_rho() does not
+  // compute rho, as the fused one, overrides this as well)
+  virtual void stage_recompute_rho() { stage_reduce_rho(); }
   virtual void stage_rev_reduce_rho();
   virtual void stage_zero_L2_adj();
   // per-bond buffers (radial basis, R_nl, Y_bond, cuBLAS MLP scratch, YI_pair) used only by the bond stages
@@ -808,11 +814,35 @@ class Grace2LKK {
   virtual void stage_rev_prod_BB();
   virtual void stage_rev_prod_BBB();
   virtual void stage_rev_prod_BBBB();
+  // Every backend: a derived engine may run a forward FC layer with its own kernels (no BLAS) and return true (the
+  // fused engine on CUDA and HIP); false keeps cuBLAS (CUDA, float) or the hand kernel.
+  enum class FCLayer { A1, AA1, AA2, B1, BB1, BB2 };
+  virtual bool fc_forward_own(FCLayer, const t_nn_3d &, const t_nn_3d &, const t_nn_3d &) { return false; }
+  // the cuBLAS FC and B-reduction ops (CUDA, float): built in setup, with their scratch, only for an engine that may
+  // call them; the fused engine runs every FC layer and its reductions on its own kernels
+  virtual bool uses_cublas_ops() const { return true; }
+  // forward FC layer `which`: the engine's own kernels (fc_forward_own), else cuBLAS (CUDA, float); false: the
+  // caller runs the hand kernel
+  bool fc_forward_fast(FCLayer which, const t_nn_3d &in_left, const t_nn_3d &in_right, const t_nn_3d &out)
+  {
+    if (fc_forward_own(which, in_left, in_right, out)) return true;
+#ifdef KOKKOS_ENABLE_CUDA
+    if constexpr (sizeof(NNScalar) == 4) {
+      FCCublasOp *const ops[] = {&fc_op_A1, &fc_op_AA1, &fc_op_AA2, &fc_op_B1, &fc_op_BB1, &fc_op_BB2};
+      FCCublasOp &op = *ops[(int) which];
+      if (blas_handle && op.active) {
+        fc_forward_cublas(op, in_left, in_right, out);
+        return true;
+      }
+    }
+#endif
+    return false;
+  }
 #ifdef KOKKOS_ENABLE_CUDA
   // Opt-2L-17: run one forward FC (left assign + right accumulate) via gather ->
   // per-tile true-fp32 SGEMM -> scatter, into out (float only). Public for the
   // same reason as compute_Y_bond_chunk (contains extended device lambdas).
-  virtual void fc_forward_cublas(FCCublasOp &op, const t_nn_3d &in_left,
+  void fc_forward_cublas(FCCublasOp &op, const t_nn_3d &in_left,
       const t_nn_3d &in_right, const t_nn_3d &out);
   // Opt-2L-19: run one element-independent ReduceN source (X -> Bout) via gather ->
   // per-tile true-fp32 SGEMM -> scatter-accumulate (float only). zero_first zeroes

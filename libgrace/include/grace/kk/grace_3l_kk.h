@@ -13,6 +13,7 @@
 #include "grace/type_map.h"
 #include "grace/system.h"    // spline_n_3l
 #include "grace/kk/support.h"
+#include "grace/kk/kk_mfma.h"    // wave_sync, the MFMA primitives of the SPBF kernels
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_DualView.hpp>
@@ -23,24 +24,47 @@
 #include <type_traits>
 #include <vector>
 
-// Opt 15: cuBLAS true-fp32 SGEMM for the radial MLP (CUDA backend only).
-#ifdef KOKKOS_ENABLE_CUDA
-#include <cublas_v2.h>
-#include "grace/kk/cublas_guard.h"
-#endif
+// the GEMM paths (Opt 15 radial MLP: CUDA only; Opt 16 / 17 / 18 and the FC GEMM: CUDA and HIP); defines GRACE_KK_GEMM
+#include "grace/kk/blas.h"
 
 namespace grace {
 namespace kk {
 
 struct alignas(16) G3F4 { float x, y, z, w; };
 struct alignas(8) G3I2 { int i; float v; };   // packed (index, value) of the CG tables
+// a radial table row c (cubic in t within the interval): the value, and its derivative in t
+KOKKOS_INLINE_FUNCTION float g3l_cubic(const G3F4 &c, float t) { return c.x + t * (c.y + t * (c.z + t * c.w)); }
+KOKKOS_INLINE_FUNCTION float g3l_cubic_dt(const G3F4 &c, float t) { return c.y + t * (2.0f * c.z + 3.0f * t * c.w); }
+// A layer's cubic radial tables (d_splR, Grace3LKK::spl_tab): per species pair p = sp_i n_sp + sp_j and interval k one
+// row of ld outputs o = n (lmax + 1) + l, each the G3F4 of the cubic in t
+struct G3LTab {
+  const float *c;
+  int N, NT, off, ld;
+  // the row of pair p at s = (r / rcut) N as the index of its first G3F4, t in the interval (r = rcut: the last
+  // interval, t = 1)
+  KOKKOS_FORCEINLINE_FUNCTION long row_s(long p, float s, float &t) const
+  {
+    int k = (int) s;
+    if (k > N - 1) k = N - 1;
+    t = s - k;
+    return (p * NT + off + k) * ld;
+  }
+  // the same from distance r and cutoff rc (s = r / rc N in float), and ds/dr = N / rc
+  KOKKOS_FORCEINLINE_FUNCTION long row(long p, float r, float rc, float &t) const { return row_s(p, r / rc * N, t); }
+  KOKKOS_INLINE_FUNCTION float dsdr(float rc) const { return (float) N / rc; }
+};
 
-// Warp primitives of the CUDA fast paths (32-lane warps). Those paths are selected on Kokkos::Cuda only; reached
-// anywhere else (HIP / SYCL device code, a host execution space) they abort instead of returning partial results.
+// Warp primitives of the GPU fast paths (32-lane warps). Those paths are selected on Kokkos::Cuda and Kokkos::HIP
+// only; reached anywhere else (SYCL device code, a host execution space) they abort instead of returning partial
+// results. HIP: the kernels' 32-lane "warp" is half of a 64-lane wavefront (CDNA: gfx90a, gfx942) or one 32-lane
+// wavefront (RDNA: gfx11, gfx12); shuffles with width 32 stay inside it either way, and the warp barrier is a
+// wavefront-scope fence (all lanes of a wavefront execute together).
 KOKKOS_INLINE_FUNCTION int g3l_shfl(int v, int src)
 {
 #if defined(__CUDA_ARCH__)
   return __shfl_sync(0xffffffffu, v, src);
+#elif defined(__HIP_DEVICE_COMPILE__)
+  return __shfl(v, src, 32);
 #else
   (void) src;
   Kokkos::abort("GRACE-3L/KK: CUDA warp primitive outside a CUDA device kernel");
@@ -52,6 +76,8 @@ KOKKOS_INLINE_FUNCTION float g3l_shfl_xor(float v, int mask)
 {
 #if defined(__CUDA_ARCH__)
   return __shfl_xor_sync(0xffffffffu, v, mask);
+#elif defined(__HIP_DEVICE_COMPILE__)
+  return __shfl_xor(v, mask, 32);
 #else
   (void) mask;
   Kokkos::abort("GRACE-3L/KK: CUDA warp primitive outside a CUDA device kernel");
@@ -63,6 +89,8 @@ KOKKOS_INLINE_FUNCTION double g3l_shfl_xor(double v, int mask)
 {
 #if defined(__CUDA_ARCH__)
   return __shfl_xor_sync(0xffffffffu, v, mask);
+#elif defined(__HIP_DEVICE_COMPILE__)
+  return __shfl_xor(v, mask, 32);
 #else
   (void) mask;
   Kokkos::abort("GRACE-3L/KK: CUDA warp primitive outside a CUDA device kernel");
@@ -74,6 +102,8 @@ KOKKOS_INLINE_FUNCTION void g3l_syncwarp()
 {
 #if defined(__CUDA_ARCH__)
   __syncwarp();
+#elif defined(__HIP_DEVICE_COMPILE__)
+  wave_sync();
 #else
   Kokkos::abort("GRACE-3L/KK: CUDA warp primitive outside a CUDA device kernel");
 #endif
@@ -219,7 +249,7 @@ class Grace3LKK {
   TypeTables type_tables() const;
   // the per-atom buffers (chunk work buffers, the per-image rows, kept state) shrunk to one atom; weights and type
   // tables stay, the next run() grows the buffers again (callers between independent jobs: free the device memory)
-  void release_buffers();
+  virtual void release_buffers();
   void use_type_tables(const TypeTables &t);
   double cutoff(int mu_i, int mu_j) const;    // pair cutoff of model elements
   // Exchange of the message rows between the atoms and their ghost images (LAMMPS: comm->forward_comm /
@@ -656,13 +686,13 @@ class Grace3LKK {
   int force_n_lm_ind = 0;       // indicator lm width for the current layer
   t_nn_3d force_A_adj;          // d_A2_adj or d_A3_adj (the basis adjoint being backpropped)
 
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   // ---- Opt 15: cuBLAS true-fp32 radial-MLP scratch + launch state ----
-  cublasHandle_t cublas_handle = nullptr;
-  // owner of cublas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
+  blas::handle_t blas_handle = nullptr;
+  // owner of blas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
   // copy it too): the last copy destroys the handle. No handle (Python wheels without cuBLAS, GRACE_RUNTIME_NO_CUBLAS):
   // the hand-written kernels.
-  std::shared_ptr<std::remove_pointer_t<cublasHandle_t>> cublas_owner;
+  std::shared_ptr<std::remove_pointer_t<blas::handle_t>> blas_owner;
   typedef Kokkos::View<NNScalar**, Kokkos::LayoutRight, DeviceType> t_nn_2d_r; // row-major [M x dim]
   // Per-(spbf,layer) weights repacked TIGHTLY row-major [n_in x n_out] at load
   // time. The native mlp_W view is LayoutLeft (column-major) + padded, so a fixed
@@ -813,7 +843,7 @@ class Grace3LKK {
     // stream 8 B/entry (packed+cg) instead of 16 B. Bounds checked at load.
     t_int_1d cg_packed;                 // [n_cg]
     t_nn_1d cg;                         // [n_cg]
-    t_int_1d out_l, out_parity;         // [nfunc]
+    t_int_1d out_l;                     // [nfunc]
     // Opt 16: cuBLAS CPLBwdProject scratch. Per-lm-slab (w) group-gathered +
     // transposed U/V, tightly packed so each w-slab is a col-major [rank x n]
     // matrix (ldb=rank, w-stride = n*rank) for cublasSgemmStridedBatched.
@@ -856,6 +886,10 @@ class Grace3LKK {
   long cpl_stamp[GRACE3L_MAX_PRODS] = {0};
   long cpl_gen = 0;
   int cpl_ld = 0;
+  // atoms per rank row the cp_l path kernels map threads over: the chunk rounded up to 64 within the row stride cpl_ld,
+  // so that on a 64-row-aligned stride (HIP, grow()) every wavefront reads 64 consecutive, aligned floats; the chunk
+  // where the stride is the chunk
+  int cpl_row_width() const { return std::min(cpl_ld, (chunk_size + 63) / 64 * 64); }
   int cpl_scratch_rank = 0, cpl_scratch_nlm = 0;
   void cpl_bind(const DeviceCPL &p);
   long cpl_stamp_now() const { return cpl_gen * 1048576L + chunk_offset + 1; }
@@ -1135,7 +1169,7 @@ class Grace3LKK {
   // d_R1_nl. Dispatches to cuBLAS SGEMM (CUDA) or the hand kernel (fallback).
   // Replaces the inline TagComputeMLPRadial launches in l{1,2}_forward_chunk.
   void compute_mlp_radial();
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   // Opt 15 helper: C[M x n_out] = alpha * In[M x n_in] * Wg (true-fp32 SGEMM,
   // CUBLAS_PEDANTIC_MATH). Row-major operands; ld* are the physical row strides
   // (allocated widths): ldW=n_out for the tight Wg, ldIn=In's alloc width,
@@ -1218,6 +1252,7 @@ class Grace3LKK {
                    const t_int_1d &ex, const t_nn_1d &mk, const t_nn_3d &X, const t_nn_3d &Y, const t_nn_3d &G,
                    const t_nn_3d &DX, bool bwd);
   void force_L1_fast();
+  template<int W> void force_L1_fast_t();
   // Radial MLP as cubic-Hermite tables in x = r / rcut_ij, one block per ordered species pair of the run
   // (the MLP input holds both embeddings, so R depends on (mu_i, mu_j)). Built at setup() when the tables fit
   // spline_mb (MB; < 0: auto, a quarter of the device memory per rank within what is free, at least 2048); otherwise
@@ -1228,26 +1263,27 @@ class Grace3LKK {
   int spline_on = 0, n_sp = 0, spl_ld = 0;
   Kokkos::View<int *, DeviceType> d_sp_of_mu;   // model species -> species index of this run (-1: absent)
   Kokkos::View<float *, DeviceType> d_splR;     // [((p * spl_Ntot + spl_off[si] + k) * spl_ld + o][4], p = sp_i n_sp + sp_j
+  G3LTab spl_tab(int si) const { return G3LTab{d_splR.data(), spl_N[si], spl_Ntot, spl_off[si], spl_ld}; }
   void build_radial_splines();
   Kokkos::View<NNScalar *, DeviceType> d_Bg[GRACE3L_MAX_REDUCES];   // grouped reduce weights
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   bool compute_reduceN_grouped(int idx, const t_nn_3d &in, const t_nn_3d &out, bool bwd, bool assign = false);
   void compute_reduceN_grouped_rm(int idx, const t_nn_3d &out, bool bwd);
 #endif
   // Multi-chunk: the L1 / L2 forward tensors the backward reads (product inputs, norm inputs / outputs) kept per
   // chunk, so the backward recomputes only the geometry. store_fwd: -1 auto (if it fits in 70 % of free memory),
   // 0 off, 1 on.
-  // FC folded into the cp_l projection it feeds (cuBLAS fp32 path): A*_2a = fc(A*_2_red, R) only enters
+  // FC folded into the cp_l projection it feeds (GPU BLAS fp32 path): A*_2a = fc(A*_2_red, R) only enters
   // A*_3 = cp_l(A*_2a, R) and A*_2b only A*_4 = cp_l(A*_2b, A*_2b), and fc is linear,
   //   proj(A*_2a) = A*_2_red UL^T + R UR^T,  UL[w] = nof[w] P[w],  UR[w] = Bw[w] P[w]   (P[w] = norm_u U[w];
   //   Bw[w] = norm_right nof[w] w_right[tile(w)])
   // (both projection sides of the self-product A*_4 in one [U | V] block). A*_2a / A*_2b and their adjoints are
-  // never formed; the store keeps A*_2_red instead. fc_fold: 0 off (default), 1 on (GRACE3L_FC_FOLD=1 too); cuBLAS
-  // fp32 path only (otherwise off, with a log line).
+  // never formed; the store keeps A*_2_red instead. fc_fold: 0 off (default), 1 on (GRACE3L_FC_FOLD=1 too); GPU BLAS
+  // fp32 path only (cuBLAS / rocBLAS / own GEMM; otherwise off, with a log line).
   int fc_fold = 0, fold_on[3] = {0, 0, 0};
   // fuse_radial: the radial evaluated from the cubic tables inside the kernels that use it (ComputeA1, ForceL1F, the
   // fast SPBF forward / backward of layers 2 and 3): no d_R1_nl / d_DR1_nl round trip and no table kernel where those
-  // kernels run; only with the tables (spline_on) and the CUDA fp32 fast kernels
+  // kernels run; only with the tables (spline_on) and the CUDA / HIP fp32 fast kernels
   int fuse_radial = 0;
   bool l1_radial_fused() const;
   void compute_A1_tables();
@@ -1276,6 +1312,17 @@ class Grace3LKK {
   void reduceN_blocked(const DeviceReduce &r, const t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR], const t_nn_3d &out);
   void reduceN_bwd_blocked(const DeviceReduce &r, int ins, const t_nn_3d &adj_out, const t_nn_3d &adj_in);
   Kokkos::View<float **, Kokkos::LayoutRight, DeviceType> d_spbf_T;   // [chunk][f * NR + n] row-major A / dE/dA
+  // MFMA SPBF backward: (Y, dYx, dYy, dYz) of every (bond, y) as one record [chunk][maxneigh][(lmax + 1)^2 * 4]
+  Kokkos::View<GeomScalar ***, Kokkos::LayoutRight, DeviceType> d_spbf_ydy;
+  // MFMA SPBF: the CG table as sliced ELL, rows (backward M build) and columns (forward), built on first use: slices of
+  // 64 rows / columns of similar length (sorted by length), entries [slice offset + e * 64 + lane] as (index, fp32 bits)
+  struct SpbfSell {
+    t_int_1d perm, len, ent;        // [slots] row / column (-1: none), [slots] length, entries [n][2]
+    std::vector<int> slc;           // [slices][2] (offset, width), passed to the kernels by value
+    const void *src = nullptr;      // cg_row_ptr / cg_col_ptr the table was built from
+  };
+  SpbfSell d_spbf_rsell[GRACE3L_N_SPBF], d_spbf_csell[GRACE3L_N_SPBF];
+  void spbf_mfma_tables(int idx);
   // rm: A stays in d_spbf_T (forward) / dE/dA is already there (backward); out / A_adj unused
   void spbf_fwd_fast(int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out, bool rm = false);
   template<int TR> void spbf_fwd_fast_t(int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out, bool rm);
@@ -1285,6 +1332,12 @@ class Grace3LKK {
                                        const t_nn_3d_rg &target, bool rm);
   template<int H, int MB> void spbf_bwd_fast2_t(int idx, const t_nn_3d &A_adj, const t_nn_3d_rg &indicator,
                                                const t_nn_3d_rg &target, bool rm);
+  // CDNA matrix-core variants of the two above (grace_3l_kk_spbf_mfma.h; default on gfx90a, opt-in on gfx94x,
+  // environment GRACE3L_SPBF_MFMA=0 / 1)
+  bool spbf_use_mfma(int idx) const;
+  template<int NLI> void spbf_fwd_mfma_t(int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out, bool rm);
+  template<int NLI> void spbf_bwd_mfma_t(int idx, const t_nn_3d &A_adj, const t_nn_3d_rg &indicator,
+                                         const t_nn_3d_rg &target, bool rm);
  protected:
 
 

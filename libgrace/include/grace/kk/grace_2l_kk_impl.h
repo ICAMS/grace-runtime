@@ -123,30 +123,30 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   // the fp64 UQ DGEMM projection (UQ arrays are double, so the fp64 style uses
   // cuBLAS for UQ even though its MLP path stays hand-written).
   if constexpr (is_cuda_v<DeviceType>) {
-    if ((sizeof(NNScalar) == 4 || has_uq) && !cublas_handle && ::grace::kk::detail::cublas_ok()) {
-      if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS) {
+    if ((sizeof(NNScalar) == 4 || has_uq) && !blas_handle && blas::available()) {
+      if (blas::create(&blas_handle) != blas::SUCCESS) {
 #ifdef GRACE_KK_CUBLAS_DLOPEN
-        cublas_handle = nullptr;    // optional cuBLAS (e.g. no device memory left): the hand-written kernels
+        blas_handle = nullptr;    // optional cuBLAS (e.g. no device memory left): the hand-written kernels
 #else
         GRACE_KK_ERROR("GRACE-2L/KK: cublasCreate failed");
 #endif
       }
-      if (cublas_handle) {
-        cublas_owner.reset(cublas_handle, [](cublasHandle_t h) { cublasDestroy(h); });
-        cublasSetStream(cublas_handle, DeviceType().cuda_stream());
-        cublasSetMathMode(cublas_handle, CUBLAS_PEDANTIC_MATH);  // no tf32 (fp32 & fp64)
+      if (blas_handle) {
+        blas_owner.reset(blas_handle, [](blas::handle_t h) { blas::destroy(h); });
+        blas::set_stream(blas_handle, DeviceType());
+        blas::set_pedantic_math(blas_handle);  // no tf32 (fp32 & fp64)
         if constexpr (sizeof(NNScalar) == 4)
           mlp_cublas_selftest();   // tiny-case transpose/leading-dim gate (aborts on mismatch)
       }
     }
   }
   {
-    if (cublas_handle && sizeof(NNScalar) == 4)
+    if (blas_handle && sizeof(NNScalar) == 4)
       log.info(fmt("[GRACE-2L/KK] radial MLP: true-fp32 cuBLAS SGEMM enabled (CUDA)\n"));
     else
       log.info(fmt("[GRACE-2L/KK] radial MLP: hand-written Kokkos kernels "
                      "(cuBLAS is CUDA+fp32/Mixed only; fp64 & non-CUDA use the fallback)\n"));
-    if (cublas_handle && has_uq)
+    if (blas_handle && has_uq)
       log.info(fmt("[GRACE-2L/KK] UQ projection: fp64 cuBLAS DGEMM enabled (CUDA)\n"));
   }
 #else
@@ -157,6 +157,7 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   log.info(fmt("[GRACE-2L/KK] Initialization complete. comm_forward={}, L1_fc_n_out={}, L2_fc_n_out={}\n",
                    comm_width(), L1_fc_n_out, L2_fc_n_out));
   setup_done = true;
+  check_kernel_launches<DeviceType>("GRACE-2L/KK");
 }
 
 // ======================================================================
@@ -680,16 +681,18 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
 #ifdef KOKKOS_ENABLE_CUDA
   // Opt-2L-17: build cuBLAS block-sparse FC metadata (CUDA device + float only).
   if constexpr (is_cuda_v<DeviceType> && sizeof(NNScalar) == 4) {
-    build_fc_cublas_op(fc_op_A1,  m.fc_A1);
-    build_fc_cublas_op(fc_op_AA1, m.fc_AA1);
-    build_fc_cublas_op(fc_op_AA2, m.fc_AA2);
-    build_fc_cublas_op(fc_op_B1,  m.fc_B1);
-    build_fc_cublas_op(fc_op_BB1, m.fc_BB1);
-    build_fc_cublas_op(fc_op_BB2, m.fc_BB2);
-    // Opt-2L-19: element-independent B ReduceN (must run before grow() so the
-    // shared FC/reduce scratch is sized for N = max #connections, e.g. 190 > FC).
-    build_reduce_cublas_op(reduce_op_B_YI, m.B_reduce_YI, m.B_n_out);
-    build_reduce_cublas_op(reduce_op_B_B0, m.B_reduce_B0, m.B_n_out);
+    if (uses_cublas_ops()) {
+      build_fc_cublas_op(fc_op_A1,  m.fc_A1);
+      build_fc_cublas_op(fc_op_AA1, m.fc_AA1);
+      build_fc_cublas_op(fc_op_AA2, m.fc_AA2);
+      build_fc_cublas_op(fc_op_B1,  m.fc_B1);
+      build_fc_cublas_op(fc_op_BB1, m.fc_BB1);
+      build_fc_cublas_op(fc_op_BB2, m.fc_BB2);
+      // Opt-2L-19: element-independent B ReduceN (must run before grow() so the
+      // shared FC/reduce scratch is sized for N = max #connections, e.g. 190 > FC).
+      build_reduce_cublas_op(reduce_op_B_YI, m.B_reduce_YI, m.B_n_out);
+      build_reduce_cublas_op(reduce_op_B_B0, m.B_reduce_B0, m.B_n_out);
+    }
   }
 #endif
 
@@ -914,8 +917,8 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow_global(int nall
     grace::kk::MemKK::realloc_kokkos(d_I_nl_LN_global, "g2l:I_nl_LN_global", nall, rho_n_out);
     grace::kk::MemKK::realloc_kokkos(d_grad_I_global, "g2l:grad_I_global", nall, I_n_funcs, I_n_out);
     grace::kk::MemKK::realloc_kokkos(d_I_nl_LN_adj_global, "g2l:I_nl_LN_adj_global", nall, rho_n_out);
-    h_I_global = Kokkos::create_mirror_view(d_I_global);
-    h_grad_I_global = Kokkos::create_mirror_view(d_grad_I_global);
+    h_I_global = Kokkos::create_mirror_view(d_I_global.base());
+    h_grad_I_global = Kokkos::create_mirror_view(d_grad_I_global.base());
   }
 }
 
@@ -1102,6 +1105,9 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         KOKKOS_LAMBDA(const int ii, int &mx) { const int c = nn[il[ii]]; if (mx < c) mx = c; },
         Kokkos::Max<int>(maxneigh));
   }
+  maxneigh = std::max(maxneigh, 0);    // Kokkos::Max over no atoms (an empty rank) gives INT_MIN
+  nall = in.nall;
+  begin_run();
   choose_chunk();
   const int chunk_limit = chunk_cap();
 
@@ -1110,7 +1116,6 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
   grow(chunk_size, maxneigh);
 
   // Allocate global arrays (nlocal + nghost)
-  nall = in.nall;
   grow_global(nall);
   realloc_all = false;
 
@@ -1138,10 +1143,10 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
   // ============ PHASE 1: Layer 1 forward (chunked) ============
   // Process all chunks to compute I and I_nl_LN, stored in global arrays
 
-  Kokkos::deep_copy(d_I_global, 0.0);
+  Kokkos::deep_copy(d_I_global.base(), 0.0);
   Kokkos::deep_copy(d_I_nl_LN_global, 0.0);
   if (!do_energy_only) {
-    Kokkos::deep_copy(d_grad_I_global, 0.0);
+    Kokkos::deep_copy(d_grad_I_global.base(), 0.0);
     Kokkos::deep_copy(d_I_nl_LN_adj_global, 0.0);
   }
 
@@ -1176,12 +1181,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int n_out = L1_fc_n_out, n_lm = n_funcs_A1;
       int n_collect = d_fc_A1_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_A1.active) { fc_forward_cublas(fc_op_A1, d_A, d_A, d_A1); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::A1, d_A, d_A, d_A1))
       Kokkos::parallel_for("FC_A1",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, n_out}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1213,12 +1213,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int no = L1_fc_n_out, nlm = n_funcs_AA;
       int ncol = d_fc_AA1_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_AA1.active) { fc_forward_cublas(fc_op_AA1, d_AA, d_A, d_AA1); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::AA1, d_AA, d_A, d_AA1))
       Kokkos::parallel_for("FC_AA1",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1251,12 +1246,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int no = L1_fc_n_out, nlm = n_funcs_AA;
       int ncol = d_fc_AA2_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_AA2.active) { fc_forward_cublas(fc_op_AA2, d_AA, d_A, d_AA2); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::AA2, d_AA, d_A, d_AA2))
       Kokkos::parallel_for("FC_AA2",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1350,7 +1340,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
     // chunk, so the projection MUST happen here, not in the Phase-3 UQ kernel). ----
     if (any_uq) {
 #ifdef KOKKOS_ENABLE_CUDA
-      if (cublas_handle) {
+      if (blas_handle) {
         compute_uq_cublas_L1();   // gather rho block -> DGEMM -> raw L1 proj into d_uq_z
       } else
 #endif
@@ -1407,12 +1397,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int no = L2_fc_n_out, nlm = n_funcs_B1;
       int ncol = d_fc_B1_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_B1.active) { fc_forward_cublas(fc_op_B1, d_B, d_B, d_B1); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::B1, d_B, d_B, d_B1))
       Kokkos::parallel_for("FC_B1",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1446,12 +1431,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int no = L2_fc_n_out, nlm = n_funcs_BB;
       int ncol = d_fc_BB1_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_BB1.active) { fc_forward_cublas(fc_op_BB1, d_BB, d_B, d_BB1); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::BB1, d_BB, d_B, d_BB1))
       Kokkos::parallel_for("FC_BB1",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1483,12 +1463,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int no = L2_fc_n_out, nlm = n_funcs_BB;
       int ncol = d_fc_BB2_cf.extent(0), cs = chunk_size;
 
-      bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-      if constexpr (sizeof(NNScalar) == 4)
-        if (fc_ops_on() && fc_op_BB2.active) { fc_forward_cublas(fc_op_BB2, d_BB, d_B, d_BB2); fc_done = true; }
-#endif
-      if (!fc_done)
+      if (!fc_forward_fast(FCLayer::BB2, d_BB, d_B, d_BB2))
       Kokkos::parallel_for("FC_BB2",
         Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
         KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1534,8 +1509,9 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
 
     // ---- L2 Stage 13: ComputeMLPEnergy ----
     {
-      auto policy = Kokkos::TeamPolicy<DeviceType, TagComputeMLPEnergy>(chunk_size, 1, 1);
-      Kokkos::parallel_for("ComputeMLPEnergy", policy, *this);
+      // a thread per atom (one-thread teams ran one active lane per wavefront / warp: 2L-medium MI250X 31k atoms
+      // 4.2 ms per call)
+      Kokkos::parallel_for("ComputeMLPEnergy", Kokkos::RangePolicy<DeviceType, TagComputeMLPEnergyR>(0, chunk_size), *this);
     }
 
     // Accumulate energy
@@ -1565,7 +1541,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
     // search over the feature dim, and the D×D Mahalanobis over its quadratic form.
     if (any_uq) {
 #ifdef KOKKOS_ENABLE_CUDA
-      if (cublas_handle) {
+      if (blas_handle) {
         compute_uq_cublas_L2();   // gather I2 block -> DGEMM -> add L1 carry, normalize, GMM
       } else
 #endif
@@ -1760,7 +1736,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       // --- Recompute L1 forward intermediates ---
       // Multi-chunk: L1 data was overwritten by later chunks + L2_ComputeNeigh.
       // d_A zeroed inline inside Recompute_ComputeAi kernel
-      // d_rho zeroed inside Recompute_FusedReduceN_rho kernel (uses = not +=)
+      // d_rho assigned by stage_recompute_rho (= not +=)
 
       stage_L1_bond_recompute();
       // Recompute: FC A1
@@ -1772,12 +1748,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         NNScalar nl = fc_A1_nl, nr = fc_A1_nr;
         int n_out = L1_fc_n_out, n_lm = n_funcs_A1;
         int n_collect = d_fc_A1_cf.extent(0), cs = chunk_size;
-        bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-        if constexpr (sizeof(NNScalar) == 4)
-          if (fc_ops_on() && fc_op_A1.active) { fc_forward_cublas(fc_op_A1, d_A, d_A, d_A1); fc_done = true; }
-#endif
-        if (!fc_done)
+        if (!fc_forward_fast(FCLayer::A1, d_A, d_A, d_A1))
         Kokkos::parallel_for("Recompute_FC_A1",
           Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, n_out}),
           KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1806,12 +1777,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         NNScalar nl = fc_AA1_nl, nr = fc_AA1_nr;
         int no = L1_fc_n_out, nlm = n_funcs_AA;
         int ncol = d_fc_AA1_cf.extent(0), cs = chunk_size;
-        bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-        if constexpr (sizeof(NNScalar) == 4)
-          if (fc_ops_on() && fc_op_AA1.active) { fc_forward_cublas(fc_op_AA1, d_AA, d_A, d_AA1); fc_done = true; }
-#endif
-        if (!fc_done)
+        if (!fc_forward_fast(FCLayer::AA1, d_AA, d_A, d_AA1))
         Kokkos::parallel_for("Recompute_FC_AA1",
           Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
           KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1841,12 +1807,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         NNScalar nl = fc_AA2_nl, nr = fc_AA2_nr;
         int no = L1_fc_n_out, nlm = n_funcs_AA;
         int ncol = d_fc_AA2_cf.extent(0), cs = chunk_size;
-        bool fc_done = false;
-#ifdef KOKKOS_ENABLE_CUDA
-        if constexpr (sizeof(NNScalar) == 4)
-          if (fc_ops_on() && fc_op_AA2.active) { fc_forward_cublas(fc_op_AA2, d_AA, d_A, d_AA2); fc_done = true; }
-#endif
-        if (!fc_done)
+        if (!fc_forward_fast(FCLayer::AA2, d_AA, d_A, d_AA2))
         Kokkos::parallel_for("Recompute_FC_AA2",
           Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, no}),
           KOKKOS_LAMBDA(const int ii, const int k) {
@@ -1867,48 +1828,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           });
       }
       stage_prod_AAAA();
-      // Recompute: ReduceN rho (for RMSNorm backward — need rho to recompute rms_inv)
-      // First kernel uses = (not +=) to zero d_rho inline, eliminating deep_copy.
-      {
-        auto rho_out = d_rho;
-        auto il = d_ilist; auto mp = d_map; auto tp = type;
-        int co = chunk_offset, cs = chunk_size, n_rho = rho_n_out;
-        // Fused Recompute_ReduceN_rho: merge 4 separate kernel launches into 1
-        {
-          auto W_A = d_rho_reduce_A_W; auto ci_A = d_rho_ci_A; auto wlt_A = d_rho_wlt_A;
-          NNScalar norm_A = rho_reduce_A_norm; int nc_A = (int)ci_A.extent(0); auto X_A = d_A;
-          auto W_AA = d_rho_reduce_AA_W; auto ci_AA = d_rho_ci_AA; auto wlt_AA = d_rho_wlt_AA;
-          NNScalar norm_AA = rho_reduce_AA_norm; int nc_AA = (int)ci_AA.extent(0); auto X_AA = d_AA;
-          auto W_AAA = d_rho_reduce_AAA_W; auto ci_AAA = d_rho_ci_AAA; auto wlt_AAA = d_rho_wlt_AAA;
-          NNScalar norm_AAA = rho_reduce_AAA_norm; int nc_AAA = (int)ci_AAA.extent(0); auto X_AAA = d_AAA;
-          auto W_AAAA = d_rho_reduce_AAAA_W; auto ci_AAAA = d_rho_ci_AAAA; auto wlt_AAAA = d_rho_wlt_AAAA;
-          NNScalar norm_AAAA = rho_reduce_AAAA_norm; int nc_AAAA = (int)ci_AAAA.extent(0); auto X_AAAA = d_AAAA;
-
-          Kokkos::parallel_for("Recompute_FusedReduceN_rho",
-            Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>({0,0}, {cs, n_rho}),
-            KOKKOS_LAMBDA(const int ii, const int k) {
-              const int mu_i = mp(tp(il[ii + co]));
-              NNScalar val = NNScalar(0.0);
-              { NNScalar s = NNScalar(0.0);
-                for (int c = 0; c < nc_A; c++) { const int fi = ci_A(c), tile = wlt_A(c), nin = W_A.extent(2);
-                  for (int n = 0; n < nin; n++) s += W_A(mu_i, k, n, tile) * X_A(ii, n, fi); }
-                val += s * norm_A; }
-              { NNScalar s = NNScalar(0.0);
-                for (int c = 0; c < nc_AA; c++) { const int fi = ci_AA(c), tile = wlt_AA(c), nin = W_AA.extent(2);
-                  for (int n = 0; n < nin; n++) s += W_AA(mu_i, k, n, tile) * X_AA(ii, n, fi); }
-                val += s * norm_AA; }
-              { NNScalar s = NNScalar(0.0);
-                for (int c = 0; c < nc_AAA; c++) { const int fi = ci_AAA(c), tile = wlt_AAA(c), nin = W_AAA.extent(2);
-                  for (int n = 0; n < nin; n++) s += W_AAA(mu_i, k, n, tile) * X_AAA(ii, n, fi); }
-                val += s * norm_AAA; }
-              { NNScalar s = NNScalar(0.0);
-                for (int c = 0; c < nc_AAAA; c++) { const int fi = ci_AAAA(c), tile = wlt_AAAA(c), nin = W_AAAA.extent(2);
-                  for (int n = 0; n < nin; n++) s += W_AAAA(mu_i, k, n, tile) * X_AAAA(ii, n, fi); }
-                val += s * norm_AAAA; }
-              rho_out(ii, k) = val;
-            });
-        }
-      }
+      stage_recompute_rho();    // rho for the RMSNorm backward (rms_inv)
       } // end if (inum > chunksize)
 
       // --- L1 Backward pass ---
@@ -1992,6 +1912,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
   RunOutput out;
   out.eng_vdwl = eng_vdwl;
   for (int k = 0; k < 6; k++) out.virial[k] = virial[k];
+  check_kernel_launches<DeviceType>("GRACE-2L/KK");
   return out;
 }
 
@@ -2364,50 +2285,32 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_sgemm(
     int n_out, int M, int n_in, int ldW, int ldIn, int ldC, NNScalar alpha)
 {
   const float a = (float) alpha, beta = 0.0f;
-  cublasStatus_t st = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+  blas::status_t st = blas::sgemm(blas_handle, blas::OP_N, blas::OP_N,
       n_out, M, n_in, &a,
       (const float*) Wg, ldW,
       (const float*) In, ldIn,
       &beta, (float*) C, ldC);
-  if (st != CUBLAS_STATUS_SUCCESS)
+  if (st != blas::SUCCESS)
     GRACE_KK_ERROR("GRACE-2L/KK: cublasSgemm failed (status {})", (int) st);
 }
 
 // Opt-2L-15 hard gate: verify the layer-0 SGEMM (transpose/leading-dim convention +
 // true-fp32 path) reproduces a host fp64 reference on a tiny deterministic batch
-// before the full chain is ever used. Aborts on gross mismatch (transpose bug ->
-// O(1) error); fp32 rounding over K=nradbase stays well under the 1e-4 gate.
+// before the full chain is ever used; gate: blas::selftest_error <= 1.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_cublas_selftest()
 {
   const auto &layers = grace_model->L1_mlp_rad_layers;   // R
   if ((int) layers.size() < 1) return;
   const int n_in = layers[0].n_in, n_out = layers[0].n_out;
-  const int Mt = 4;
-  t_nn_2d_r X("g2l:selftest_X", Mt, n_in), C("g2l:selftest_C", Mt, n_out);
-  auto hX = Kokkos::create_mirror_view(X);
-  for (int b = 0; b < Mt; b++)
-    for (int k = 0; k < n_in; k++)
-      hX(b, k) = (NNScalar)(0.01 * (double)(((b * 7 + k * 3) % 13) - 6));
-  Kokkos::deep_copy(X, hX);
-
-  mlp_sgemm(d_mlp_Wg[0][0].data(), X.data(), C.data(), n_out, Mt, n_in,
-      (int) d_mlp_Wg[0][0].extent(1), (int) X.extent(1), (int) C.extent(1), NNScalar(1.0));
-  Kokkos::fence();
-
-  auto hC = Kokkos::create_mirror_view(C);
-  Kokkos::deep_copy(hC, C);
-  double maxrel = 0.0;
-  for (int b = 0; b < Mt; b++)
-    for (int j = 0; j < n_out; j++) {
-      double ref = 0.0;
-      for (int k = 0; k < n_in; k++)
-        ref += (double) hX(b, k) * layers[0].W[(size_t) k * n_out + j];
-      const double rel = std::fabs((double) hC(b, j) - ref) / std::max(1e-6, std::fabs(ref));
-      maxrel = std::max(maxrel, rel);
-    }
-  if (maxrel > 1e-4)
-    GRACE_KK_ERROR("GRACE-2L/KK: cuBLAS SGEMM selftest failed (max rel {:.3e})", maxrel);
+  const auto &Wg = d_mlp_Wg[0][0];
+  const double err = blas::gemm_selftest<NNScalar, DeviceType>("g2l", n_in, n_out, layers[0].W.data(),
+      [&](const NNScalar *X, NNScalar *C, int M) {
+        mlp_sgemm(Wg.data(), X, C, n_out, M, n_in, (int) Wg.extent(1), n_in, n_out, NNScalar(1.0));
+      });
+  if (err > 1.0)
+    GRACE_KK_ERROR("GRACE-2L/KK: {} SGEMM selftest failed (max error {:.3g} x the fp32 rounding bound)",
+                   blas::name(), err);
 }
 
 // ======================================================================
@@ -2534,12 +2437,12 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::fc_forward_cublas(
     for (int t = 0; t < op.ntiles; t++) {
       const int m = op.L_count[t]; if (!m) continue;
       const int colbase = op.L_pstart[t] * cs, Mt = m * cs;
-      cublasStatus_t st = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+      blas::status_t st = blas::sgemm(blas_handle, blas::OP_N, blas::OP_N,
           n_out, Mt, nin, &one,
           (const float*) op.Wl_packed.data() + (size_t) t * n_out * nin, n_out,
           (const float*) d_fc_G.data() + (size_t) colbase * nin, nin,
           &zero, (float*) d_fc_C.data() + (size_t) colbase * n_out, n_out);
-      if (st != CUBLAS_STATUS_SUCCESS)
+      if (st != blas::SUCCESS)
         GRACE_KK_ERROR("GRACE-2L/KK: FC cublasSgemm(L) failed (status {})", (int) st);
     }
     { auto C = d_fc_C; auto L_pos = op.L_pos; auto nof = op.nof; auto outv = out;
@@ -2567,12 +2470,12 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::fc_forward_cublas(
     for (int t = 0; t < op.ntiles; t++) {
       const int m = op.R_count[t]; if (!m) continue;
       const int colbase = op.R_pstart[t] * cs, Mt = m * cs;
-      cublasStatus_t st = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+      blas::status_t st = blas::sgemm(blas_handle, blas::OP_N, blas::OP_N,
           n_out, Mt, nin, &one,
           (const float*) op.Wr_packed.data() + (size_t) t * n_out * nin, n_out,
           (const float*) d_fc_G.data() + (size_t) colbase * nin, nin,
           &zero, (float*) d_fc_C.data() + (size_t) colbase * n_out, n_out);
-      if (st != CUBLAS_STATUS_SUCCESS)
+      if (st != blas::SUCCESS)
         GRACE_KK_ERROR("GRACE-2L/KK: FC cublasSgemm(R) failed (status {})", (int) st);
     }
     { auto C = d_fc_C; auto R_pos = op.R_pos; auto R_tgt = op.R_tgt; auto nof = op.nof; auto outv = out;
@@ -2682,12 +2585,12 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::reduce_forward_cubla
   for (int t = 0; t < op.ntiles; t++) {
     const int m = op.count[t]; if (!m) continue;
     const int colbase = op.pstart[t] * cs, Mt = m * cs;
-    cublasStatus_t st = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+    blas::status_t st = blas::sgemm(blas_handle, blas::OP_N, blas::OP_N,
         n_out, Mt, nin, &one,
         (const float*) op.W_packed.data() + (size_t) t * n_out * nin, n_out,
         (const float*) d_fc_G.data() + (size_t) colbase * nin, nin,
         &zero, (float*) d_fc_C.data() + (size_t) colbase * n_out, n_out);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-2L/KK: ReduceB cublasSgemm failed (status {})", (int) st);
   }
 
@@ -2775,14 +2678,14 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_uq_cublas_L1
     // zproj[RP x sN] = R_rho[RP x Db_L1] · Bmat_L1[Db_L1 x sN]; R_rho = rows
     // [Db_L2, d_basis) of the row-major [D_basis,RP] R -> offset Db_L2*RP, lda=RP.
     const float onef = 1.0f, zerof = 0.0f;
-    cublasStatus_t st = uq_sgemm
-        ? cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, RP, sN, Db_L1, &onef,
+    blas::status_t st = uq_sgemm
+        ? blas::sgemm(blas_handle, blas::OP_N, blas::OP_N, RP, sN, Db_L1, &onef,
                       d_uq_rp_matrix_f.data() + (size_t) Db_L2 * RP, RP, d_uq_Bmat_f.data(), Db_L1,
                       &zerof, d_uq_proj_f.data(), RP)
-        : cublasDgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, RP, sN, Db_L1, &one,
+        : blas::dgemm(blas_handle, blas::OP_N, blas::OP_N, RP, sN, Db_L1, &one,
                       d_uq_rp_matrix.data() + (size_t) Db_L2 * RP, RP, d_uq_Bmat.data(), Db_L1,
                       &zero, d_uq_proj.data(), RP);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-2L/KK: UQ projection GEMM (L1) failed (status {})", (int) st);
 
     // Scatter the raw L1 projection into the per-global-atom carry d_uq_z(i,d).
@@ -2867,12 +2770,12 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_uq_cublas_L2
     // proj[RP x sN] = R_I2[RP x Db_L2] · Bmat_L2[Db_L2 x sN]; R_I2 = rows
     // [0, Db_L2) of R -> offset 0, lda=RP.
     const float onef = 1.0f, zerof = 0.0f;
-    cublasStatus_t st = uq_sgemm
-        ? cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, RP, sN, Db_L2, &onef,
+    blas::status_t st = uq_sgemm
+        ? blas::sgemm(blas_handle, blas::OP_N, blas::OP_N, RP, sN, Db_L2, &onef,
                       d_uq_rp_matrix_f.data(), RP, d_uq_Bmat_f.data(), Db_L2, &zerof, d_uq_proj_f.data(), RP)
-        : cublasDgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, RP, sN, Db_L2, &one,
+        : blas::dgemm(blas_handle, blas::OP_N, blas::OP_N, RP, sN, Db_L2, &one,
                       d_uq_rp_matrix.data(), RP, d_uq_Bmat.data(), Db_L2, &zero, d_uq_proj.data(), RP);
-    if (st != CUBLAS_STATUS_SUCCESS)
+    if (st != blas::SUCCESS)
       GRACE_KK_ERROR("GRACE-2L/KK: UQ projection GEMM (L2) failed (status {})", (int) st);
 
     Kokkos::parallel_for("UQFinish",
@@ -2899,7 +2802,7 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial(i
 #ifdef KOKKOS_ENABLE_CUDA
   if constexpr (is_cuda_v<DeviceType> && sizeof(NNScalar) == 4) {
     const int n_layers = (which == 0) ? mlp_rad_R_n_layers : mlp_rad_R1_n_layers;
-    if (cublas_handle && n_layers == 3) {
+    if (blas_handle && n_layers == 3) {
       mlp_which = which;
       const int bond_stride = (int) d_radial_basis.extent(1);
       const int M = chunk_size * bond_stride;
@@ -3230,10 +3133,8 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
-void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagComputeMLPEnergy,
-    const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPEnergy>::member_type& team) const
+void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagComputeMLPEnergyR, const int ii) const
 {
-  const int ii = team.league_rank();
   if (ii >= chunk_size) return;
   const int i = d_ilist[ii + chunk_offset];
   const int mu_i = d_map(type(i));
@@ -3283,8 +3184,9 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
     e += sum * d_energy_norms(last);
   }
 
-  // E_atom = (MLP_out + linear_term) * output_scale + shift
-  d_e_atom(ii) = (KKA)((e + linear_term) * output_scale + d_shifts(mu_i));
+  // E_atom = (MLP_out + linear_term) * output_scale + shift, in fp64 (KKA) as on the CPU: an fp32 sum rounds E_atom
+  // to ~1e-6 eV
+  d_e_atom(ii) = ((KKA) e + (KKA) linear_term) * (KKA) output_scale + (KKA) d_shifts(mu_i);
 }
 
 // ======================================================================
@@ -5018,7 +4920,7 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::stage_reduce_B()
     // Opt-2L-19: element-independent B ReduceN via cuBLAS (float only). YI zeroes
     // all nBf output funcs, B0 accumulates on top. fp64/non-CUDA use the hand kernel.
     if constexpr (sizeof(NNScalar) == 4)
-      if (cublas_handle && reduce_op_B_YI.active) {
+      if (blas_handle && reduce_op_B_YI.active) {
         reduce_forward_cublas(reduce_op_B_YI, d_YI, d_B, /*zero_first=*/true, nBf);
         if (reduce_op_B_B0.active)
           reduce_forward_cublas(reduce_op_B_B0, d_B0, d_B, /*zero_first=*/false, nBf);
@@ -5421,7 +5323,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::Grace2LKK()
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::~Grace2LKK()
 {
-  // the cuBLAS handle is released by its shared owner (cublas_owner) with the last engine copy
+  // the BLAS handle is released by its shared owner (blas_owner) with the last engine copy
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -5508,7 +5410,8 @@ int Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::pack_forward(int n, c
 {
   d_sendlist = sendlist;
   v_buf = buf;
-  Kokkos::parallel_for("PackForwardComm", Kokkos::RangePolicy<DeviceType, TagPackForwardComm>(0, n), *this);
+  if constexpr (is_hip_v<DeviceType>) comm_rows_hip(0, n);
+  else Kokkos::parallel_for("PackForwardComm", Kokkos::RangePolicy<DeviceType, TagPackForwardComm>(0, n), *this);
   return comm_values(n, comm_width());
 }
 
@@ -5518,7 +5421,8 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::unpack_forward(int n
 {
   comm_first = first;
   v_buf = buf;
-  Kokkos::parallel_for("UnpackForwardComm", Kokkos::RangePolicy<DeviceType, TagUnpackForwardComm>(0, n), *this);
+  if constexpr (is_hip_v<DeviceType>) comm_rows_hip(1, n);
+  else Kokkos::parallel_for("UnpackForwardComm", Kokkos::RangePolicy<DeviceType, TagUnpackForwardComm>(0, n), *this);
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -5527,7 +5431,8 @@ int Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::pack_reverse(int n, i
 {
   comm_first = first;
   v_buf = buf;
-  Kokkos::parallel_for("PackReverseComm", Kokkos::RangePolicy<DeviceType, TagPackReverseComm>(0, n), *this);
+  if constexpr (is_hip_v<DeviceType>) comm_rows_hip(2, n);
+  else Kokkos::parallel_for("PackReverseComm", Kokkos::RangePolicy<DeviceType, TagPackReverseComm>(0, n), *this);
   return comm_values(n, comm_width());
 }
 
@@ -5537,21 +5442,65 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::unpack_reverse(int n
 {
   d_sendlist = sendlist;
   v_buf = buf;
-  Kokkos::parallel_for("UnpackReverseComm", Kokkos::RangePolicy<DeviceType, TagUnpackReverseComm>(0, n), *this);
+  if constexpr (is_hip_v<DeviceType>) comm_rows_hip(3, n);
+  else Kokkos::parallel_for("UnpackReverseComm", Kokkos::RangePolicy<DeviceType, TagUnpackReverseComm>(0, n), *this);
+}
+
+// HIP: buffer row i (comm_width() doubles, element r = f * I_n_out + k) <-> the message (or its gradient) of atom j(i);
+// a thread per atom (the Tag*Comm operators) wrote / read its row with a stride of comm_width() doubles between the
+// lanes. Here 64 atoms x 64 row elements go through shared memory: atom-contiguous on the view side, row-contiguous
+// on the buffer side. mode 0: pack forward (I of sendlist), 1: unpack forward (I of ghosts first + i), 2: pack
+// reverse (dE/dI of the ghosts), 3: unpack reverse (added to dE/dI of sendlist).
+template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
+void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::comm_rows_hip(int mode, int n)
+{
+  const int W = comm_width(), no = I_n_out, nti = (n + 63) / 64, ntr = (W + 63) / 64;
+  if (nti == 0) return;
+  auto I = d_I_global; auto gI = d_grad_I_global; auto buf = v_buf; auto sl = d_sendlist;
+  const int first = comm_first;
+  const bool to_buf = mode == 0 || mode == 2;
+  using pol_t = Kokkos::TeamPolicy<DeviceType>;
+  pol_t pol(nti * ntr, 256);
+  pol = pol.set_scratch_size(0, Kokkos::PerTeam(64 * 65 * sizeof(NNScalar)));
+  Kokkos::parallel_for("CommRows", pol, KOKKOS_LAMBDA(const typename pol_t::member_type &t) {
+    const int tr = t.league_rank() / nti, i0 = (t.league_rank() - tr * nti) * 64, r0 = tr * 64;
+    NNScalar *tile = (NNScalar *) t.team_shmem().get_shmem(64 * 65 * sizeof(NNScalar));
+    for (int q = t.team_rank(); q < 64 * 64; q += 256) {    // coalesced source reads
+      const int a = to_buf ? (q & 63) : (q >> 6), r = to_buf ? (q >> 6) : (q & 63);
+      const int i = i0 + a, rr = r0 + r;
+      if (i < n && rr < W) {
+        const int f = rr / no, k = rr - f * no;
+        tile[a * 65 + r] = mode == 0 ? I(sl(i), f, k) : mode == 2 ? gI(first + i, f, k)
+                                                       : (NNScalar) buf((size_t) i * W + rr);
+      }
+    }
+    t.team_barrier();
+    for (int q = t.team_rank(); q < 64 * 64; q += 256) {    // coalesced destination writes
+      const int a = to_buf ? (q >> 6) : (q & 63), r = to_buf ? (q & 63) : (q >> 6);
+      const int i = i0 + a, rr = r0 + r;
+      if (i < n && rr < W) {
+        const int f = rr / no, k = rr - f * no;
+        const NNScalar v = tile[a * 65 + r];
+        if (to_buf) buf((size_t) i * W + rr) = v;
+        else if (mode == 1) I(first + i, f, k) = v;
+        else Kokkos::atomic_add(&gI(sl(i), f, k), v);
+      }
+    }
+  });
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_rows_to_host(bool reverse)
 {
-  if (reverse) Kokkos::deep_copy(h_grad_I_global, d_grad_I_global);
-  else Kokkos::deep_copy(h_I_global, d_I_global);
+  if (reverse) Kokkos::deep_copy(h_grad_I_global.base(), d_grad_I_global.base());
+  else Kokkos::deep_copy(h_I_global.base(), d_I_global.base());
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_rows_from_host(bool reverse)
 {
-  if (reverse) Kokkos::deep_copy(d_grad_I_global, h_grad_I_global);
-  else Kokkos::deep_copy(d_I_global, h_I_global);
+  if (reverse) Kokkos::deep_copy(d_grad_I_global.base(), h_grad_I_global.base());
+  else Kokkos::deep_copy(d_I_global.base(), h_I_global.base());
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>

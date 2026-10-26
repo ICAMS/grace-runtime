@@ -187,13 +187,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l(
   cpl_nlm = (n_lm_left > n_lm_right) ? n_lm_left : n_lm_right;
   cpl_bind(p);
 
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   // Opt 18 (fp32 only): un-fuse. cuBLAS U/V rank-projection into the global lproj/rproj
   // scratch, then the couple reads them back. The projection is ~78% of the fused cp_l
   // cost and is the mirror of the Opt-16 backward projection GEMM (reuses p.Uw/p.Vw).
   // fp64 + non-CUDA keep the fused shared-memory kernel below (no SGEMM benefit, and
   // un-fusing reintroduces the lproj/rproj round-trip that Opt-5 removed).
-  if (cublas_handle && sizeof(NNScalar) == 4) {
+  if (blas_handle && sizeof(NNScalar) == 4) {
     compute_cp_l_project_cublas(p, in_left, in_right);
     cpl_stamp[&p - d_prod] = cpl_stamp_now();
     cpl_couple_gather(p, out);
@@ -212,9 +212,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l(
   Kokkos::parallel_for("CPLFused", policy, *this);
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 18: cuBLAS cp_l forward U/V rank-projection into the global lproj/rproj scratch.
 //   lproj(a,r,w) = norm_u * Σ_n in_left(a,n,w) * U(gl(w),r,n)   (batch over w = lm)
 //   rproj(a,r,w) = norm_v * Σ_n in_right(a,n,w) * V(gr(w),r,n)
@@ -235,37 +233,37 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_project
   if (p.lr_ok && in_left.data() == in_right.data() && !getenv("GRACE3L_CPL_LR_SPLIT")) {
     // both sides from the same input: one GEMM into ranks 0 .. 2 rank - 1 of the slot
     const float alpha = (float) p.lr_alpha;
-    cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+    blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T,
         chunk_size, 2 * p.rank, p.n_left, &alpha,
         (const float*) in_left.data(), (int) in_left.extent(0),
         (long long) in_left.extent(0) * in_left.extent(1),
         (const float*) p.Wlr.data(), 2 * p.rank, (long long) p.n_left * 2 * p.rank,
         &beta, (float*) d_cpl_lproj.data(), ldc, sc, n_lm_left);
-    if (st != CUBLAS_STATUS_SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd merged projection cublas failed (status {})", (int) st);
+    if (st != blas::SUCCESS)
+      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd merged projection GEMM ({}) failed (status {})", blas::name(), (int) st);
     return;
   }
   if (n_lm_left > 0 && p.n_left > 0) {
     const float alpha = (float) p.norm_u;
-    cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+    blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T,
         chunk_size, p.rank, p.n_left, &alpha,
         (const float*) in_left.data(), (int) in_left.extent(0),
         (long long) in_left.extent(0) * in_left.extent(1),
         (const float*) p.Uw.data(), p.rank, (long long) p.n_left * p.rank,
         &beta, (float*) d_cpl_lproj.data(), ldc, sc, n_lm_left);
-    if (st != CUBLAS_STATUS_SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd left projection cublas failed (status {})", (int) st);
+    if (st != blas::SUCCESS)
+      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd left projection GEMM ({}) failed (status {})", blas::name(), (int) st);
   }
   if (n_lm_right > 0 && p.n_right > 0) {
     const float alpha = (float) p.norm_v;
-    cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+    blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T,
         chunk_size, p.rank, p.n_right, &alpha,
         (const float*) in_right.data(), (int) in_right.extent(0),
         (long long) in_right.extent(0) * in_right.extent(1),
         (const float*) p.Vw.data(), p.rank, (long long) p.n_right * p.rank,
         &beta, (float*) d_cpl_rproj.data(), ldc, sc, n_lm_right);
-    if (st != CUBLAS_STATUS_SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd right projection cublas failed (status {})", (int) st);
+    if (st != blas::SUCCESS)
+      GRACE_KK_ERROR("GRACE-3L/KK: cp_l fwd right projection GEMM ({}) failed (status {})", blas::name(), (int) st);
   }
 }
 #endif
@@ -438,11 +436,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_bwd(
 
   // 1+2) fused recompute-project + couple-VJP (team per (a,r); lproj/rproj + adj_out row
   //      + adj accumulators in shared) -> d_cpl_lproj_adj/d_cpl_rproj_adj.
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   // Use the same true-fp32 cuBLAS projections as the forward path, but keep the
   // VJP fused in shared memory. This avoids the hand projection's strided
   // LayoutLeft traversal without reintroducing global scattered VJP updates.
-  if (cublas_handle && sizeof(NNScalar) == 4) {
+  if (blas_handle && sizeof(NNScalar) == 4) {
     // the forward projections of this chunk and evaluation are still in the slot unless recomputation is forced
     static const bool reproject = getenv("GRACE3L_CPL_REPROJECT") != nullptr;
     if (reproject || cpl_stamp[&p - d_prod] != cpl_stamp_now()) {
@@ -464,13 +462,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_bwd(
     Kokkos::parallel_for("CPLBwdFused", policy, *this);
   }
   // 3) project bwd -> adj_left/adj_right (accumulate; reduces over r, stays separate).
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   // Opt 16: two batched col-major GEMMs (left with Uw, right with Vw), each beta=1
   // into the shared adj buffer. The LayoutLeft slabs A=lproj_adj(:,:,w) / C=adj(:,:,w)
   // are col-major with ld=extent(0), w-stride=extent(0)*extent(1) -> no scatter needed.
   // For SELF-products cpl_adj_left aliases cpl_adj_right; the two GEMMs run sequentially
   // on the SAME (default-instance) stream, so the beta=1 accumulation is race-free.
-  if (cublas_handle && sizeof(NNScalar) == 4) {
+  if (blas_handle && sizeof(NNScalar) == 4) {
     const long strideA = (long) d_cpl_lproj_adj.stride(2);
     const int  ldA     = (int)  d_cpl_lproj_adj.stride(1);
     if (p.lr_ok && cpl_in_left.data() == cpl_in_right.data() && cpl_adj_left.data() == cpl_adj_right.data() &&
@@ -519,16 +517,16 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_fc_fold()
   static const bool env = getenv("GRACE3L_FC_FOLD") && atoi(getenv("GRACE3L_FC_FOLD")) != 0;
   if (!(fc_fold || env)) return;
   bool ok = sizeof(NNScalar) == 4;
-#ifdef KOKKOS_ENABLE_CUDA
-  ok = ok && cublas_handle;
+#ifdef GRACE_KK_GEMM
+  ok = ok && blas_handle;
 #else
   ok = false;
 #endif
   if (!ok) {
-    log.info(fmt("[GRACE-3L/KK] fc_fold needs the CUDA cuBLAS fp32 path: FC not folded\n"));
+    log.info(fmt("[GRACE-3L/KK] fc_fold needs the GPU BLAS fp32 path: FC not folded\n"));
     return;
   }
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   const auto &m = *grace_model;
   auto build = [&](int pi, int fi, bool self) -> bool {
     if (pi < 0 || fi < 0) return false;
@@ -572,7 +570,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_fc_fold()
 #endif
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // lproj (or [lproj | rproj] of a self-product) = Lred UL^T + R UR^T; a non-self product projects its right input as
 // compute_cp_l_project_cublas does
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -585,24 +583,24 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_fold_project(
   const int ldc = (int) d_cpl_lproj.stride(1);
   const long long sc = (long long) d_cpl_lproj.stride(2);
   const float one = 1.0f, zero = 0.0f;
-  cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, chunk_size, nr, no, &one,
+  blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T, chunk_size, nr, no, &one,
       (const float *) Lred.data(), (int) Lred.extent(0), (long long) Lred.extent(0) * Lred.extent(1),
       (const float *) UL.data(), nr, (long long) no * nr, &zero, (float *) d_cpl_lproj.data(), ldc, sc, nlm);
-  if (st == CUBLAS_STATUS_SUCCESS)
-    st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, chunk_size, nr, ni, &one,
+  if (st == blas::SUCCESS)
+    st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T, chunk_size, nr, ni, &one,
         (const float *) R.data(), (int) R.extent(0), (long long) R.extent(0) * R.extent(1),
         (const float *) UR.data(), nr, (long long) ni * nr, &one, (float *) d_cpl_lproj.data(), ldc, sc, nlm);
-  if (st == CUBLAS_STATUS_SUCCESS && nr == p.rank) {
+  if (st == blas::SUCCESS && nr == p.rank) {
     const int nlm_r = (int) p.group_right.extent(0);
     const float alpha = (float) p.norm_v;
     if (nlm_r > 0 && p.n_right > 0)
-      st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, chunk_size, p.rank, p.n_right, &alpha,
+      st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_T, chunk_size, p.rank, p.n_right, &alpha,
           (const float *) right.data(), (int) right.extent(0), (long long) right.extent(0) * right.extent(1),
           (const float *) p.Vw.data(), p.rank, (long long) p.n_right * p.rank, &zero, (float *) d_cpl_rproj.data(),
           ldc, sc, nlm_r);
   }
-  if (st != CUBLAS_STATUS_SUCCESS)
-    GRACE_KK_ERROR("GRACE-3L/KK: cp_l folded projection cublas failed (status {})", (int) st);
+  if (st != blas::SUCCESS)
+    GRACE_KK_ERROR("GRACE-3L/KK: cp_l folded projection GEMM ({}) failed (status {})", blas::name(), (int) st);
 }
 #endif
 
@@ -610,7 +608,7 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_fold(
     const DeviceCPL &p, const t_nn_3d &Lred, const t_nn_3d &R, const t_nn_3d &right, const t_nn_3d &out)
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   cpl_p = p;
   cpl_out = out;
   cpl_nlm = std::max((int) p.group_left.extent(0), (int) p.group_right.extent(0));
@@ -620,7 +618,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_fold(
   cpl_couple_gather(p, out);
 #else
   (void) p; (void) Lred; (void) R; (void) right; (void) out;
-  GRACE_KK_ERROR("GRACE-3L/KK: fc_fold needs the CUDA cuBLAS path");
+  GRACE_KK_ERROR("GRACE-3L/KK: fc_fold needs the GPU BLAS path");
 #endif
 }
 
@@ -631,7 +629,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_fold_bw
     const DeviceCPL &p, const t_nn_3d &Lred, const t_nn_3d &R, const t_nn_3d &right, const t_nn_3d &adj_out,
     const t_nn_3d &adj_Lred, const t_nn_3d &adj_R, const t_nn_3d &adj_right)
 {
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
   cpl_p = p;
   cpl_adj_out = adj_out;
   cpl_nlm = std::max((int) p.group_left.extent(0), (int) p.group_right.extent(0));
@@ -661,7 +659,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_fold_bw
                               (int) p.group_right.extent(0), p.norm_v);
 #else
   (void) p; (void) Lred; (void) R; (void) right; (void) adj_out; (void) adj_Lred; (void) adj_R; (void) adj_right;
-  GRACE_KK_ERROR("GRACE-3L/KK: fc_fold needs the CUDA cuBLAS path");
+  GRACE_KK_ERROR("GRACE-3L/KK: fc_fold needs the GPU BLAS path");
 #endif
 }
 
@@ -680,7 +678,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_couple_gather(co
   const int cs = chunk_size, nfunc = p.nfunc;
   auto L = d_cpl_lproj; auto R = d_cpl_rproj; auto O = out;
   auto off = p.foff; auto ia = p.fa; auto ib = p.fb; auto cg = p.fcg; auto fcol = p.fcol;
-  Kokkos::parallel_for("CPLCoupleG", Kokkos::RangePolicy<DeviceType>(0, cs * p.rank), KOKKOS_LAMBDA(const int q) {
+  Kokkos::parallel_for("CPLCoupleG", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256>>(0, cs * p.rank), KOKKOS_LAMBDA(const int q) {
     const int r = q / cs, a = q - r * cs;
     for (int f = 0; f < nfunc; f++) {
       NNScalar v = NNScalar(0.0);
@@ -699,8 +697,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_couple_path(cons
   auto L = d_cpl_lproj; auto R = d_cpl_rproj; auto O = out; auto fcol = p.fcol;
   auto ob = p.path_ob[0]; auto pr = p.path_pr[0]; auto pt = p.path_pt[0]; auto pcg = p.path_cg;
   const long sl = (long) L.stride(2), sr = (long) R.stride(2), so = (long) O.stride(2);
-  Kokkos::parallel_for("CPLCouplePath", Kokkos::RangePolicy<DeviceType>(0, cs * p.rank), KOKKOS_LAMBDA(const int q) {
-    const int r = q / cs, a = q - r * cs;
+  const int rw = cpl_row_width();    // thread q -> (atom a < cs, rank r)
+  Kokkos::parallel_for("CPLCouplePath", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256>>(0, rw * p.rank), KOKKOS_LAMBDA(const int q) {
+    const int r = q / rw, a = q - r * rw;
+    if (a >= cs) return;
     const G3LPath::Tabs tb{ob.data(), pr.data(), pt.data(), reinterpret_cast<const float *>(pcg.data()), fcol.data(), nob};
     G3LPath::run<0>(tb, reinterpret_cast<const float *>(&L(a, r, 0)), sl, nullptr, 0,
                     reinterpret_cast<const float *>(&R(a, r, 0)), sr, reinterpret_cast<float *>(&O(a, r, 0)), so,
@@ -716,8 +716,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_vjp_path(const D
   auto dL = d_cpl_lproj_adj; auto dR = d_cpl_rproj_adj;
   const long sl = (long) L.stride(2), sr = (long) R.stride(2), sd = (long) Dv.stride(2);
   const long sgl = (long) dL.stride(2), sgr = (long) dR.stride(2);
-  // the one-pass form runs teams of 64 threads: GPU execution spaces only (host spaces cap a team at their
-  // thread count); elsewhere the two-kernel form
+  const int rw = cpl_row_width();    // thread q -> (atom a < cs, rank r)
+  // the one-pass form runs teams of 64 threads: CUDA only (host spaces cap a team at their thread count; on HIP /
+  // MI250X it is slower than the two kernels: 3L W-bcc-5k 86.7 vs 75.5 us/atom); elsewhere the two-kernel form
   static const bool two_env = getenv("GRACE3L_CPL_VJP2") != nullptr;
   bool two = two_env;
 #ifdef KOKKOS_ENABLE_CUDA
@@ -729,7 +730,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_vjp_path(const D
     // both adjoints in one pass over D (left-outer tables): left accumulator in registers, right row in the team
     // scratch (column per thread), copied out at the end
     constexpr int TB = 64;
-    const int nr = (int) p.group_right.extent(0), n = cs * p.rank, nob = p.path_nob[0];
+    const int nr = (int) p.group_right.extent(0), n = rw * p.rank, nob = p.path_nob[0];
     auto ob = p.path_ob[0]; auto pr = p.path_pr[0]; auto pt = p.path_pt[0];
     using team_policy = Kokkos::TeamPolicy<DeviceType>;
     using member = typename team_policy::member_type;
@@ -738,8 +739,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_vjp_path(const D
     Kokkos::parallel_for("CPLVjpPathB", pol, KOKKOS_LAMBDA(const member &t) {
       float *sh = (float *) t.team_shmem().get_shmem((size_t) nr * TB * sizeof(float));
       const int tid = t.team_rank(), q = t.league_rank() * TB + tid;
-      if (q >= n) return;
-      const int r = q / cs, a = q - r * cs;
+      const int r = q / rw, a = q - r * rw;
+      if (q >= n || a >= cs) return;
       float *gr = sh + tid;
       for (int w = 0; w < nr; w++) gr[w * TB] = 0.0f;
       const G3LPath::Tabs tb{ob.data(), pr.data(), pt.data(), reinterpret_cast<const float *>(pcg.data()), fcol.data(), nob};
@@ -750,11 +751,17 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_vjp_path(const D
     });
     return;
   }
+  // gfx90a / gfx94x (512 registers per lane): at least 3 waves per SIMD (with M = 1 the left kernel took 172 VGPRs, i.e.
+  // 2 waves): 3L W-bcc-5k both kernels 76.6 -> 65.5 ms, C-diamond-125k 1892 -> 1643 ms per run (4 waves: 128 VGPRs,
+  // spills, 69.5 / 1696 ms). Other targets keep M = 1 (3 waves would leave about 84 VGPRs on gfx906 / gfx908). The
+  // forward kernel (93 VGPRs, 5 waves) times the same at M = 1, 2 and 4.
+  using vjp_lb = hip_lb_t<DeviceType, 256, GRACE_KK_GEMM_MFMA ? 3 : 1>;
   {
     const int nob = p.path_nob[0];
     auto ob = p.path_ob[0]; auto pr = p.path_pr[0]; auto pt = p.path_pt[0];
-    Kokkos::parallel_for("CPLVjpPathL", Kokkos::RangePolicy<DeviceType>(0, cs * p.rank), KOKKOS_LAMBDA(const int q) {
-      const int r = q / cs, a = q - r * cs;
+    Kokkos::parallel_for("CPLVjpPathL", Kokkos::RangePolicy<DeviceType, vjp_lb>(0, rw * p.rank), KOKKOS_LAMBDA(const int q) {
+      const int r = q / rw, a = q - r * rw;
+      if (a >= cs) return;
       const G3LPath::Tabs tb{ob.data(), pr.data(), pt.data(), reinterpret_cast<const float *>(pcg.data()), fcol.data(), nob};
       G3LPath::run<1>(tb, nullptr, 0, reinterpret_cast<float *>(&dL(a, r, 0)), sgl,
                       reinterpret_cast<const float *>(&R(a, r, 0)), sr, nullptr, 0,
@@ -764,8 +771,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_vjp_path(const D
   {
     const int nob = p.path_nob[1];
     auto ob = p.path_ob[1]; auto pr = p.path_pr[1]; auto pt = p.path_pt[1];
-    Kokkos::parallel_for("CPLVjpPathR", Kokkos::RangePolicy<DeviceType>(0, cs * p.rank), KOKKOS_LAMBDA(const int q) {
-      const int r = q / cs, a = q - r * cs;
+    Kokkos::parallel_for("CPLVjpPathR", Kokkos::RangePolicy<DeviceType, vjp_lb>(0, rw * p.rank), KOKKOS_LAMBDA(const int q) {
+      const int r = q / rw, a = q - r * rw;
+      if (a >= cs) return;
       const G3LPath::Tabs tb{ob.data(), pr.data(), pt.data(), reinterpret_cast<const float *>(pcg.data()), fcol.data(), nob};
       G3LPath::run<2>(tb, nullptr, 0, reinterpret_cast<float *>(&dR(a, r, 0)), sgr,
                       reinterpret_cast<const float *>(&L(a, r, 0)), sl, nullptr, 0,
@@ -823,7 +831,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_couple_vjp_gathe
   cpl_vjp_t<64, 2>(p, adj_out);
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
+#ifdef GRACE_KK_GEMM
 // Opt 16: batched projection SGEMM for CPLBwdProject. Standard col-major batched GEMM
 // (NOT the row-major transpose trick): the LayoutLeft slabs A=lproj_adj(:,:,w) and
 // C=adj(:,:,w) are already col-major [M x rank] / [M x n] with leading dim = extent(0)
@@ -838,14 +846,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_project_sgemm_ba
 {
   if (batch <= 0 || n <= 0 || M <= 0 || rank <= 0) return;
   const float a = (float) alpha, beta = 1.0f;
-  cublasStatus_t st = cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+  blas::status_t st = blas::sgemm_strided_batched(blas_handle, blas::OP_N, blas::OP_N,
       M, n, rank, &a,
       (const float*) A,  ldA,  (long long) strideA,
       (const float*) Bw, rank, (long long) n * rank,
       &beta, (float*) C, ldC,  (long long) strideC,
       batch);
-  if (st != CUBLAS_STATUS_SUCCESS)
-    GRACE_KK_ERROR("GRACE-3L/KK: cublasSgemmStridedBatched failed (status {})", (int) st);
+  if (st != blas::SUCCESS)
+    GRACE_KK_ERROR("GRACE-3L/KK: cp_l projection strided-batched GEMM ({}) failed (status {})", blas::name(), (int) st);
 }
 
 #endif

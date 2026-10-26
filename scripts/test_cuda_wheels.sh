@@ -4,7 +4,11 @@
 # env (CPython 3.12, numpy / ase / pytest from conda-forge) with the grace-runtime and grace-runtime-cuda12 abi3 wheels
 # (and nvidia-cublas-cu12 unless WITH_CUBLAS=0), the tests copied out of the repository; then
 #   1. import, plug-in, architecture, device="auto" backend, cuBLAS in use;
-#   2. the GPU test files (parity with the CPU calculator, batches, auto device, plug-in logic);
+#   2. the GPU test files (parity with the CPU calculator, batches, auto device, plug-in logic,
+#      memory, allocation failures, chunks, several calculators; TorchSim and device batches with WITH_TORCH=1, which
+#      installs the [torchsim] extra),
+#      a release gate: only the skips GRACE_TEST_ALLOW_SKIP matches pass (card sizes, timings, the PTX path without an
+#      older module, the unsupported-model check without that model), so a missing model or package is a failure;
 #   3. an architecture without a module (GRACE_RUNTIME_CUDA_ARCH=sm61): auto -> CPU with a warning, cuda -> ImportError;
 #   4. WITH_TF=1: TensorFlow on the GPU and grace-runtime CUDA in one process (env gn-cuda-tf, tensorflow[and-cuda]).
 # Stops unless the card is idle (no compute apps, utilization < 5 %). GRACE_CACHE: the test models.
@@ -31,9 +35,11 @@ E=gn-cuda-test-$(hostname -s)
 "$MM" env remove -y -q -n "$E" > /dev/null 2>&1
 "$MM" create -y -q -n "$E" -c conda-forge python=3.12 numpy ase pytest > /dev/null || { echo "FAIL env"; exit 1; }
 P="$MAMBA_ROOT_PREFIX/envs/$E/bin/python"
-"$P" -m pip install -q "$CPU_WH"/grace_runtime-*-cp312-abi3-*.whl "$GPU_WH"/grace_runtime_cuda12-*-cp312-abi3-*.whl
+CPU_WHL=$(ls "$CPU_WH"/grace_runtime-*-cp312-abi3-*.whl | head -1)
+"$P" -m pip install -q "$CPU_WHL" "$GPU_WH"/grace_runtime_cuda12-*-cp312-abi3-*.whl
 check $? "install wheels"
 [ "${WITH_CUBLAS:-1}" = 1 ] && "$P" -m pip install -q "nvidia-cublas-cu12>=12.4,<13"
+if [ "${WITH_TORCH:-0}" = 1 ]; then "$P" -m pip install -q "$CPU_WHL[torchsim]"; check $? "install [torchsim]"; fi
 W=$(mktemp -d /tmp/gn-cuda-test.XXXX)
 mkdir -p "$W/python" "$W/tests"
 cp -r "$ROOT/python/tests" "$W/python/"
@@ -51,9 +57,12 @@ assert calc.backend.startswith("cuda:") and m.__name__.startswith("grace_runtime
 EOF
 check $? "import / auto device / plug-in module"
 
-"$P" -m pytest -q -p no:cacheprovider python/tests/test_cuda_parity.py python/tests/test_cuda_calculator.py \
-  python/tests/test_cuda_batch.py python/tests/test_batch.py python/tests/test_auto_device.py \
-  python/tests/test_cuda_plugin.py 2>&1 | tail -3
+ALLOW="for .*cards|timing test|older GPU family|unsupported test model"
+[ "${WITH_TORCH:-0}" = 1 ] || ALLOW="$ALLOW|torch"
+[ "${WITH_CUBLAS:-1}" = 1 ] || ALLOW="$ALLOW|nvidia.cublas"
+GRACE_TEST_ALLOW_SKIP=${GRACE_TEST_ALLOW_SKIP-$ALLOW} "$P" -m pytest -q -p no:cacheprovider python/tests/test_gpu_*.py \
+  python/tests/test_cuda_plugin.py python/tests/test_rocm_plugin.py python/tests/test_batch.py \
+  python/tests/test_auto_device.py python/tests/test_torchsim.py 2>&1 | tail -15
 check ${PIPESTATUS[0]} "GPU tests"
 
 GRACE_RUNTIME_CUDA_ARCH=sm61 "$P" - <<EOF

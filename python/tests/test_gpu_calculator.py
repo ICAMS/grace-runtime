@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-"""GRACERuntimeCalculator(device="cuda") against the CPU calculator: periodic, small triclinic,
+"""GRACERuntimeCalculator(device=GPU) against the CPU calculator: periodic, small triclinic,
 shifted (atoms outside the cell), slab (mixed pbc) and open (cluster) structures, growth and species changes on one
 calculator, NVE energy conservation, UQ keys. Both evaluate fp32 fused kernels with different summation orders:
 energy 1e-5 eV/atom, forces 5e-5 eV/A + 1e-6 max|F| (fp32 relative), stress 1e-6 eV/A^3."""
@@ -15,7 +15,9 @@ from ase.io import read
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
 
-from grace_runtime import GRACERuntimeCalculator, _cuda
+from grace_runtime import GRACERuntimeCalculator, Model, compute_batch
+
+from gpu_tools import GPU, NO_GPU, PLATFORM, gpu_ok
 
 ROOT = Path(__file__).resolve().parents[2]
 FX = ROOT / "tests" / "fixtures"
@@ -25,16 +27,9 @@ M1 = CACHE / "GRACE-1L-OMAT-large-base" / "kokkos.npz"
 M3 = CACHE / "GRACE-3L-OMAT-large" / "kokkos.npz"
 
 
-def _cuda_ok():
-    try:
-        _cuda.module_for(0)
-        return True
-    except (ImportError, ValueError):
-        return False
 
-
-pytestmark = pytest.mark.skipif(not _cuda_ok() or not (M1.exists() and M2.exists()),
-                                reason="no CUDA module for this device or registry models missing")
+pytestmark = pytest.mark.skipif(not gpu_ok() or not (M1.exists() and M2.exists()),
+                                reason=f"{NO_GPU} / registry models missing")
 
 
 def wmo54():
@@ -58,8 +53,8 @@ def structures():
 
 
 def gpu(model, **kw):
-    calc = GRACERuntimeCalculator(str(model), device="cuda", **kw)
-    assert calc.backend.startswith("cuda:"), calc.backend
+    calc = GRACERuntimeCalculator(str(model), device=GPU, **kw)
+    assert calc.backend.startswith(PLATFORM + ":"), calc.backend
     return calc
 
 
@@ -92,6 +87,7 @@ def test_growth_and_species_change_on_one_calculator():
         e_c, f_c, _ = evaluate(at, cpu)
         assert abs(e_g - e_c) / len(at) <= 1e-5
         assert np.abs(f_g - f_c).max() <= 5e-5
+    assert calc._cpu is None    # the GPU module keeps the neighbour list; no CPU engine on the GPU path
 
 
 def test_uq_keys_match_cpu():
@@ -131,13 +127,38 @@ def nve_drift(calc, steps=200):
 def test_nve_conservation_as_cpu():
     d_g = nve_drift(gpu(M2, skin=0.5))
     d_c = nve_drift(GRACERuntimeCalculator(str(M2), num_threads=8, skin=0.5))
-    print(f"NVE max |dE|/atom: cuda {d_g:.2e}  cpu {d_c:.2e}")
+    print(f"NVE max |dE|/atom: {GPU} {d_g:.2e}  cpu {d_c:.2e}")
     assert d_g <= max(2 * d_c, 1e-4)
+
+
+def test_unknown_element():
+    at = bulk("Og", "fcc", a=5.0)    # the GPU module names the element and the model's, as the CPU calculator
+    at.calc = gpu(M2)
+    with pytest.raises(ValueError, match=r"Og is not in the model \(model elements: .*\bW\b"):
+        at.get_potential_energy()
+
+
+def test_gpu_path_builds_no_cpu_driver():
+    """the GPU path never asks the CPU Model for its cutoffs (Model.cutoff_matrix builds the CPU fused driver of the
+    species set and keeps it cached)"""
+    class NoCpu:
+        def __init__(self, model):
+            self._m = model
+
+        def __getattr__(self, name):
+            if name == "cutoff_matrix":
+                raise AssertionError("CPU driver built on the GPU path")
+            return getattr(self._m, name)
+    calc = gpu(M2)
+    calc.model = NoCpu(calc.model)
+    e_g, _, _ = evaluate(wmo54(), calc)
+    e_c, _, _ = evaluate(wmo54(), GRACERuntimeCalculator(str(M2), num_threads=8))
+    assert abs(e_g - e_c) / 54 <= 1e-5
 
 
 def test_bad_device():
     with pytest.raises(ValueError, match="unknown device"):
-        GRACERuntimeCalculator(str(M2), device="gpu")
+        GRACERuntimeCalculator(str(M2), device="npu")
 
 
 @pytest.mark.parametrize("model", [M1, M2], ids=["1L", "2L"])
@@ -160,7 +181,7 @@ def test_bond_vectors_do_not_depend_on_the_coordinate_origin(model):
     forces of the CPU calculator (fp32 network rounding only, ~2e-6 eV/A), and the same cell translated by 500 A
     gives the same forces (fp32 positions made them grow with |x|: 3e-5 eV/A at 35 A)"""
     at = bulk("C").repeat((14, 14, 14))
-    calc = GRACERuntimeCalculator(str(model), device="cuda")
+    calc = GRACERuntimeCalculator(str(model), device=GPU)
     a = at.copy()
     a.calc = calc
     f0 = a.get_forces()
@@ -170,3 +191,28 @@ def test_bond_vectors_do_not_depend_on_the_coordinate_origin(model):
     f1 = b.get_forces()
     assert np.abs(f0).max() <= 5e-6, np.abs(f0).max()
     assert np.abs(f1).max() <= 5e-6, np.abs(f1).max()
+
+
+
+def test_model_spline_reaches_the_gpu():
+    """Model(path, spline=N) sets the radial table intervals of the GPU engine too, in the calculator and in
+    compute_batch (the GPU used 1024 whatever the Model said): the GPU model sets up one engine per (spline,
+    chunksize), so a 512 Model next to live 1024 engines adds one engine per path; 512 vs 1024 moves the forces by
+    ~1e-6 eV/A (2L)"""
+    from grace_runtime import calculator, free_gpu_memory
+    at = wmo54()
+    m = {n: Model(str(M2), spline=n) for n in (512, 1024)}
+    assert m[512].spline == 512 and m[1024].spline == 1024
+    with pytest.raises(ValueError, match="spline must be >= 16"):
+        Model(str(M2), spline=8)
+    free_gpu_memory()
+    f, calcs, setups = {}, [], {}
+    for n in (1024, 512):
+        f[n] = compute_batch(m[n], [at], device=GPU, chunksize=2048)[0]["forces"]    # engine (n, 2048), kept by the cache
+        a = at.copy()
+        a.calc = GRACERuntimeCalculator(m[n], device=GPU)    # engine (n, auto chunk), kept by the calculator
+        a.get_forces()
+        calcs.append(a.calc)
+        setups[n] = calculator._KK_MODELS[m[n].path].engine_setups
+    assert setups[512] == setups[1024] + 2, setups    # before the fix: the 1024 engines again, no new setup
+    assert np.abs(f[512] - f[1024]).max() <= 1e-4

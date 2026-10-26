@@ -4,7 +4,6 @@ memory (one pass while it fits) and, on a device allocation failure, halves it d
 memory dropped); a structure that does not fit even then
 is a clear RuntimeError, not "model not supported". Small-card cases run only on such cards (dandolo RTX 4070 SUPER
 12 GB, belgica RTX 2070 8 GB)."""
-import ctypes
 import os
 from pathlib import Path
 
@@ -12,7 +11,9 @@ import numpy as np
 import pytest
 from ase.build import bulk
 
-from grace_runtime import GRACERuntimeCalculator, _cuda
+from grace_runtime import GRACERuntimeCalculator
+
+from gpu_tools import GPU, NO_GPU, gpu_ok, gpu_total_gb
 
 CACHE = Path(os.environ.get("GRACE_CACHE", Path.home() / ".cache" / "grace-runtime-test"))
 M2M = CACHE / "GRACE-2L-SMAX-OMAT-medium" / "kokkos.npz"
@@ -20,24 +21,12 @@ M2L = CACHE / "GRACE-2L-OMAT-large-base" / "kokkos.npz"
 HEA = "Al Sc Ti V Cr Mn Fe Co Ni Cu Zn Y Zr Nb Mo Tc Ru Rh Pd Ag Hf Ta W Re Os".split()
 
 
-def _cuda_ok():
-    try:
-        _cuda.module_for(0)
-        return True
-    except (ImportError, ValueError):
-        return False
 
-
-pytestmark = pytest.mark.skipif(not _cuda_ok() or not (M2M.exists() and M2L.exists()), reason="no GPU module / models")
+pytestmark = pytest.mark.skipif(not gpu_ok() or not (M2M.exists() and M2L.exists()), reason=f"{NO_GPU} / models")
 
 
 def total_gb():
-    cu = ctypes.CDLL("libcuda.so.1")
-    cu.cuInit(0)
-    dev, mem = ctypes.c_int(), ctypes.c_size_t()
-    cu.cuDeviceGet(ctypes.byref(dev), 0)
-    cu.cuDeviceTotalMem_v2(ctypes.byref(mem), dev)
-    return mem.value / 2**30
+    return gpu_total_gb()
 
 
 def hea128k():
@@ -48,8 +37,8 @@ def hea128k():
 
 def test_chunksize_parameter():
     w = bulk("W", "bcc", a=3.165, cubic=True).repeat(4)
-    fixed = GRACERuntimeCalculator(str(M2M), device="cuda", chunksize=2048)
-    auto = GRACERuntimeCalculator(str(M2M), device="cuda")
+    fixed = GRACERuntimeCalculator(str(M2M), device=GPU, chunksize=2048)
+    auto = GRACERuntimeCalculator(str(M2M), device=GPU)
     e = []
     for c in (fixed, auto):
         a = w.copy()
@@ -63,16 +52,17 @@ SNIPPET = """
 import sys, numpy as np
 from ase.build import bulk
 from grace_runtime import GRACERuntimeCalculator
+GPU = __import__("os").environ["GRACE_TEST_GPU"]
 HEA = "Al Sc Ti V Cr Mn Fe Co Ni Cu Zn Y Zr Nb Mo Tc Ru Rh Pd Ag Hf Ta W Re Os".split()
 a = bulk("W", "bcc", a=3.165, cubic=True).repeat((40, 40, 40))
 a.set_chemical_symbols(np.random.default_rng(20261008).permutation(np.resize(HEA, len(a))))
-a.calc = GRACERuntimeCalculator(sys.argv[1], device="cuda")
+a.calc = GRACERuntimeCalculator(sys.argv[1], device=GPU)
 f = a.get_forces()
 print("OK", np.isfinite(f).all(), a.calc.chunksize)
 """
 
 
-@pytest.mark.skipif(not 10 < (total_gb() if _cuda_ok() else 0) <= 16, reason="for 10-16 GB cards")
+@pytest.mark.skipif(not 10 < (total_gb() if gpu_ok() else 0) <= 16, reason="for 10-16 GB cards")
 @pytest.mark.parametrize("model", [M2M, M2L], ids=["2L-medium", "2L-large"])
 def test_auto_chunk_fits_a_large_system_on_a_small_card(model):
     """one model per process (a Model keeps its engine and buffers for the process)"""
@@ -85,10 +75,10 @@ def test_auto_chunk_fits_a_large_system_on_a_small_card(model):
     assert ok == "OK" and finite == "True" and 1024 <= int(chunk) <= 65536
 
 
-@pytest.mark.skipif(not 0 < (total_gb() if _cuda_ok() else 0) <= 10, reason="for cards up to 10 GB")
+@pytest.mark.skipif(not 0 < (total_gb() if gpu_ok() else 0) <= 10, reason="for cards up to 10 GB")
 def test_does_not_fit_is_a_clear_error():
     at = hea128k()
-    at.calc = GRACERuntimeCalculator(str(M2L), device="cuda")
+    at.calc = GRACERuntimeCalculator(str(M2L), device=GPU)
     with pytest.raises(RuntimeError, match="does not fit"):
         at.get_forces()
 
@@ -101,7 +91,7 @@ def test_3l_chunks_match_one_pass():
     w = bulk("W", "bcc", a=3.165, cubic=True).repeat(4)
     w.rattle(0.05, seed=2)
     r = []
-    for c in (GRACERuntimeCalculator(str(m3), device="cuda", chunksize=32), GRACERuntimeCalculator(str(m3), device="cuda")):
+    for c in (GRACERuntimeCalculator(str(m3), device=GPU, chunksize=32), GRACERuntimeCalculator(str(m3), device=GPU)):
         a = w.copy()
         a.calc = c
         r.append((a.get_potential_energy(), a.get_forces()))
@@ -114,12 +104,13 @@ import sys, numpy as np
 from ase.build import bulk
 from grace_runtime import GRACERuntimeCalculator, compute_batch
 from grace_runtime.calculator import _KK_MODELS
+GPU = __import__("os").environ["GRACE_TEST_GPU"]
 m3 = sys.argv[1]
 base = bulk("W", "bcc", a=3.165, cubic=True)
 if sys.argv[2] == "system":
     a = base.repeat(20)    # 16000 atoms: more than one chunk of GRACE-3L on a 24 GB card
     a.rattle(0.03, seed=1)
-    a.calc = GRACERuntimeCalculator(m3, device="cuda")
+    a.calc = GRACERuntimeCalculator(m3, device=GPU)
     a.get_forces()
     a.rattle(0.01, seed=2)
     a.get_forces()
@@ -129,8 +120,8 @@ else:
         c = base.repeat(3)
         c.rattle(0.03, seed=k)
         cells.append(c)
-    compute_batch(m3, cells, device="cuda", energy_only=True)
-    compute_batch(m3, cells, device="cuda", energy_only=True)
+    compute_batch(m3, cells, device=GPU, energy_only=True)
+    compute_batch(m3, cells, device=GPU, energy_only=True)
 print("SETUPS", list(_KK_MODELS.values())[0].engine_setups)
 """
 

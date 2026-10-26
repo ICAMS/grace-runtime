@@ -12,6 +12,7 @@
 
 #include <Kokkos_Core.hpp>
 
+
 #include <cmath>
 #include <vector>
 
@@ -20,6 +21,19 @@ namespace kk {
 namespace GraceFusedKK {
 
 constexpr int GRACE_FUSED_MAX_LMAX = 4;
+
+struct alignas(16) GF4 { float x, y, z, w; };
+// HIP bond backward kernels: row length of the dE/dA rows [channel][lm] (lm contiguous, 16-byte loads): (lmax + 1)^2
+// rounded up to whole float4 with an odd number of them (no bank conflicts between consecutive channels)
+KOKKOS_INLINE_FUNCTION constexpr int fused_lmp(int nlm)
+{
+  return 4 * ((nlm + 3) / 4 + ((nlm + 3) / 4 % 2 == 0 ? 1 : 0));
+}
+
+// l_of_y (kk_mfma.h): l of the flat index lm = l^2 + l + m, for loops over lm with compile-time bounds
+// (lm < (GRACE_FUSED_MAX_LMAX + 1)^2): nvcc does not unroll an inner lm loop whose bounds depend on the outer l, and a
+// register array indexed in it (dE/dA row, Y, dY / dr) then goes to local memory
+static_assert(GRACE_FUSED_MAX_LMAX == 4, "l_of_y: extend to the new GRACE_FUSED_MAX_LMAX");
 
 // Real spherical harmonics, identical to PairGRACE2LKokkos::compute_Y_bond_chunk.
 template<class ViewG>
@@ -105,12 +119,16 @@ float spline_v(const View3 &c, const int N, const float x, const int o)
 
 // Y_lm and G = dY_lm / d(rx, ry, rz) of the polynomial extension of the same real harmonics
 // (dual numbers through the recurrences). Surface gradient: dY/dr = (G - rhat (rhat.G)) / r.
-template<class ViewG>
+// Y_lm at Y[YS lm], G at G[GS lm + 0..2] (default: Y[nlm], G[nlm][3]; 4, 4 with G = Y + 1: [nlm][Y, Gx, Gy, Gz]).
+// LM > 0: lmax = LM at compile time (constant trip counts: Y, G and the recursion can stay in registers), the argument
+// lmax is ignored.
+template<int YS = 1, int GS = 3, int LM = 0, class ViewG>
 KOKKOS_INLINE_FUNCTION
-void real_sph_grad(const int lmax, const float rx, const float ry, const float rz,
+void real_sph_grad(const int lmax_rt, const float rx, const float ry, const float rz,
                    const ViewG &idx_s, const ViewG &alm, const ViewG &blm, const ViewG &cl,
                    const ViewG &dl, float *Y, float *G)
 {
+  const int lmax = LM > 0 ? LM : lmax_rt;
   float plm[(GRACE_FUSED_MAX_LMAX + 1) * (GRACE_FUSED_MAX_LMAX + 2) / 2];
   float dplm[(GRACE_FUSED_MAX_LMAX + 1) * (GRACE_FUSED_MAX_LMAX + 2) / 2];
   plm[0] = 1.0f; dplm[0] = 0.0f;
@@ -136,16 +154,16 @@ void real_sph_grad(const int lmax, const float rx, const float ry, const float r
   const float sq2f = 1.4142135623730950488f;
   for (int l = 0; l <= lmax; l++) {
     const int c = l * (l + 1);
-    Y[c] = plm[l * (l + 1) / 2];
-    G[3 * c] = 0.0f; G[3 * c + 1] = 0.0f; G[3 * c + 2] = dplm[l * (l + 1) / 2];
+    Y[YS * c] = plm[l * (l + 1) / 2];
+    G[GS * c] = 0.0f; G[GS * c + 1] = 0.0f; G[GS * c + 2] = dplm[l * (l + 1) / 2];
     float pr = rx, pi = ry, prx = 1.0f, pry = 0.0f, pix = 0.0f, piy = 1.0f;
     for (int m = 1; m <= l; m++) {
       const float s = (m % 2 == 0) ? sq2f : -sq2f;
       const float pv = plm[l * (l + 1) / 2 + m], dpv = dplm[l * (l + 1) / 2 + m];
-      Y[c + m] = s * pr * pv;
-      G[3 * (c + m)] = s * prx * pv; G[3 * (c + m) + 1] = s * pry * pv; G[3 * (c + m) + 2] = s * pr * dpv;
-      Y[c - m] = s * pi * pv;
-      G[3 * (c - m)] = s * pix * pv; G[3 * (c - m) + 1] = s * piy * pv; G[3 * (c - m) + 2] = s * pi * dpv;
+      Y[YS * (c + m)] = s * pr * pv;
+      G[GS * (c + m)] = s * prx * pv; G[GS * (c + m) + 1] = s * pry * pv; G[GS * (c + m) + 2] = s * pr * dpv;
+      Y[YS * (c - m)] = s * pi * pv;
+      G[GS * (c - m)] = s * pix * pv; G[GS * (c - m) + 1] = s * piy * pv; G[GS * (c - m) + 2] = s * pi * dpv;
       const float nr = pr * rx - pi * ry, ni = pr * ry + pi * rx;
       const float nrx = prx * rx + pr - pix * ry, nry = pry * rx - piy * ry - pi;
       const float nix = prx * ry + pix * rx + pi, niy = pry * ry + pr + piy * rx;

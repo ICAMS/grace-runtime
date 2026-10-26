@@ -178,6 +178,32 @@ inline float hsum(const v16 v)
   return (c[0] + c[2]) + (c[1] + c[3]);
 }
 
+#if defined(__aarch64__)
+// NEON (aarch64): a v16 is 4 of the 32 registers and the v16 tiles below spill. o[a] += sc M^T x[a] for the NB atoms,
+// 16 columns at a time (NB x 16 / NF accumulators)
+template<int NV>
+inline void mv_bands(const float *M, int ldm, int nk, const float *x, int is, float *o, int os, float sc)
+{
+  constexpr int P = 16 / simd::NF;
+  for (int v = 0; v < NV; v++) {
+    simd::fn acc[NB][P] = {};
+    for (int k = 0; k < nk; k++) {
+      const float *row = M + (size_t) k * ldm + 16 * v;
+      simd::fn w[P];
+      for (int p = 0; p < P; p++) w[p] = simd::loadn(row + simd::NF * p);
+      for (int a = 0; a < NB; a++) {
+        const float xa = x[a * is + k];
+        for (int p = 0; p < P; p++) acc[a][p] += xa * w[p];
+      }
+    }
+    for (int a = 0; a < NB; a++) {
+      float *oa = o + a * os + 16 * v;
+      for (int p = 0; p < P; p++) simd::storen(oa + simd::NF * p, simd::loadn(oa + simd::NF * p) + sc * acc[a][p]);
+    }
+  }
+}
+#endif
+
 /* Matrix-vector items over a batch: for every item q and atom slot a
      out[out_off[q] * NB + a * ostr] += sc[q] * sum_k in[in_off[q] * NB + a * istr + k] * M[k][:]
    Each matrix row is loaded once per SB atoms (registers: SB * NV accumulators). */
@@ -195,6 +221,10 @@ inline void mv_batch(const MVG &g, int ty, const float *const *src, float *const
     const float *x = S + (size_t) g.in_off[q] * NB;
     float *o = D + (size_t) g.out_off[q] * NB;
     const float sc = g.sc[q];
+#if defined(__aarch64__)
+    mv_bands<NV>(M, ldm, nk, x, is, o, os, sc);
+    continue;
+#endif
     for (int a0 = 0; a0 < NB; a0 += SB) {
       v16 acc[SB][NV];
       for (int a = 0; a < SB; a++)
@@ -250,12 +280,60 @@ inline void fc_bwd(const FC &F, const float *gout, float *gXl, float *gXr)
   mv_groups(F.gb, 0, src, dst);
 }
 
-// CG products on batch rows of length RL = NB * P = 16 * NR: whole rows per term (term indices read once)
+#if defined(__aarch64__)
+// NEON: the products in chunks of PROD_CH v16 values (NR is a multiple of 4: G2LF_NR_DISPATCH)
+constexpr int PROD_CH = 4;
+
+// dst = sum_t c_t L[l t] R[r t] over the terms t of output o
+template<int NR>
+inline void prod_fwd_chunks(const Prod &p, int o, const float *L, const float *R, float *dst)
+{
+  static_assert(NR % PROD_CH == 0, "whole chunks");
+  constexpr int RL = 16 * NR;
+  for (int v0 = 0; v0 < NR; v0 += PROD_CH) {
+    v16 acc[PROD_CH] = {};
+    for (int t = p.off[o]; t < p.off[o + 1]; t++) {
+      const float *l = L + (size_t) p.l[t] * RL + 16 * v0, *r = R + (size_t) p.r[t] * RL + 16 * v0;
+      const float c = p.c[t];
+      for (int v = 0; v < PROD_CH; v++) acc[v] += c * ld(l + 16 * v) * ld(r + 16 * v);
+    }
+    for (int v = 0; v < PROD_CH; v++) st(dst + 16 * (v0 + v), acc[v]);
+  }
+}
+
+// gL[l t] += c_t d * R[r t], gR[r t] += c_t d * L[l t] for the terms t of output o, d = the row's gradient
+template<int NR>
+inline void prod_bwd_chunks(const Prod &p, int o, const float *L, const float *R, const float *d0, float *gL, float *gR)
+{
+  static_assert(NR % PROD_CH == 0, "whole chunks");
+  constexpr int RL = 16 * NR;
+  for (int v0 = 0; v0 < NR; v0 += PROD_CH) {
+    v16 d[PROD_CH];
+    for (int v = 0; v < PROD_CH; v++) d[v] = ld(d0 + 16 * (v0 + v));
+    for (int t = p.off[o]; t < p.off[o + 1]; t++) {
+      const size_t lo = (size_t) p.l[t] * RL + 16 * v0, ro = (size_t) p.r[t] * RL + 16 * v0;
+      const float c = p.c[t];
+      for (int v = 0; v < PROD_CH; v++) {
+        const v16 cd = c * d[v];
+        st(gL + lo + 16 * v, ld(gL + lo + 16 * v) + cd * ld(R + ro + 16 * v));
+        st(gR + ro + 16 * v, ld(gR + ro + 16 * v) + cd * ld(L + lo + 16 * v));
+      }
+    }
+  }
+}
+#endif
+
+// CG products on batch rows of length RL = NB * P = 16 * NR: whole rows per term (term indices read once; NEON:
+// once per chunk)
 template<int NR>
 inline void prod_fwd_t(const Prod &p, const float *L, const float *R, float *out)
 {
   constexpr int RL = 16 * NR;
   for (int o = 0; o < p.nout; o++) {
+#if defined(__aarch64__)
+    prod_fwd_chunks<NR>(p, o, L, R, out + (size_t) o * RL);
+    continue;
+#endif
     v16 acc[NR];
     for (int v = 0; v < NR; v++) acc[v] = v16{};
     for (int t = p.off[o]; t < p.off[o + 1]; t++) {
@@ -273,6 +351,10 @@ inline void prod_bwd_t(const Prod &p, const float *L, const float *R, const floa
   constexpr int RL = 16 * NR;
   for (int o = 0; o < p.nout; o++) {
     if (p.off[o] == p.off[o + 1]) continue;
+#if defined(__aarch64__)
+    prod_bwd_chunks<NR>(p, o, L, R, g + (size_t) o * RL, gL, gR);
+    continue;
+#endif
     v16 d[NR];
     for (int v = 0; v < NR; v++) d[v] = ld(g + (size_t) o * RL + 16 * v);
     for (int t = p.off[o]; t < p.off[o + 1]; t++) {
@@ -316,6 +398,10 @@ inline void mv_item(const float *M, int nk, const float *x, int is, float *o, in
   constexpr int SB0 = NV <= 4 ? 4 : 2;
   constexpr int SB = SB0 < NB ? SB0 : NB;
   constexpr int ldm = 16 * NV;
+#if defined(__aarch64__)
+  mv_bands<NV>(M, ldm, nk, x, is, o, os, 1.0f);
+  return;
+#endif
   for (int a0 = 0; a0 < NB; a0 += SB) {
     v16 acc[SB][NV];
     for (int a = 0; a < SB; a++)
@@ -385,6 +471,9 @@ inline void prod_red_fwd_t(const Prod &p, const float *L, const float *Rt, int t
     bool any = false;
     for (int k = 0; k < nred; k++) any |= rrs[k]->off[o] < rrs[k]->off[o + 1];
     if (!any) continue;
+#if defined(__aarch64__)
+    prod_fwd_chunks<NR>(p, o, L, Rt, row);
+#else
     v16 acc[NR];
     for (int v = 0; v < NR; v++) acc[v] = v16{};
     for (int t = p.off[o]; t < p.off[o + 1]; t++) {
@@ -393,6 +482,7 @@ inline void prod_red_fwd_t(const Prod &p, const float *L, const float *Rt, int t
       for (int v = 0; v < NR; v++) acc[v] += c * ld(l + 16 * v) * ld(r + 16 * v);
     }
     for (int v = 0; v < NR; v++) st(row + 16 * v, acc[v]);
+#endif
     for (int k = 0; k < nred; k++) {
       const Red &R = *reds[k];
       const RowRed &rr = *rrs[k];
@@ -427,6 +517,10 @@ inline void prod_red_bwd_t(const Prod &p, const float *L, const float *Rt, int t
         mv_item_d(S.pin, S.WT.data() + (tyo * S.nt + rr.t[c]) * R.pout * S.pin, S.nout,
                   gouts[k] + (size_t) rr.fo[c] * NB * R.pout, R.pout, row, S.pin);
     }
+#if defined(__aarch64__)
+    prod_bwd_chunks<NR>(p, o, L, Rt, row, gL, gR);
+    continue;
+#endif
     v16 d[NR];
     for (int v = 0; v < NR; v++) d[v] = ld(row + 16 * v);
     for (int t = p.off[o]; t < p.off[o + 1]; t++) {
@@ -1175,10 +1269,10 @@ inline vd8 ldd(const double *p) { return simd::load(p); }
 // f[0, RP): raw projection; nrm = ||b|| over all blocks; dens[0, n_density): density channel norms. Normalise,
 // append log(dens), nearest centroid of element mu, Mahalanobis distance: sigma, gamma = sigma / threshold
 // dot product with eight vector accumulators (fp reductions are not vectorised without -ffast-math)
-inline double uq_dot(const double *x, const double *y, int n)
+inline double uq_dot(const double *x, const double *y, size_t n)
 {
   vd8 acc = vd8{};
-  int k = 0;
+  size_t k = 0;
   for (; k + 8 <= n; k += 8) acc += ldd(x + k) * ldd(y + k);
   double t = 0.0;
   for (int v = 0; v < 8; v++) t += acc[v];
@@ -1190,26 +1284,28 @@ template <class M>
 inline void uq_gmm(const M &m, int mu, double *f, double *delta, double nrm, const double *dens, double &gamma,
                    double &sigma, double &cluster)
 {
-  const int RP = m.uq_rp_dim, D = m.uq_feature_dim, K = m.uq_max_clusters;
+  // sizes unsigned, as the loaders hold them: they check uq_rp_dim >= 1 and uq_feature_dim >= uq_rp_dim (uq_head.cpp,
+  // model_1l / model_2l.cpp), which an int D does not show the compiler (GCC 16 -Wstringop-overflow on std::fill)
+  const size_t RP = m.uq_rp_dim, D = m.uq_feature_dim, K = m.uq_max_clusters;
   if (m.uq_normalize)
-    for (int d = 0; d < RP; d++) f[d] /= nrm + 1.0e-12;
+    for (size_t d = 0; d < RP; d++) f[d] /= nrm + 1.0e-12;
   for (int p = 0; p < m.uq_n_density; p++) f[RP + p] = std::log(dens[p] + 1.0e-12) * m.uq_density_scale;
   int kstar = 0;
   double best = 1.0e300;
   for (int q = 0; q < m.uq_n_clusters[mu]; q++) {
     const double *cen = m.uq_centroids.data() + ((size_t) mu * K + q) * D;
-    for (int p = 0; p < D; p++) delta[p] = f[p] - cen[p];
+    for (size_t p = 0; p < D; p++) delta[p] = f[p] - cen[p];
     const double d2 = uq_dot(delta, delta, D);
     if (d2 < best) { best = d2; kstar = q; }
   }
   const double *cen = m.uq_centroids.data() + ((size_t) mu * K + kstar) * D;
-  for (int p = 0; p < D; p++) delta[p] = f[p] - cen[p];
+  for (size_t p = 0; p < D; p++) delta[p] = f[p] - cen[p];
   // sig2 = delta^T S delta = delta^T S^T delta: y = S^T delta accumulated row by row of S (vectorises), f reused for y
   const double *icov = m.uq_inv_cov.data() + ((size_t) mu * K + kstar) * D * D;
   std::fill(f, f + D, 0.0);
-  for (int p = 0; p < D; p++) {
-    const double dp = delta[p], *row = icov + (size_t) p * D;
-    for (int q = 0; q < D; q++) f[q] += dp * row[q];
+  for (size_t p = 0; p < D; p++) {
+    const double dp = delta[p], *row = icov + p * D;
+    for (size_t q = 0; q < D; q++) f[q] += dp * row[q];
   }
   const double sig2 = uq_dot(delta, f, D);
   sigma = std::sqrt(sig2 + 1.0e-8);

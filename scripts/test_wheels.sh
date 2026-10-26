@@ -6,13 +6,19 @@
 # the python test suite (no TensorFlow) with the module the CPU picks and with GRACE_RUNTIME_CPU=v3 where the CPU has
 # AVX2. A run fails unless pytest exits 0 and reports passed tests (a crash such as SIGILL is a failure).
 # Test models: $GRACE_CACHE (grace-runtime models download GRACE-2L-SMAX-OMAT-medium GRACE-1L-OMAT-large-base
-# GRACE-2L-OMAT-medium-ft-E).
+# GRACE-2L-OMAT-medium-ft-E). A release gate: only the skips GRACE_TEST_ALLOW_SKIP matches pass (python/tests/conftest.py;
+# here the GPU tests, card sizes and timings included, TorchSim, AVX-512-only, MKL / scikit-learn, TensorFlow and the
+# example notebook in an env made before it needed matplotlib; without phonopy only its phonon section is left out), so
+# a missing model is a failure.
 set -uo pipefail
+ALLOW="CUDA|GPU|cards|timing test|torch|AVX-512|sklearn|MKL|tensorpotential|SavedModel|unsupported test model"
+ALLOW+="|example notebook"
+export GRACE_TEST_ALLOW_SKIP=${GRACE_TEST_ALLOW_SKIP-$ALLOW}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WH=${1:-$ROOT/dist/wheelhouse}
 export MAMBA_ROOT_PREFIX=${MAMBA_ROOT_PREFIX:-$HOME/micromamba}
 MM=${MICROMAMBA:-${MAMBA_EXE:-$(command -v micromamba)}}
-DEPS="numpy scipy ase matscipy pytest pyyaml threadpoolctl pip"
+DEPS="numpy scipy ase pytest pyyaml threadpoolctl pip phonopy matplotlib-base"    # phonons_batch, the notebook
 TMP=${TMPDIR:-/tmp}/gn-wheeltest-$$
 rc=0
 for py in ${PYTHONS:-3.10 3.11 3.12 3.13}; do

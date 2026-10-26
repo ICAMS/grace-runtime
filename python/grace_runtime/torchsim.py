@@ -7,14 +7,13 @@ Needs ``torch`` and ``torch-sim-atomistic`` (>= 0.6, Python >= 3.12): ``pip inst
 A state on the model's GPU stays there: types and positions go to the GPU module as device tensors (DLPack), the
 neighbour lists and periodic images are built on the GPU, energies / forces / virials come back as device tensors.
 Other states (CPU model, a state on another device, cells with zero vectors) take the host path: positions, cells
-and atomic numbers copied to the host, neighbour lists built there, one batch of the GPU module (or the CPU calculator,
-system after system). Outputs are tensors on the model's device in its dtype. The GPU buffers stay allocated between calls (an MD loop;
+and atomic numbers copied to the host, one batch of the GPU module from host arrays (neighbour lists still built on
+the GPU; cells with zero vectors padded on the host) or the CPU kernels, system after system. Outputs are
+tensors on the model's device in its dtype. The GPU buffers stay allocated between calls (an MD loop;
 ``grace_runtime.free_gpu_memory()`` returns them). The GPU kernels compute in fp32 (sums in fp64), as
 ``GRACERuntimeCalculator``. Forces come from the kernels, not from autograd: the outputs carry no gradient, and states
 with ``positions.requires_grad`` are refused.
 """
-import os
-
 import numpy as np
 import torch
 from ase import Atoms
@@ -22,10 +21,10 @@ from ase.data import atomic_numbers, chemical_symbols
 from ase.stress import voigt_6_to_full_3x3_stress
 from torch_sim.models.interface import ModelInterface
 
-from . import registry
 from ._core import Model
-from .batch import _chunks, _cpu, _gpu_batch, _gpu_compute
+from .batch import _chunks, _cpu_iter, _gpu_batch, _gpu_compute
 from .calculator import _chunk_arg, _select_device, default_threads
+from .dispersion import resolve as _resolve_dispersion
 
 _UQ_ATOM = ("gamma", "atomic_sigma", "gmm_cluster")
 
@@ -34,7 +33,8 @@ class GRACERuntimeModel(ModelInterface):
     """A GRACE model (kokkos.npz path, registry name or ``grace_runtime.Model``) as a TorchSim model.
 
     device: torch device or string; None: "cuda" when torch sees a GPU and grace-runtime can use it (as
-        ``device="auto"`` of ``GRACERuntimeCalculator``), else "cpu". "cuda:N" runs the kernels on GPU N.
+        ``device="auto"`` of ``GRACERuntimeCalculator``), else "cpu". "cuda:N" runs the kernels on GPU N. On a ROCm
+        build of torch (``torch.version.hip`` set) torch's "cuda" is the AMD GPU, and grace-runtime runs on "rocm:N".
     dtype: dtype of the outputs (torch.float64 default; inputs of any float dtype are accepted).
     compute_forces / compute_stress: return "forces" [n_atoms, 3] / "stress" [n_systems, 3, 3] (eV/A^3, zero for
         cells with zero vectors); without both only energies are computed (no backward pass).
@@ -42,10 +42,14 @@ class GRACERuntimeModel(ModelInterface):
     uq: the UQ head (uqv6 "gamma_only"): "gamma", "atomic_sigma", "gmm_cluster" [n_atoms] and "total_sigma"
         [n_systems].
     chunksize, max_nall, max_atoms: as ``compute_batch`` (GPU memory per engine pass; atoms per call into the GPU
-        module, host path only). num_threads: host threads (host neighbour search, the CPU calculator).
+        module, host path only). num_threads: threads of the CPU kernels.
     device_path: states on the model's GPU stay there (neighbour lists built on the GPU, inputs and outputs as
         device tensors); False, or cells with zero vectors (molecules), or a state on another device: the host path
-        (copies to the host, host neighbour lists).
+        (copies to the host and back).
+    dispersion: a dispersion correction added to the model (a ``grace_runtime.D3`` or "d3-pbe", "d3-r2scan"; see
+        ``grace_runtime.dispersion``): included in energy, forces, stress, energies; its energy also as
+        "dispersion_energy" [n_systems], with dispersion_parts also "dispersion_forces", "dispersion_stress",
+        "dispersion_energies".
 
     Autobatching: ``memory_scales_with`` is "n_atoms"; ``max_memory_scaler(state)`` estimates the atoms per call that
     fit the free GPU memory, for ``BinningAutoBatcher`` / ``InFlightAutoBatcher(max_memory_scaler=...)`` (TorchSim's
@@ -55,16 +59,18 @@ class GRACERuntimeModel(ModelInterface):
     def __init__(self, model, device=None, dtype=torch.float64, compute_forces: bool = True,
                  compute_stress: bool = True, energies: bool = False, uq: bool = False, chunksize="auto",
                  max_nall: int = 1 << 21, max_atoms: int = 131072, num_threads: int | None = None,
-                 device_path: bool = True):
+                 device_path: bool = True, dispersion=None, dispersion_parts: bool = False):
         super().__init__()
-        m = model if isinstance(model, Model) else Model(registry.resolve(os.fspath(model)))
+        m = model if isinstance(model, Model) else Model(model)
         if device is None:
             want = "auto" if torch.cuda.is_available() else "cpu"
         else:
             dev = torch.device(device)
             if dev.type not in ("cpu", "cuda"):
-                raise ValueError(f"device must be cpu or cuda, not {dev}")
-            want = "cpu" if dev.type == "cpu" else f"cuda:{torch.cuda.current_device() if dev.index is None else dev.index}"
+                raise ValueError(f"device must be cpu or cuda (torch's name for AMD GPUs too), not {dev}")
+            platform = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+            want = ("cpu" if dev.type == "cpu" else
+                    f"{platform}:{torch.cuda.current_device() if dev.index is None else dev.index}")
         resolved, kkm, self.backend_info = _select_device(want, m)    # as GRACERuntimeCalculator.backend_info
         if kkm is not None:
             idx = int(resolved.split(":")[1]) if ":" in resolved else kkm[0].device()
@@ -86,6 +92,8 @@ class GRACERuntimeModel(ModelInterface):
         # GPU states on the model's device: neighbour lists on the GPU, no host copies (False: the host path)
         self._device_path = bool(device_path)
         self._lut, self._lut_key = None, None
+        self._disp = _resolve_dispersion(dispersion)
+        self._dparts = bool(dispersion_parts) and self._disp is not None
 
     @property
     def model(self) -> Model:
@@ -112,7 +120,9 @@ class GRACERuntimeModel(ModelInterface):
         if self._kk is None:
             out = self._cpu(natoms, numbers, pos, cells, pbc, eonly)
         elif len(numbers) == 0:
-            out = {"energy": np.zeros(nsys), "forces": np.zeros((0, 3)), "virial": np.zeros((nsys, 6))}
+            out = {"energy": np.zeros(nsys), "forces": np.zeros((0, 3)), "virial": np.zeros((nsys, 6)),
+                   "dispersion_energy": np.zeros(nsys), "dispersion_energies": np.zeros(0),
+                   "dispersion_forces": np.zeros((0, 3)), "dispersion_virial": np.zeros((nsys, 6))}
         else:
             out = self._gpu(natoms, numbers, pos, cells, pbc, eonly)
         return self._outputs(out, natoms, cells, eonly)
@@ -148,7 +158,7 @@ class GRACERuntimeModel(ModelInterface):
         z = state.atomic_numbers.detach()
         zs = torch.unique(z).cpu().numpy()
         species = sorted(chemical_symbols[k] for k in zs)
-        b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True)
+        b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True, dispersion=self._disp)
         key = tuple(species)
         if self._lut_key != key:    # atomic number -> type 1..len(species), on the device
             lut = torch.zeros(int(max(atomic_numbers[e] for e in species)) + 1, dtype=torch.int32, device=dev)
@@ -171,18 +181,35 @@ class GRACERuntimeModel(ModelInterface):
         if self._uq:
             for k in _UQ_ATOM:
                 out[k] = kw[k] = torch.empty(n, **f64)
+        if self._disp is not None:
+            out["dispersion_energy"] = kw["dispersion_energy"] = torch.empty(nsys, **f64)
+        if self._dparts:
+            out["dispersion_energies"] = kw["dispersion_energies"] = torch.empty(n, **f64)
+            if not eonly:
+                out["dispersion_forces"] = kw["dispersion_forces"] = torch.empty((n, 3), **f64)
+                out["dispersion_virial"] = kw["dispersion_virial"] = torch.empty((nsys, 6), **f64)
         torch.cuda.synchronize(dev)    # positions / types written by torch before the module reads them
         b.compute_device(natoms, types, pos, np.ascontiguousarray(cells), pbc, out["energy"], energy_only=eonly,
                          max_nall=self._max_nall, **kw)
         r = {"energy": out["energy"].to(self._dtype)}
+
+        def stress(w):
+            full = torch.stack([w[:, [0, 3, 4]], w[:, [3, 1, 5]], w[:, [4, 5, 2]]], dim=1)
+            vol = torch.linalg.det(cells_t.to(torch.float64)).abs()
+            return (-full / vol[:, None, None]).to(self._dtype)
+
         if not eonly:
             if self._compute_forces:
                 r["forces"] = out["forces"].to(self._dtype)
             if self._compute_stress:
-                w = out["virial"]
-                full = torch.stack([w[:, [0, 3, 4]], w[:, [3, 1, 5]], w[:, [4, 5, 2]]], dim=1)
-                vol = torch.linalg.det(cells_t.to(torch.float64)).abs()
-                r["stress"] = (-full / vol[:, None, None]).to(self._dtype)
+                r["stress"] = stress(out["virial"])
+        if self._disp is not None:
+            r["dispersion_energy"] = out["dispersion_energy"].to(self._dtype)
+        if self._dparts:
+            r["dispersion_energies"] = out["dispersion_energies"].to(self._dtype)
+            if not eonly:
+                r["dispersion_forces"] = out["dispersion_forces"].to(self._dtype)
+                r["dispersion_stress"] = stress(out["dispersion_virial"])
         if self._energies:
             r["energies"] = out["energies"].to(self._dtype)
         if self._uq:
@@ -195,24 +222,26 @@ class GRACERuntimeModel(ModelInterface):
     def _gpu(self, natoms, numbers, pos, cells, pbc, eonly):
         """calls into the GPU module, at most max_atoms atoms each (a larger system alone), outputs concatenated"""
         species = sorted(chemical_symbols[k] for k in np.unique(numbers))
-        b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True)    # buffers kept across steps
+        b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True,    # buffers kept across steps
+                       dispersion=self._disp)
         starts = np.concatenate([[0], np.cumsum(natoms)])
         parts = []
         for lo, hi in _chunks(natoms, self._max_atoms):
             a0, a1 = starts[lo], starts[hi]
             parts.append(_gpu_compute(b, species, natoms[lo:hi], numbers[a0:a1], pos[a0:a1], cells[lo:hi],
                                       pbc[lo:hi], uq=self._uq, energies=self._energies, energy_only=eonly,
-                                      num_threads=self._nth, max_nall=self._max_nall))
+                                      max_nall=self._max_nall, dispersion_parts=self._dparts))
         if len(parts) == 1:
             return dict(parts[0])
         return {k: np.concatenate([np.asarray(p[k]) for p in parts]) for k in parts[0]}
 
     def _cpu(self, natoms, numbers, pos, cells, pbc, eonly):
-        """the calculator loop of compute_batch(device="cpu") -> arrays as the GPU module returns them"""
+        """the CPU loop of compute_batch(device="cpu") -> arrays as the GPU module returns them"""
         ends = np.cumsum(natoms)
         structures = [Atoms(numbers=numbers[e - n:e], positions=pos[e - n:e], cell=c, pbc=p)
                       for n, e, c, p in zip(natoms, ends, cells, pbc)]
-        res = _cpu(self._model, structures, self._uq, self._energies, eonly, self._nth)
+        res = list(_cpu_iter(self._model, structures, self._uq, self._energies, eonly, self._nth, self._disp,
+                             self._dparts))
         out = {"energy": np.array([r["energy"] for r in res])}
         if not eonly:
             out["forces"] = np.concatenate([r["forces"] for r in res]).reshape(-1, 3)
@@ -222,6 +251,13 @@ class GRACERuntimeModel(ModelInterface):
         if self._uq:
             for key in _UQ_ATOM:
                 out[key] = np.concatenate([r[key] for r in res])
+        if self._disp is not None:
+            out["dispersion_energy"] = np.array([r["dispersion_energy"] for r in res])
+        if self._dparts:
+            out["dispersion_energies"] = np.concatenate([r["dispersion_energies"] for r in res])
+            if not eonly:
+                out["dispersion_forces"] = np.concatenate([r["dispersion_forces"] for r in res]).reshape(-1, 3)
+                out["dispersion_stress33"] = np.stack([voigt_6_to_full_3x3_stress(r["dispersion_stress"]) for r in res])
         return out
 
     def _outputs(self, out, natoms, cells, eonly):
@@ -242,6 +278,14 @@ class GRACERuntimeModel(ModelInterface):
             sig = np.asarray(out["atomic_sigma"], dtype=np.float64)
             r["total_sigma"] = t(np.bincount(np.repeat(np.arange(len(natoms)), natoms), weights=sig,
                                              minlength=len(natoms)))
+        if self._disp is not None:
+            r["dispersion_energy"] = t(out["dispersion_energy"])
+        if self._dparts:
+            r["dispersion_energies"] = t(out["dispersion_energies"])
+            if not eonly:
+                r["dispersion_forces"] = t(out["dispersion_forces"])
+                r["dispersion_stress"] = t(out["dispersion_stress33"] if "dispersion_stress33" in out
+                                           else _stress(out["dispersion_virial"], cells))
         return r
 
 

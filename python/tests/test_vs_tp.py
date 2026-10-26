@@ -3,7 +3,9 @@
 there is no -fp64 one, so both sides are fp32 and the thresholds are wider).
 
 Skipped without tensorpotential / the cached models. Run on CPU: CUDA_VISIBLE_DEVICES= pytest -s.
-Energy <= 1e-6 eV/atom (2e-6 below 10 atoms: fp32 floor), forces <= 2e-5 eV/A; stress and per-atom energies are reported (they set the thresholds).
+Energy <= 1e-6 eV/atom (2e-6 below 10 atoms: fp32 floor), forces <= 2e-5 eV/A, stress <= 2e-5 relative to
+max(|stress|, 1e-3 eV/A^3), per-atom energies <= 1e-5 eV. Measured worst (CPU, 2026-10-20): stress 6.8e-6 (1L, W1),
+per-atom energy 3.1e-6 eV (1L, W54).
 """
 import os
 
@@ -24,7 +26,8 @@ MODELS = [  # (name, kokkos.npz of the fp32 model, fp64 SavedModel)
     ("3L-OMAT-large", f"{CACHE}/GRACE-3L-OMAT-large/kokkos.npz", f"{CACHE}/GRACE-3L-OMAT-large"),    # fp32 reference
 ]
 TOL = {"3L-OMAT-large": (2e-6, 2e-6, 5e-5)}    # (dE/atom >= 10 atoms, below, dF); default (1e-6, 2e-6, 2e-5); 3L measured
-# dE/atom <= 2.2e-7 (C64; 9.6e-7 for the 1-atom W1), dF <= 3.0e-6 against the fp32 SavedModel
+# dE/atom <= 2.2e-7 (C64; 9.6e-7 for the 1-atom W1), dF <= 1.0e-5 against the fp32 SavedModel
+TOL_S, TOL_E_ATOM = 2e-5, 1e-5    # stress (relative, see the module doc), per-atom energy (eV); all models
 HEA25 = ["Al", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo", "Ru", "Rh", "Pd",
          "Ag", "Hf", "Ta", "W", "Re", "Os", "Ir"]
 
@@ -83,6 +86,8 @@ def test_parity(name, npz, saved):
         tE, tE_small, tF = TOL.get(name, (1e-6, 2e-6, 2e-5))
         assert dE <= (tE if n >= 10 else tE_small), (sname, dE)
         assert dF <= tF, (sname, dF)
+        assert dS <= TOL_S, (sname, dS)
+        assert de <= TOL_E_ATOM, (sname, de)
     print(f"{name:22s} worst: " + "  ".join(f"{k} {v:.2e}" for k, v in worst.items()))
 
 

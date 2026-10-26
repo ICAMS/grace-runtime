@@ -23,6 +23,11 @@ int main(int argc, char **argv)
   grace::kk::Grace1LFusedKK<Dev, grace::kk::DefaultTraits<Dev>> ef;
   ef.set_model(m, type2mu);
   ef.setup();
+  // the matrix-core basis A covers lmax 4 and ceil(NR / 16) * 5 <= 16 output blocks: radial widths up to 48; the
+  // engines use the vector-ALU kernel for the others
+  namespace G = grace::kk::GraceFusedKK;
+  CHECK(G::a_fwd_mfma_fits<Dev>(4, 32) && G::a_fwd_mfma_fits<Dev>(4, 42) && G::a_fwd_mfma_fits<Dev>(4, 48));
+  CHECK(!G::a_fwd_mfma_fits<Dev>(4, 49) && !G::a_fwd_mfma_fits<Dev>(4, 64) && !G::a_fwd_mfma_fits<Dev>(3, 32));
   std::printf("kk 1l setup ok\n");
   return 0;
 }
