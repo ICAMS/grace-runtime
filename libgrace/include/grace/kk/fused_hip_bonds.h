@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GPU helpers of the fused GRACE-1L / GRACE-2L bond kernels (grace/1l/fused/kk, grace/2l/fused/kk), developed on HIP
+// GPU helpers of the fused GRACE-1L / GRACE-2L bond kernels (Grace1LFusedKK, Grace2LFusedKK), developed on HIP
 // and used on CUDA as well; the matrix-core kernels are CDNA only.
 //
 // compact_bonds: per run, the neighbours of each local atom that are bonds (within the bond cutoff; for a coupled

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <thread>
 #include <vector>
 static double check(int M, int N, int K, float beta, std::mt19937 &rng)
 {
@@ -49,5 +50,25 @@ int main()
     std::printf("max relative error %.3g\n", worst);
     CHECK(worst <= 1e-5);
   }
+  // concurrent GemmStat updates from several threads (each has omp_get_thread_num() == 0)
+  grace::gemm::GemmStat &st = grace::gemm::gemm_stat();
+  st.t.clear();
+  st.on = true;
+  std::vector<std::thread> ths;
+  for (int t = 0; t < 4; t++)
+    ths.emplace_back([] {
+      std::vector<float> a(64, 1.0f), b(64, 2.0f);    // A 1 x K, B K x 1 for K up to 64
+      float c = 0.0f;
+      for (int r = 0; r < 50; r++)
+        for (int k = 1; k <= 64; k++) grace::gemm::gemm(1, 1, k, 1.0f, a.data(), k, b.data(), 1, 0.0f, &c, 1);
+    });
+  for (auto &th : ths) th.join();
+  st.on = false;
+#ifdef _OPENMP
+  long calls = 0;
+  for (const auto &e : st.t) calls += e.second.second;
+  CHECK(st.t.size() == 64 && calls == 4 * 50 * 64);
+#endif
+  st.t.clear();
   return 0;
 }

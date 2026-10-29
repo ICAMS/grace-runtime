@@ -238,9 +238,9 @@ void d3_passes(const D3TablesKK<DeviceType> &t, D3WorkKK<DeviceType> &wk,
     team.team_reduce(Sum(c));
     Kokkos::single(Kokkos::PerTeam(team), [&]() {
       double wl[R], dwl[R];
-      d3::weights(c, &cnref(si * R), nref(si), wl, dwl);
+      d3::weights(c, &cnref(si * R), nref(si), wl, energy_only ? nullptr : dwl);    // as the CPU path
       for (int k = 0; k < R; k++) {
-        dw(a, k) = dwl[k];
+        if (!energy_only) dw(a, k) = dwl[k];
         wf(a, k) = (float) wl[k];
       }
     });
@@ -443,7 +443,8 @@ void d3_passes(const D3TablesKK<DeviceType> &t, D3WorkKK<DeviceType> &wk,
         const d3::AtmSide<float> si3 = {sf(i, SU), sf(i, SIU), sf(i, SR), sf(i, SQ), sf(i, SSW), sf(i, SDS)},
                                  sj3 = {sf(j, SU), sf(j, SIU), sf(j, SR), sf(j, SQ), sf(j, SSW), sf(j, SDS)};
         const float k9 = s9u * Kokkos::sqrt(c9),
-                    e3 = k9 * d3::atm<float>(si3, sj3, d3::atm_side<float>(ujk, rc3f, ron3f), cd3, dg);
+                    e3 = k9 * d3::atm<float>(si3, sj3, d3::atm_side<float>(ujk, rc3f, ron3f), cd3,
+                                             energy_only ? nullptr : dg);
         ei += (double) e3 / 3.0;
         Kokkos::atomic_add(&sd(i), (double) e3 / 3.0);
         Kokkos::atomic_add(&sd(j), (double) e3 / 3.0);

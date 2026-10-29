@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // View types of the Kokkos engines for consumers without LAMMPS (the Python module). The LAMMPS glue defines its own
-// traits from ArrayTypes (src/KOKKOS/grace_kk_traits.h), so the engines there see exactly the LAMMPS types.
+// traits from ArrayTypes (GraceLammpsTraits), so the engines there see exactly the LAMMPS types.
 #pragma once
+
+#include "grace/kk/support.h"    // View64
 
 #include <Kokkos_Core.hpp>
 
@@ -44,7 +46,8 @@ template<class DeviceType, class KKFloat = double, class AccFloat = double> stru
   using t_int_1d = Kokkos::View<int *, DeviceType>;
   using t_double_1d = Kokkos::View<double *, Kokkos::LayoutRight, DeviceType>;    // exchange buffers
   using t_int_1d_randomread = Kokkos::View<const int *, DeviceType, Kokkos::MemoryTraits<Kokkos::RandomAccess>>;
-  using t_neighbors_2d = Kokkos::View<int **, layout, DeviceType>;
+  // [nlocal][maxneigh]: more than 2^31 entries from 22M atoms x 100 neighbours, so 64-bit offsets (View64)
+  using t_neighbors_2d = View64<Kokkos::View<int **, layout, DeviceType>>;
   static constexpr int neighmask = 0x1FFFFFFF;    // LAMMPS NEIGHMASK (special-bond bits above it)
 };
 

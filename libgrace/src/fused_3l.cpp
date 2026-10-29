@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE/pair_grace_3l_fused.cpp (lammps-ace feature/grace-runtime a73b8b17ee); contributing
-// author: Yury Lysogorskiy (ICAMS). The arithmetic is unchanged (LAMMPS grace/3l/fused stays bit-identical): the LAMMPS
-// parts became the bond source (BondGather<Src>), the Exchange of the two message layers and Outputs.
+// Contributing author: Yury Lysogorskiy (ICAMS). Input through the bond source (BondGather<Src>), the messages of
+// the two layers through Exchange, results through Outputs.
 #include "grace/fused_3l.h"
 
 #include "grace/bonds.h"
@@ -154,9 +153,9 @@ struct Grace3LFused::Net {
   size_t maxten = 0, maxP = 0;
   size_t tmax[T_NT] = {};    // per tensor: max over layers of nf * nc
   int folded[3] = {0, 0, 0};    // fc_fold: products per layer whose FC is folded into the projections (0..2)
-  // UQ: first row of the projection matrix for the rho1 / rho2 / rho3 basis blocks
+  // UQ: first row of the projection matrix for the rho1 / rho2 / rho3 basis blocks (and total width in uq_off[3])
   bool has_uq = false;
-  int uq_off[3] = {0, 0, 0};
+  int uq_off[4] = {0, 0, 0, 0};
   std::vector<float> uq_rp;    // fp32 projection matrix [d_basis][rp_dim]
 };
 
@@ -177,6 +176,7 @@ struct Grace3LFused::Glob {
 
 struct Grace3LFused::Work {
   int nbat = 0, ty = 0, sp = 0;
+  int zero_i = -1, zero_j = -1;    // the first bond of length 0 its gathers met (throw_zero_bond)
   std::vector<int> atom, boff;
   std::vector<int> bj, bt;
   std::vector<double> rh, rr, rc;
@@ -203,11 +203,11 @@ struct Grace3LFused::Work {
 Grace3LFused::Grace3LFused(std::shared_ptr<const GRACE3LModel> m, FusedSettings s, Logger lg) :
     log(lg), model(std::move(m)), set(s), g(std::make_unique<Glob>())
 {
-  if (set.block < 1 || set.block > 64) throw Error("grace/3l/fused: block must be in 1..64");
+  if (set.block < 1 || set.block > 64) throw Error("GRACE-3L: block must be in 1..64");
   for (int k = 0; k < 3; k++)
-    if (spline_n_of(set, k) < 16) throw Error(str("grace/3l/fused: spline N of layer ", k + 1, " must be >= 16"));
+    if (spline_n_of(set, k) < 16) throw Error(str("GRACE-3L: spline N of layer ", k + 1, " must be >= 16"));
   if ((int) model->shift_values.size() != model->n_elements && !model->shift_values.empty())
-    throw Error(str("grace/3l/fused: shift_values has ", model->shift_values.size(), " entries, expected n_elements = ",
+    throw Error(str("GRACE-3L: shift_values has ", model->shift_values.size(), " entries, expected n_elements = ",
                     model->n_elements));
   g3_prof_on = getenv("G2LF_PROF") != nullptr;
 }
@@ -218,19 +218,19 @@ Grace3LFused::~Grace3LFused()
     double tot = 0.0;
     for (int q = 0; q < P_N; q++) tot += g3_prof[q];
     std::ostringstream o;
-    o << "[grace/3l/fused] profile (wall), s:\n";
+    o << "[GRACE-3L] profile (wall), s:\n";
     for (int q = 0; q < P_N; q++) {
       char b[160];
       std::snprintf(b, sizeof(b), "  %-16s %10.4f  %5.1f %%\n", P_NAME[q], g3_prof[q], 100.0 * g3_prof[q] / std::max(tot, 1e-30));
       o << b;
     }
-    o << "[grace/3l/fused] thread 0 categories, s (L1 L2 L3):\n";
+    o << "[GRACE-3L] thread 0 categories, s (L1 L2 L3):\n";
     for (int c = 0; c < C_N; c++) {
       char b[160];
       std::snprintf(b, sizeof(b), "  %-16s %9.4f %9.4f %9.4f\n", C_NAME[c], g3_cat[0][c], g3_cat[1][c], g3_cat[2][c]);
       o << b;
     }
-    o << "[grace/3l/fused] thread 0 chain operations, s (fwd bwd):\n";
+    o << "[GRACE-3L] thread 0 chain operations, s (fwd bwd):\n";
     for (int q = 0; q < O_N; q++) {
       char b[160];
       std::snprintf(b, sizeof(b), "  %-16s %9.4f %9.4f\n", O_NAME[q], g3_op[0][q], g3_op[1][q]);
@@ -247,7 +247,7 @@ void Grace3LFused::setup_types(int ntypes_, const std::vector<int> &t2m)
 {
   ntypes = ntypes_;
   type2mu = t2m;
-  check_type2mu(type2mu, ntypes, model->n_elements, "grace/3l/fused");
+  check_type2mu(type2mu, ntypes, model->n_elements, "GRACE-3L");
   const int ntp = ntypes + 1;
   cutsq_flat.assign((size_t) ntp * ntp, 0.0);
   cutsq_rows.resize(ntp);
@@ -268,8 +268,8 @@ double Grace3LFused::cutoff(int i, int j) const
 
 void Grace3LFused::enable_uq()
 {
-  if (!net) throw Error("grace/3l/fused: setup_types() before enable_uq()");
-  if (!net->has_uq) throw Error("grace/3l/fused: the model has no UQ head (kokkos.npz exported without UQ artifacts)");
+  if (!net) throw Error("GRACE-3L: setup_types() before enable_uq()");
+  if (!net->has_uq) throw Error("GRACE-3L: the model has no UQ head (kokkos.npz exported without UQ artifacts)");
   uq_ready = true;
 }
 
@@ -281,7 +281,7 @@ void Grace3LFused::ensure_threads(int nth)
   for (int t = 0; t < nthreads; t++) work.emplace_back(new Work());
   if (gemm::blas_thread_unsafe() && nthreads > 1 && !gemm::force_builtin()) {
     gemm::force_builtin() = true;
-    log.warn("grace/3l/fused: the linked OpenBLAS uses pthreads and is not safe to call from several OpenMP threads; "
+    log.warn("GRACE-3L: the linked OpenBLAS uses pthreads and is not safe to call from several OpenMP threads; "
              "using the built-in GEMM. Link a sequential or OpenMP BLAS (e.g. BLA_VENDOR=Intel10_64lp_seq) to use it");
   }
 }
@@ -357,21 +357,6 @@ int find_name(const std::vector<std::string> &names, const std::string &n)
   return -1;
 }
 
-// host memory in MB from /proc/meminfo (MemTotal, MemAvailable); 0 when unreadable
-void host_memory_mb(double &total, double &avail)
-{
-  total = avail = 0.0;
-  if (FILE *f = std::fopen("/proc/meminfo", "r")) {
-    char key[64];
-    double kb;
-    while (std::fscanf(f, "%63s %lf kB", key, &kb) == 2) {
-      if (!std::strcmp(key, "MemTotal:")) total = kb / 1024.0;
-      if (!std::strcmp(key, "MemAvailable:")) avail = kb / 1024.0;
-    }
-    std::fclose(f);
-  }
-}
-
 }    // namespace
 
 void Grace3LFused::build_net()
@@ -380,7 +365,7 @@ void Grace3LFused::build_net()
   const double spline_mb = set.spline_mb;
   const bool store_fwd = set.store_fwd;
   auto arch = [&](bool ok, const std::string &why) {
-    if (!ok) throw Error("grace/3l/fused supports only the GRACE-3L-OMAT-large architecture: " + why);
+    if (!ok) throw Error("GRACE-3L: the CPU engine supports only the GRACE-3L-OMAT-large architecture: " + why);
   };
   net = std::make_unique<Net>();
   Net &n = *net;
@@ -423,12 +408,12 @@ void Grace3LFused::build_net()
   double budget = spline_mb;
   if (budget < 0.0) {    // auto: a quarter of the host memory per process, within what is available
     double total = 0.0, avail = 0.0;
-    host_memory_mb(total, avail);
+    fused::host_memory_mb(total, avail);
     budget = std::max(2048.0, std::min(0.25 * total, avail) / std::max(1, set.ranks_per_node));
   }
   const bool use_mlp = table_mb > budget;
   if (use_mlp)
-    log.info(str("[grace/3l/fused] radial MLP by GEMM: tables for ", n.nsp * n.nsp, " species pairs would need ",
+    log.info(str("[GRACE-3L] radial MLP by GEMM: tables for ", n.nsp * n.nsp, " species pairs would need ",
                  (long) table_mb, " MB > spline_mb ", (long) budget, "\n"));
 
   std::vector<std::string> prod_names, red_names, fc_names;
@@ -871,14 +856,15 @@ void Grace3LFused::build_net()
         off += n.L[k].nc[R.role[j]] * (int) R.ci[j].size();
       }
     }
+    n.uq_off[3] = off;
     if (off != m.uq_d_basis)
-      throw Error(str("grace/3l/fused UQ: basis width ", off, " != uq_rp_matrix rows ", m.uq_d_basis));
+      throw Error(str("GRACE-3L UQ: basis width ", off, " != uq_rp_matrix rows ", m.uq_d_basis));
     if (m.uq_n_elements != m.n_elements || m.uq_feature_dim != m.uq_rp_dim + m.uq_n_density || m.uq_n_density > 4)
-      throw Error(str("grace/3l/fused UQ: inconsistent UQ head (elements ", m.uq_n_elements, " / ", m.n_elements,
+      throw Error(str("GRACE-3L UQ: inconsistent UQ head (elements ", m.uq_n_elements, " / ", m.n_elements,
                       ", D ", m.uq_feature_dim, ", RP ", m.uq_rp_dim, ", density ", m.uq_n_density, ")"));
   }
   nmax = 0;    // reallocate the per-atom arrays with the new widths
-  log.info(str("[grace/3l/fused] ", n.nsp, " species, radial tables ", (long) table_mb, " MB (N = ", spline_n_of(set, 0),
+  log.info(str("[GRACE-3L] ", n.nsp, " species, radial tables ", (long) table_mb, " MB (N = ", spline_n_of(set, 0),
                " ", spline_n_of(set, 1), " ", spline_n_of(set, 2), "), largest block tensor ",
                n.maxten, " floats/atom, store_fwd ", store_fwd ? "yes" : "no", " (",
                store_fwd ? (g->stw[0] + g->stw[1]) * 4 / 1024 : 0, " KB/atom); GEMM ", gemm::backend(),
@@ -1165,7 +1151,7 @@ void radial_mlp_block(const Layer &L, Grace3LFused::Work &w, const Grace3LFused:
    one layer over all local blocks: k = 0, 1, 2; bwd: reverse pass (forces, message adjoints)
 ------------------------------------------------------------------------- */
 
-// UQ (schema v6 as grace/3l/fused/kk; projection in fp32, carried in fp32 over the layers; norms and GMM in fp64):
+// UQ (schema v6 as Grace3LFusedKK; projection in fp32, carried in fp32 over the layers; norms and GMM in fp64):
 // stream the rho reduce inputs of layer k (model order: instruction, channel, collected function) into the raw
 // projection z = B R and the block norm^2; after layer 3 the shared GMM (uq_gmm: normalise, density channels
 // [full, rho1, rho2, rho3], nearest centroid, Mahalanobis distance)
@@ -1175,31 +1161,39 @@ void Grace3LFused::uq_layer(int k, Work &w, Outputs &out)
   const GRACE3LModel &m = *model;
   const Layer &L = n.L[k];
   const Red &R = L.rho;
-  const int NB = set.block, RP = m.uq_rp_dim, D = m.uq_feature_dim;
-  const float *Rm = n.uq_rp.data();
+  const int NB = set.block, RP = m.uq_rp_dim, D = m.uq_feature_dim,
+            kb = n.uq_off[k + 1] - n.uq_off[k];    // basis width of layer k
+  w.s.ensure((size_t) w.nbat * kb, (size_t) w.nbat * RP);
   for (int a = 0; a < w.nbat; a++) {
-    const int i = w.atom[a];
-    float *z = g->uqz.data() + (size_t) i * RP;
+    float *bx = w.s.X.data() + (size_t) a * kb;
     double n2 = 0.0;
-    const float *row = Rm + (size_t) n.uq_off[k] * RP;
+    int col = 0;
     for (size_t j = 0; j < R.ins.size(); j++) {
       const int src = R.role[j], C = L.nc[src];
       const float *T = tv(w, src);
       for (int c = 0; c < C; c++)
         for (int f : R.ci[j]) {
           const float bv = T[((size_t) f * NB + a) * C + c];
+          bx[col++] = bv;
           n2 += (double) bv * bv;
-          for (int d = 0; d < RP; d++) z[d] += bv * row[d];
-          row += RP;
         }
     }
-    double *n2b = g->uqn2.data() + (size_t) i * 3;
-    n2b[k] = n2;
+    g->uqn2[(size_t) w.atom[a] * 3 + k] = n2;
+  }
+  // the built-in kernel, not a linked BLAS: the same z (so gamma / cluster) on every platform and thread count
+  gemm::gemm_builtin(w.nbat, RP, kb, 1.0f, w.s.X.data(), kb, n.uq_rp.data() + (size_t) n.uq_off[k] * RP, RP, 0.0f,
+                     w.s.Y.data(), RP);
+  for (int a = 0; a < w.nbat; a++) {
+    const int i = w.atom[a];
+    float *z = g->uqz.data() + (size_t) i * RP;
+    const float *zy = w.s.Y.data() + (size_t) a * RP;
+    vadd(z, zy, RP);
     if (k < 2) continue;
 
     if ((int) w.uqf.size() < D) { w.uqf.assign(D, 0.0); w.uqd.assign(D, 0.0); }
     double *fe = w.uqf.data();
     for (int d = 0; d < RP; d++) fe[d] = z[d];
+    const double *n2b = g->uqn2.data() + (size_t) i * 3;
     const double nrm = std::sqrt(n2b[0] + n2b[1] + n2b[2]);
     const double dens[4] = {nrm, std::sqrt(n2b[0]), std::sqrt(n2b[1]), std::sqrt(n2b[2])};
     fused::uq_gmm(m, n.mu_of_sp[w.sp], fe, w.uqd.data(), nrm, dens, out.gamma[i], out.atomic_sigma[i], out.gmm_cluster[i]);
@@ -1212,7 +1206,7 @@ void Grace3LFused::run_layer(int k, bool bwd, const Src &src, Outputs &out, cons
   Net &n = *net;
   const Layer &L = n.L[k];
   const int NB = set.block, nl = n.nl, nlm = n.nlm, C = L.C;
-  const bool store_fwd = set.store_fwd;
+  const bool store_fwd = store.kept && !fl.energy_only;    // no reverse pass reads the store under energy_only
   const int nblk = g->bstart.size();
   const BondFilter filt{cutsq_rows.data(), n.rcut_type.data(), ntypes + 1, fl.couple.eq ? &fl.couple : nullptr};
   const fused::SHCoefs shc{n.lmax, nlm, n.sh_a.data(), n.sh_b.data(), n.sh_c.data(), n.sh_d.data()};
@@ -1245,7 +1239,7 @@ void Grace3LFused::run_layer(int k, bool bwd, const Src &src, Outputs &out, cons
     for (int a = 0; a < w.nbat; a++) w.atom[a] = g->order[g->bstart[q] + a];
     w.ty = src.type[w.atom[0]];
     w.sp = n.sp_of_type[w.ty];
-    w.ft = g->fthr.of(tid);
+    w.ft = bwd ? g->fthr.of(tid) : nullptr;
     const bool pt = g3_prof_on && tid == 0;
     f3l::prof_on = pt;
     double tc = pt ? prof_now() : 0.0;
@@ -1346,11 +1340,15 @@ void Grace3LFused::run_layer(int k, bool bwd, const Src &src, Outputs &out, cons
         double hin[128], s[256], act[256];
         const double lin = (double) r1[0] + r2[0] + r3[0];
         for (int c = 0; c < nin; c++) hin[c] = (double) r1[c + 1] + r2[c + 1] + r3[c + 1];
+        for (int j = 0; j < nh; j++) s[j] = 0.0;
+        for (int c = 0; c < nin; c++) {
+          const double x = hin[c];
+          const double *row = n.eW0.data() + (size_t) c * nh;
+          for (int j = 0; j < nh; j++) s[j] += x * row[j];
+        }
         double e = 0.0;
         for (int j = 0; j < nh; j++) {
-          double v = 0.0;
-          for (int c = 0; c < nin; c++) v += n.eW0[(size_t) c * nh + j] * hin[c];
-          v *= n.en0;
+          const double v = s[j] * n.en0;
           s[j] = v;
           act[j] = n.e_act == 1 ? std::tanh(v) : v / (1.0 + std::exp(-v));
           e += n.eW1[j] * act[j];
@@ -1360,6 +1358,7 @@ void Grace3LFused::run_layer(int k, bool bwd, const Src &src, Outputs &out, cons
         w.E[a] = Ea;
         eng += Ea;
         if (eatom) eatom[i] += Ea;
+        if (!bwd) continue;
         float *d = g->dRn.data() + (size_t) i * wr;
         d[0] = (float) n.oscale;
         double ds[256];
@@ -1503,7 +1502,7 @@ void Grace3LFused::run_layer(int k, bool bwd, const Src &src, Outputs &out, cons
   }
   if (k == 2) out.energy += eng;
   if (g3_prof_on) {
-#pragma omp parallel
+#pragma omp parallel num_threads(nthreads)
     {
       if (thread_id() == 0) {
         g3_couple_tot += f3l::prof_couple;
@@ -1520,16 +1519,27 @@ void Grace3LFused::grow(int nmax_new)
   if (nmax_new <= nmax) return;
   nmax = 0;    // committed after the allocations: a failed one (std::bad_alloc) leaves the next call to grow again
   const size_t n = (size_t) nmax_new;
-  g->I1.assign(n * g->w1, 0.0f);
-  g->dI1.assign(n * g->w1, 0.0f);
-  g->I2.assign(n * g->w2, 0.0f);
-  g->dI2.assign(n * g->w2, 0.0f);
-  g->rho1.assign(n * g->wr, 0.0f);
-  g->rho2.assign(n * g->wr, 0.0f);
-  g->dRn.assign(n * g->wr, 0.0f);
-  for (int k = 0; k < 2; k++) {
-    g->st[k].clear();
-    if (set.store_fwd) g->st[k].assign(n * g->stw[k], 0.0f);
+  g->I1.assign(n * g->w1, 0.0f, nthreads);
+  g->dI1.assign(n * g->w1, 0.0f, nthreads);
+  g->I2.assign(n * g->w2, 0.0f, nthreads);
+  g->dI2.assign(n * g->w2, 0.0f, nthreads);
+  g->rho1.assign(n * g->wr, 0.0f, nthreads);
+  g->rho2.assign(n * g->wr, 0.0f, nthreads);
+  g->dRn.assign(n * g->wr, 0.0f, nthreads);
+  // store_fwd: decided here, once per size (the available memory changes between calls, the code path should not)
+  for (int k = 0; k < 2; k++) g->st[k].clear();
+  store = StoreInfo{};
+  if (set.store_fwd) {
+    store.need_gb = (double) n * (g->stw[0] + g->stw[1]) * sizeof(float) / 1e9;
+    store.limit_gb = fused::store_budget_gb(set.store_fwd_max_gb, set.ranks_per_node);
+    if (store.need_gb <= store.limit_gb) {
+      for (int k = 0; k < 2; k++) g->st[k].assign(n * g->stw[k], 0.0f, nthreads);
+      store.kept = true;
+    } else {
+      auto gb = [](double x) { return std::round(x * 10) / 10; };
+      log.warn(str("GRACE-3L: store_fwd would need ", gb(store.need_gb), " GB > limit ", gb(store.limit_gb),
+                   " GB; recomputing layers 1-2 in the reverse pass instead"));
+    }
   }
   g->lock.reset(n);
   nmax = nmax_new;
@@ -1541,10 +1551,10 @@ template<class Src>
 void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nodes, const Src &src, Exchange &ex,
                            Outputs &out, const ComputeFlags &fl, int nth)
 {
-  if (!net) throw Error("grace/3l/fused: setup_types() before compute()");
+  if (!net) throw Error("GRACE-3L: setup_types() before compute()");
   if (fl.couple.eq && (fl.couple.eq < 1 || fl.couple.eq > 4 || !fl.couple.mask))
-    throw Error("grace fused: two-group coupling needs eq 1..4 and the atom mask");
-  if (fl.uq && !uq_ready) throw Error("grace/3l/fused: enable_uq() before a compute with ComputeFlags::uq");
+    throw Error("GRACE-3L: two-group coupling needs eq 1..4 and the atom mask");
+  if (fl.uq && !uq_ready) throw Error("GRACE-3L: enable_uq() before a compute with ComputeFlags::uq");
   ensure_threads(std::max(nth, 1));
   grow(nmax_nodes);
   const int NB = set.block;
@@ -1566,20 +1576,20 @@ void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   for (int p = 0; p < inum;) {
     const int t = type[g->order[p]];
     if (type2mu[t] < 0)    // its per-type rows are not built (pair_style hybrid keeps it out of the list)
-      throw Error(str("grace/3l/fused: atom ", g->order[p], " of unmapped type ", t, " in the atom list"));
+      throw Error(str("GRACE-3L: atom ", g->order[p], " of unmapped type ", t, " in the atom list"));
     int e = p;
     while (e < inum && e - p < NB && type[g->order[e]] == t) e++;
     g->bstart.push_back(p);
     g->blen.push_back(e - p);
     p = e;
   }
-  g->fthr.ensure(nthreads, nmax_nodes);
+  if (!fl.energy_only) g->fthr.ensure(nthreads, nmax_nodes);
   uq_on = fl.uq;
   if (uq_on && inum > 0 && !(out.gamma && out.atomic_sigma && out.gmm_cluster))    // no atoms: nothing written
-    throw Error("grace/3l/fused: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
+    throw Error("GRACE-3L: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
   if (uq_on) {
-    g->uqz.assign((size_t) n_nodes * model->uq_rp_dim, 0.0f);
-    g->uqn2.assign((size_t) n_nodes * 3, 0.0);
+    g->uqz.assign((size_t) n_nodes * model->uq_rp_dim, 0.0f, nthreads);
+    g->uqn2.assign((size_t) n_nodes * 3, 0.0, nthreads);
   }
   for (auto &wp : work) {
     wp->want_vir = fl.virial && !fl.energy_only;
@@ -1599,15 +1609,16 @@ void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   if (fl.energy_only) {    // readout and UQ of layer 3 only: no reverse pass, forces and virials untouched
     run_layer(2, false, src, out, fl);
     tick(P_S5);
+    throw_zero_bond(work);
     return;
   }
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(nthreads)
   for (int i = 0; i < n_nodes; i++) std::memset(g->dI2.data() + (size_t) i * g->w2, 0, g->w2 * sizeof(float));
   run_layer(2, true, src, out, fl);
   tick(P_S5);
   ex.reverse(1);
   tick(P_S6);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(nthreads)
   for (int i = 0; i < n_nodes; i++) std::memset(g->dI1.data() + (size_t) i * g->w1, 0, g->w1 * sizeof(float));
   run_layer(1, true, src, out, fl);
   tick(P_S7);
@@ -1615,6 +1626,7 @@ void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   tick(P_S8);
   run_layer(0, true, src, out, fl);
   tick(P_S9);
+  throw_zero_bond(work);
   if (n_nodes > 0) g->fthr.reduce(out.f, n_nodes);
   tick(P_FRED);
   if (fl.virial)

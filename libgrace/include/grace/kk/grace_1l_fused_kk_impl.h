@@ -42,26 +42,27 @@ using namespace g1lf_detail;
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::setup()
 {
-  if (spline_n < 16) GRACE_KK_ERROR("grace/1l/fused/kk: spline N must be >= 16 (got {})", spline_n);
+  if (spline_n < 16) GRACE_KK_ERROR("GRACE-1L/KK: spline N must be >= 16 (got {})", spline_n);
   this->couple_supported = true;    // two-group coupling in the bond kernels
+  this->general_reduce_supported = true;    // its own reduce (build_red_meta): any collect_ind / w_l_tile layout
   Base::setup();
   const GRACE1LModel &m = *this->grace_model;
 #ifdef KOKKOS_ENABLE_CUDA
-  this->fc_cublas_max_N = 0;      // the base cuBLAS FC gather/GEMM scratch is never used here
+  this->fc_blas_max_N = 0;    // the base cuBLAS FC gather/GEMM scratch is never used here
   this->fc_op_AA1.active = false;
   this->fc_op_AA2.active = false;
 #endif
   const int nlm = (this->lmax + 1) * (this->lmax + 1);
   if (this->lmax > G1LF_MAX_LMAX)
-    GRACE_KK_ERROR("grace/1l/fused/kk: lmax {} > {} not supported", this->lmax, G1LF_MAX_LMAX);
+    GRACE_KK_ERROR("GRACE-1L/KK: lmax {} > {} not supported", this->lmax, G1LF_MAX_LMAX);
   if (this->nradmax * nlm > G1LF_TEAM * G1LF_MAX_ACC || this->nradmax > G1LF_TEAM || G1LF_TEAM % this->nradmax)
-    GRACE_KK_ERROR("grace/1l/fused/kk: radial width {} outside the compiled bond kernels", this->nradmax);
+    GRACE_KK_ERROR("GRACE-1L/KK: radial width {} outside the compiled bond kernels", this->nradmax);
   if (this->fc_n_out != G1LF_NO && this->fc_n_out != G1LF_NO_M)
-    GRACE_KK_ERROR("grace/1l/fused/kk: FC width {} not compiled (must be {} or {})", this->fc_n_out, G1LF_NO,
+    GRACE_KK_ERROR("GRACE-1L/KK: FC width {} not compiled (must be {} or {})", this->fc_n_out, G1LF_NO,
                      G1LF_NO_M);
-  if (this->rho_n_out != 17) GRACE_KK_ERROR("grace/1l/fused/kk: rho width must be 17");
+  if (this->rho_n_out != 17) GRACE_KK_ERROR("GRACE-1L/KK: rho width must be 17");
   if (this->nradmax > G1LF_NIN || this->nradmax > G1LF_NIR)
-    GRACE_KK_ERROR("grace/1l/fused/kk: nradmax {} > {}", this->nradmax, G1LF_NIR);
+    GRACE_KK_ERROR("GRACE-1L/KK: nradmax {} > {}", this->nradmax, G1LF_NIR);
   auto live = [](const GRACE1LModel::CGProduct &p, bool left, bool right) {
     std::vector<int> v;
     if (left) v.insert(v.end(), p.left_ind.begin(), p.left_ind.end());
@@ -74,7 +75,7 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
   build_fc_meta(fcm_A1, m.fc_A1, liveA1);
   build_fc_meta(fcm_AA1, m.fc_AA1, live(m.prod_AAA, true, false));
   build_fc_meta(fcm_AA2, m.fc_AA2, live(m.prod_AAAA, true, true));
-  this->log.info(fmt("grace/1l/fused/kk: live FC outputs A1 {}/{} AA1 {}/{} AA2 {}/{}\n", fcm_A1.nlive,
+  this->log.info(fmt("[GRACE-1L/KK] live FC outputs A1 {}/{} AA1 {}/{} AA2 {}/{}\n", fcm_A1.nlive,
                    fcm_A1.nf, fcm_AA1.nlive, fcm_AA1.nf, fcm_AA2.nlive, fcm_AA2.nf));
   build_prod_meta(pm_AA, m.prod_AA, true);
   build_prod_meta(pm_AAA, m.prod_AAA, false);
@@ -94,7 +95,7 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
     if (no_shape) shape_id = 0;
     ng_AAA = 0;
     for (int x : m.prod_AAA.left_ind) ng_AAA = std::max(ng_AAA, x + 1);
-    this->log.info(fmt("grace/1l/fused/kk: CG products {}\n",
+    this->log.info(fmt("[GRACE-1L/KK] CG products {}\n",
                      shape_id ? "specialised: GRACE-1L large shape" : "generic (tables differ from the compiled shape)"));
   }
   {
@@ -118,7 +119,7 @@ void Grace1LFusedKK<DeviceType, Traits>::build_spline_tables()
   const auto &layers = m.mlp_rad_layers;
   const int nout = layers.back().n_out;
   if (nout != this->nradmax * (this->lmax + 1))
-    GRACE_KK_ERROR("grace/1l/fused/kk: radial MLP output width mismatch");
+    GRACE_KK_ERROR("GRACE-1L/KK: radial MLP output width mismatch");
   std::vector<double> fv((size_t) (N + 1) * nout), dv((size_t) (N + 1) * nout);
   std::vector<double> g, dg, out, dout;
   for (int k = 0; k <= N; k++) {
@@ -528,11 +529,11 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd_c()
   };
   GraceFusedKK::fbwd_launch<DeviceType, G1LF_TEAM>("g1lf:bond_bwd", cs, shmem, body);
 }
-// dense-chain kernels and metadata: shared with grace/2l/fused/kk in grace_fused_kokkos_dense.h
+// dense-chain kernels and metadata: shared with Grace2LFusedKK in grace/kk/fused_dense.h
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::build_fc_meta(FCMeta &m, const GRACE1LModel::FCWeights &fc, const std::vector<int> &used)
 {
-  GraceFusedKK::build_fc_meta(m, fc, used, "grace/1l/fused/kk");
+  GraceFusedKK::build_fc_meta(m, fc, used, "GRACE-1L/KK");
 }
 
 template<class DeviceType, class Traits>
@@ -598,11 +599,11 @@ void Grace1LFusedKK<DeviceType, Traits>::build_red_meta()
     const auto &rw = *rws[x];
     const int nin = rw.n_in, nw = rw.w_shape > 0 ? rw.w_shape : 1;
     rm.nin[x] = nin; rm.nfi[x] = nfi[x]; rm.gbase[x] = gtot;
-    if (nin > G1LF_NIN) GRACE_KK_ERROR("grace/1l/fused/kk: rho source width {} > {}", nin, G1LF_NIN);
+    if (nin > G1LF_NIN) GRACE_KK_ERROR("GRACE-1L/KK: rho source width {} > {}", nin, G1LF_NIN);
     by_g.resize(gtot + nfi[x]);
     for (size_t c = 0; c < rw.collect_ind.size(); c++) {
       const int fi = rw.collect_ind[c], tile = rw.w_l_tile[c];
-      if (fi >= nfi[x] || tile >= nw) GRACE_KK_ERROR("grace/1l/fused/kk: rho reduce index out of range");
+      if (fi >= nfi[x] || tile >= nw) GRACE_KK_ERROR("GRACE-1L/KK: rho reduce index out of range");
       conns.push_back({x, fi, tile});
       by_g[gtot + fi].push_back(tile);
     }
@@ -623,16 +624,15 @@ void Grace1LFusedKK<DeviceType, Traits>::build_red_meta()
     rm.W[x] = W;
   }
   rm.gtot = gtot;
-  const int nc = conns.size();
-  rm.toff = V1<int>("g1lf:rho_nconn", 1);
+  const int nc = (int) conns.size();
+  rm.nconn = nc;
   rm.tx = V1<int>("g1lf:rho_tx", std::max(nc, 1)); rm.tfi = V1<int>("g1lf:rho_tfi", std::max(nc, 1));
   rm.ttile = V1<int>("g1lf:rho_ttile", std::max(nc, 1));
   {
-    auto hn = Kokkos::create_mirror_view(rm.toff); hn(0) = nc;
     auto hx = Kokkos::create_mirror_view(rm.tx); auto hf = Kokkos::create_mirror_view(rm.tfi);
     auto ht = Kokkos::create_mirror_view(rm.ttile);
     for (int c = 0; c < nc; c++) { hx(c) = conns[c][0]; hf(c) = conns[c][1]; ht(c) = conns[c][2]; }
-    Kokkos::deep_copy(rm.toff, hn); Kokkos::deep_copy(rm.tx, hx); Kokkos::deep_copy(rm.tfi, hf);
+    Kokkos::deep_copy(rm.tx, hx); Kokkos::deep_copy(rm.tfi, hf);
     Kokkos::deep_copy(rm.ttile, ht);
   }
   int tot = 0;
@@ -654,11 +654,7 @@ template<int NQ>
 void Grace1LFusedKK<DeviceType, Traits>::red_fwd()
 {
   const int cs = this->chunk_size, co = this->chunk_offset;
-  int nc = 0;
-  {
-    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), rm.toff);
-    nc = h(0);
-  }
+  const int nc = rm.nconn;
   const int nblk = (nc + G1LF_CC - 1) / G1LF_CC;
   auto W0 = rm.W[0]; auto W1 = rm.W[1]; auto W2 = rm.W[2]; auto W3 = rm.W[3];
   const int n0 = rm.nin[0], n1 = rm.nin[1], n2 = rm.nin[2], n3 = rm.nin[3];
@@ -853,3 +849,8 @@ void Grace1LFusedKK<DeviceType, Traits>::stage_bond_bwd(int, int) { fused_bond_b
 
 }    // namespace kk
 }    // namespace grace
+
+// the explicit instantiation of GRACE_KK_EXTERN_1L (grace/kk/grace_1l_fused_kk.h), in one translation unit
+#define GRACE_KK_INSTANTIATE_1L(Device, Traits)                        \
+  template class grace::kk::Grace1LKK<Device, float, float, Traits>; \
+  template class grace::kk::Grace1LFusedKK<Device, Traits>

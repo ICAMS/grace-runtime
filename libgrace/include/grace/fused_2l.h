@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE/pair_grace_2l_fused (lammps-ace, feature/grace-fused); contributing author:
-// Yury Lysogorskiy (ICAMS).
+// Contributing author: Yury Lysogorskiy (ICAMS).
 //
 // GRACE-2L fused CPU driver, fp32, one batch of up to NB same-type atoms per OpenMP thread at a time with
 // every per-atom tensor in a thread-private workspace, SIMD over channels. Per compute():
@@ -39,7 +38,7 @@ class Grace2LFused {
   void setup_types(int ntypes, const std::vector<int> &type2mu);
   double cutoff(int t1, int t2) const { return rcut_type[t1 * (ntypes + 1) + t2]; }
 
-  // UQ (uqv6 gamma_only, as grace/2l/kk): validates the model's UQ head against the built reduces; throws Error when
+  // UQ (uqv6 gamma_only, as Grace2LKK): validates the model's UQ head against the built reduces; throws Error when
   // the model has none or an unusable one. Afterwards compute() with ComputeFlags::uq fills Outputs::gamma etc.
   void enable_uq();
   bool uq_enabled() const { return uq_ready; }
@@ -57,6 +56,7 @@ class Grace2LFused {
   float *message() { return I_glob.data(); }
   float *message_grad() { return gI_sum.data(); }
   double memory_bytes() const;
+  const StoreInfo &store_info() const { return store; }
 
   struct Work;
 
@@ -66,15 +66,16 @@ class Grace2LFused {
   std::vector<double> cutsq_flat;                   // [ntypes+1][ntypes+1]
   std::vector<double *> cutsq_rows;
   std::vector<std::unique_ptr<Work>> work;
-  bool vflag_atom = false;          // per call (layer1_backward / layer2 read them as the LAMMPS style did)
+  bool vflag_atom = false;          // per call (layer1_backward / layer2 read them)
   double **vatom = nullptr;
 
   std::shared_ptr<const GRACE2LModel> model;
   int spline_n = 1024;
   int store_l1 = 1;                 // keep A, A1, AA1, AA2 per atom from P1 instead of recomputing layer 1 in P5
-  double store_l1_max_gb = 8.0;
+  double store_l1_max_gb = -1.0;    // < 0: auto (fused::store_budget_gb)
+  int ranks_per_node = 1;
   fused::SpreadBuf<float> l1_store;      // [nmax][nlm + nlm + nAA + nAA][P1]
-  bool l1_stored = false, warned_store = false;
+  StoreInfo store;                       // store_l1: kept or recomputed (decided when nmax grows)
 
   // dimensions
   int lmax = 0, nlm = 0, nl = 0;
@@ -152,6 +153,8 @@ class Grace2LFused {
   Outputs *uq_out = nullptr;
   bool eonly = false;                   // this compute(): ComputeFlags::energy_only (layer 2 stops after the energy)
   fused::SpreadBuf<double> uq_z, uq_n2l1;
+  // the atom's energy from rho and I2; grho = dE/drho and gI2 = dE/dI2, both skipped when grho is nullptr (energy only:
+  // pass both or neither)
   double energy_atom(const float *rho, const float *I2, int ty, double *grho, float *gI2) const;
   template<class Src> void bonds(Work &, const Src &, bool grad);
 };

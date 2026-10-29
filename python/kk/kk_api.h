@@ -20,14 +20,16 @@ bool initialized();
 int device();
 const char *arch();        // GPU architecture this module was built for, e.g. "sm86", "gfx90a"
 const char *platform();    // "cuda" (NVIDIA, Kokkos CUDA) or "rocm" (AMD, Kokkos HIP)
-const char *blas();        // GEMM library of the engines: "cublas", "rocblas", "kkgemm" (HIP: hand-written Kokkos GEMMs), ""
-bool cublas();             // cuBLAS in use (UQ projections); false: hand-written kernels
+const char *blas();        // GEMM library of the engines: "cublas", "rocblas", "kkgemm" (hand-written Kokkos GEMMs), ""
+bool cublas();             // cuBLAS in use (dense GEMMs); false: Kokkos GEMMs or hand-written kernels
 std::pair<size_t, size_t> memory_info();    // (free, total) bytes of the device (cudaMemGetInfo / hipMemGetInfo)
 void debug_track_alloc(bool on);                                  // diagnostics: live allocations by label
 std::vector<std::pair<std::string, uint64_t>> debug_live_alloc();
 uint64_t debug_peak_alloc();    // high-water mark of the bytes allocated since debug_track_alloc(true)
 // tests: the nth device allocation from now on whose label contains `label` fails as out of memory (nth <= 0: off)
 void debug_fail_alloc(const std::string &label, int nth);
+// tests: the nth engine launch check from now on reports a kernel launch that ran out of device memory (0: off)
+void debug_fail_launch(int nth);
 
 struct Result {
   double energy = 0.0;
@@ -44,13 +46,13 @@ struct Result {
   std::vector<double> dispersion_energies;    // [n]
 };
 
-// a loaded GRACE-1L / 2L kokkos.npz (host); its Systems / Batches share one engine on the device (weights, spline
+// a loaded GRACE-1L / 2L / 3L kokkos.npz or PACE npz (host); its Systems / Batches share one engine on the device (weights, spline
 // tables), each with its own species set (type tables switched per call)
 class Model {
  public:
-  Model(const std::string &path, int spline);
+  Model(const std::string &path, int spline, const std::string &asi = "");
   ~Model();
-  int layers() const;    // 1, 2 or 3
+  int layers() const;    // 1, 2 or 3 (GRACE); 0: a PACE model
   bool has_uq() const;
   void validate_uq() const;    // throws std::invalid_argument unless the UQ head is usable
   std::vector<std::string> element_names() const;
@@ -67,7 +69,7 @@ class System {
   // lacks or a model outside the fused kernels' limits
   // chunksize: atoms per engine pass (bounds the GPU memory of large structures; 0: all atoms in one pass; < 0: auto:
   // the engine's chunk from the free GPU memory, as LAMMPS chunksize auto - one pass while it fits; on a device
-  // allocation failure half that chunk, halved down to 1024, then a 'does not fit' error)
+  // allocation failure half that chunk, halved down to 512, then a 'does not fit' error)
   System(const Model &model, const std::vector<std::string> &species, double skin, int spline, int chunksize);
   ~System();
   double cutoff() const;    // largest pair cutoff of the species set

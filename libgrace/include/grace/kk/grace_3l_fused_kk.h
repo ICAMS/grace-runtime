@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-3L fused Kokkos engine (LAMMPS grace/3l/fused/kk, the only GRACE-3L Kokkos style): the fp32 engine Grace3LKK<float, float> (fp64 only in
-// r_ij, |r|, rhat, the cutoff envelope and the Chebyshev basis) with its fused stages switched on. The stages live in
-// the base engine behind flags, so this type adds no kernel instantiation of its own:
+// GRACE-3L fused Kokkos engine: the fp32 engine Grace3LKK<float, float> (fp64 only in r_ij, |r|, rhat, the cutoff
+// envelope and the Chebyshev basis) with its fused stages switched on. The stages live in the base engine behind flags,
+// so this type adds no kernel instantiation of its own:
 //   fc_fold      the FC A*_2a / A*_2b folded into the cp_l projections they feed;
 //   fuse_radial  the radial evaluated from the cubic tables inside the kernels that use it;
 //   spline_mb    auto (< 0): tables in up to a quarter of the device memory, so many species get them too.

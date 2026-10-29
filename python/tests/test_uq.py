@@ -105,7 +105,7 @@ def test_model_compute_uq(uqm):
 
 
 def test_more_gmm_clusters_than_max_is_rejected(uqm, tmp_path):
-    """uq_n_clusters[e] > uq_max_clusters would index the GMM arrays out of bounds (lammps-ace 3cd0775d99)."""
+    """uq_n_clusters[e] > uq_max_clusters would index the GMM arrays out of bounds."""
     src = UQ_MODELS["1l"]
     with np.load(src) as z:
         d = {k: z[k] for k in z.files}

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_npz.h (feature/grace-runtime a73b8b17ee): npz access of the GRACE-1L / 2L / 3L
-// loaders and the UQ head (private to libgrace: cnpy is not part of the public headers). Every array is read by its
-// stored dtype: a value is converted or rejected, never reinterpreted.
+// npz access of the GRACE-1L / 2L / 3L loaders and the UQ head (private to libgrace: cnpy is not part of the public
+// headers). Every array is read by its stored dtype: a value is converted or rejected, never reinterpreted.
 #ifndef GRACE_SRC_NPZ3_H
 #define GRACE_SRC_NPZ3_H
 #include "grace/error.h"
@@ -258,6 +257,26 @@ inline int npz_get_int_in(const cnpy::npz_t &npz, const std::string &key, int de
     throw bad_array(key, "is " + std::to_string(v) + ", expected a value in [" + std::to_string(lo) + ", " +
                              std::to_string(hi) + "]");
   return v;
+}
+
+// the newest grace_format_version of a GRACE kokkos.npz this build reads
+constexpr int kGraceFormatVersion = 1;
+
+// grace_model_kind / grace_format_version of a GRACE kokkos.npz (written by tensorpotential exports; older exports have
+// neither and load as before): the kind must be the loader's, the format one this build reads
+inline void check_grace_format(const cnpy::npz_t &npz, const char *kind)
+{
+  const bool described = npz.count("grace_model_kind") != 0;
+  if (described) {
+    const auto k = npz_names(npz, "grace_model_kind");
+    if (k.size() != 1) throw bad_array("grace_model_kind", "must hold one name");
+    if (k[0] != kind) throw Error(std::string(kind) + ": the file holds a " + k[0] + " model");
+  }
+  const int v = npz_get_int_scalar(npz, "grace_format_version", 0);
+  if (described && v < 1) throw bad_array("grace_format_version", "is missing or below 1 next to grace_model_kind");
+  if (v > kGraceFormatVersion)
+    throw Error(std::string(kind) + ": kokkos.npz format " + std::to_string(v) + ", this grace-runtime reads up to " +
+                std::to_string(kGraceFormatVersion) + "; update grace-runtime");
 }
 
 // the same, required (npz_get_int_in with a default outside [lo, hi] also requires the key)

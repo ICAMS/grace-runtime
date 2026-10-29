@@ -34,7 +34,7 @@ def load_cell(name):
 
 
 def load_ref(name, layer, n):
-    stem = FX / "ref_gpu" / f"{name}_{layer}_{'kk' if layer == '3l' else 'fused'}"    # 3L: frozen grace/3l/kk/mixed refs
+    stem = FX / "ref_gpu" / f"{name}_{layer}_{'kk' if layer == '3l' else 'fused'}"    # 3L: frozen refs of Grace3LKK<float, double>
     t = np.loadtxt(f"{stem}.thermo")
     d = np.loadtxt(f"{stem}.dump", skiprows=9)
     d = d[np.argsort(d[:, 0])]
@@ -290,10 +290,14 @@ def _need_blas():
 
 
 def test_blas_loaded_at_run_time(mod):
-    """cuBLAS / rocBLAS is loaded at run time (nvidia-cublas-cu12 preloaded by grace_runtime._cuda; the system rocBLAS),
-    not a link dependency"""
+    """cuBLAS / rocBLAS is loaded at run time (nvidia-cublas-cu12 preloaded by grace_runtime._cuda, before any system
+    cuBLAS; the system rocBLAS), not a link dependency"""
     _need_blas()
     assert mod.blas() == BLAS
+    if PLATFORM == "cuda":
+        from grace_runtime import _cuda
+        lib = _cuda.cublas_library()
+        assert lib["source"] == "wheel" and "/nvidia/cublas/lib/" in lib["path"], lib
 
 
 def test_uq_without_blas_matches(tmp_path):
@@ -343,10 +347,49 @@ def test_uq_without_cublas_is_cheap(model):
     assert ratio <= 1.8, f"UQ costs {100 * (ratio - 1):.0f} % without cuBLAS"
 
 
+E3L_TIME = """
+import sys, time, numpy as np
+from ase.build import bulk
+import os
+from grace_runtime import _gpu
+kk = _gpu.ensure_init(os.environ["GRACE_TEST_GPU"])
+at = bulk("W", "bcc", a=3.165, cubic=True).repeat((8, 8, 8))
+at.symbols[::3] = "Mo"
+ty = np.where(at.numbers == 74, 1, 2).astype(np.int32)
+pos, h = np.ascontiguousarray(at.positions), np.ascontiguousarray(at.cell.array)
+s = kk.System(kk.Model(sys.argv[1]), ["W", "Mo"])
+t = []
+for _ in range(3):
+    s.compute(ty, pos, h, [True] * 3)
+    t0 = time.perf_counter()
+    for _ in range(10):
+        s.compute(ty, pos, h, [True] * 3)
+    t.append(time.perf_counter() - t0)
+print(kk.blas() or "-", min(t))
+"""
+
+
+@pytest.mark.skipif(os.environ.get("GRACE_PERF_TESTS") != "1", reason="timing test: GRACE_PERF_TESTS=1 on an idle card")
+def test_3l_without_blas_is_not_much_slower():
+    """GRACE-3L energy + forces without cuBLAS / rocBLAS (the built-in Kokkos GEMMs) take at most twice the time with
+    it (L40S, RTX 2070: 1.4-1.5x; the hand-written fallback before the Kokkos GEMMs on CUDA: 13-16x), W/Mo 1024 atoms"""
+    _need_blas()
+    env = {k: v for k, v in os.environ.items() if k != NO_BLAS}
+    out = {}
+    for tag, e in (("blas", env), ("none", dict(env, **{NO_BLAS: "1"}))):
+        r = subprocess.run([sys.executable, "-c", E3L_TIME, str(MODELS["3l"])], capture_output=True, text=True, env=e,
+                           timeout=900)
+        assert r.returncode == 0, r.stderr[-2000:]
+        out[tag] = r.stdout.split()[-2:]
+    assert out["blas"][0] == BLAS and out["none"][0] == "kkgemm", out
+    ratio = float(out["none"][1]) / float(out["blas"][1])
+    assert ratio <= 2.0, f"3L without {BLAS}: {ratio:.1f}x the time with it"
+
+
 @pytest.mark.parametrize("cell", ["W54", "WMo54"])
 def test_3l_without_cublas_against_lammps(cell):
     """the hand-written kernels of the 3L engine (grace-runtime-cuda12 without the [cublas] extra; AMD without rocBLAS):
-    a fresh process with GRACE_RUNTIME_NO_CUBLAS=1 / NO_ROCBLAS=1 matches the frozen LAMMPS grace/3l/kk/mixed references (which used cuBLAS)"""
+    a fresh process with GRACE_RUNTIME_NO_CUBLAS=1 / NO_ROCBLAS=1 matches the frozen LAMMPS references of Grace3LKK<float, double> (which used cuBLAS)"""
     import subprocess
     import sys
     code = (

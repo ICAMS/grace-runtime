@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Two-group lambda coupling (alchemical decoupling; lammps-ace MR !43, Pablo Pena Cano). A bond between an atom of
-// group 1 and an atom of group 2 is stretched along its own direction, r -> r'(r, lambda); the model sees r' rhat_ij.
-// The forces are the gradient of the stretched energy: the radial part of a bond force is multiplied by dr'/dr, the
-// angular part keeps the true 1/r (the r'/r of the Jacobian cancels the model's 1/r'), the virial uses the true r_ij.
-// A bond with r' >= rc is dropped (the cutoff envelope and its derivative vanish at rc). dE/dlambda is the sum over the
+// Two-group lambda coupling (alchemical decoupling; contributed by Pablo Pena Cano). A bond between an atom of group 1
+// and an atom of group 2 is stretched along its own direction, r -> r'(r, lambda); the model sees r' rhat_ij. The
+// forces are the gradient of the stretched energy: the radial part of a bond force is multiplied by dr'/dr, the angular
+// part keeps the true 1/r (the r'/r of the Jacobian cancels the model's 1/r'), the virial uses the true r_ij. A bond
+// with r' >= rc is dropped (the cutoff envelope and its derivative vanish at rc). dE/dlambda is the sum over the
 // stretched bonds of dE/dr' dr'/dlambda. Host and device (CUDA / HIP) code.
 #pragma once
 

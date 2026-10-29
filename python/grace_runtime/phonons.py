@@ -13,9 +13,10 @@ def phonopy_forces_batch(model, phonons, device: str = "auto", **kwargs) -> list
     """Forces of the displaced supercells of phonopy.Phonopy objects, all in one compute_batch, each minus the forces
     of its undisplaced supercell (phonopy's --fz: the residual forces of an imperfect relaxation drop out).
 
-    model: as eos_batch. phonons: Phonopy objects with displacements generated (any scheme: generate_displacements
-        with its options, random displacements, a dataset set by hand).
-    device and other keyword arguments: to compute_batch.
+    model: as eos_batch.
+    phonons: Phonopy objects with displacements generated (any scheme: generate_displacements with its options,
+        random displacements, a dataset set by hand).
+    device: as compute_batch; other keyword arguments are forwarded to compute_batch.
 
     Sets `.forces` of each Phonopy and returns the list; then e.g. produce_force_constants of phonopy.
     """
@@ -51,12 +52,13 @@ def phonons_batch(model, structures, supercell=None, min_length: float = 10.0, d
     """Phonons of each structure by finite displacements with phonopy (pip install phonopy): the displaced supercells
     of all structures go through one compute_batch (phonopy_forces_batch).
 
-    model: as eos_batch. structures: periodic ASE Atoms with relaxed cells (e.g. relax_batch(cell_filter="frechet");
-        the residual forces drop out, see phonopy_forces_batch); masses set on them are used.
-    supercell: n (n x n x n), 3 repeats or a 3x3 matrix, for every structure; None (default): for each structure the
-        smallest diagonal supercell of its cell with all lattice-plane spacings >= min_length (A).
+    model: as eos_batch.
+    structures: periodic ASE Atoms with relaxed cells (e.g. relax_batch(cell_filter="frechet"); the residual forces
+        drop out, see phonopy_forces_batch); masses set on them are used.
+    supercell, min_length: n (n x n x n), 3 repeats or a 3x3 matrix, for every structure; None (default): for each
+        structure the smallest diagonal supercell of its cell with all lattice-plane spacings >= min_length (A).
     distance: phonopy's displacement amplitude (A).
-    device and other keyword arguments: to compute_batch.
+    device: as compute_batch; other keyword arguments are forwarded to compute_batch.
 
     Returns one phonopy.Phonopy per structure with its forces and symmetrised force constants (the acoustic sum rule;
     produce_force_constants() again gives them unsymmetrised): then e.g. run_mesh, run_total_dos,

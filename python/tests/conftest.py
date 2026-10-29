@@ -34,6 +34,15 @@ def model_2l_nouq(models, tmp_path_factory):
     return strip_uq(models["2l"], tmp_path_factory.mktemp("nouq") / "kokkos.npz")
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _free_gpu_after_module():
+    """GPU engines stay cached until free_gpu_memory(): without this, the engines of all earlier test files add up in
+    one pytest process and later GPU tests (and their child processes) run out of memory on 8 GB cards."""
+    yield
+    from grace_runtime import free_gpu_memory
+    free_gpu_memory()
+
+
 
 # Release gates set GRACE_TEST_ALLOW_SKIP to a regular expression: a skip whose reason does not match it fails the run
 # (listed at the end), so a missing model, GPU module or package cannot pass a gate as a skip.

@@ -5,7 +5,7 @@ grace_runtime._rocm through the entry point group grace_runtime.backends."""
 import re
 from pathlib import Path
 
-ABI = 5             # = grace_runtime._gpu.ABI (the C++ interface kk_api.h of the modules)
+ABI = 6             # = grace_runtime._gpu.ABI (the C++ interface kk_api.h of the modules)
 PLATFORM = "rocm"   # grace_runtime._gpu.plugins: an AMD backend (a plug-in without PLATFORM is CUDA)
 ROCM_MAJOR = 6      # soname major of the HIP runtime the modules link (libamdhip64.so.6)
 

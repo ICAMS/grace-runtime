@@ -4,8 +4,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "grace-runtime"
-version = "0.0.1.dev1"
-description = "Native CPU inference of GRACE interatomic potentials with an ASE calculator"
+version = "0.1.0"
+description = "Fast CPU and GPU inference of GRACE and PACE interatomic potentials with ASE, batching and TorchSim"
 requires-python = ">=3.10"
 license = { text = "Academic Software License (ASL); bundled third-party code: see THIRD_PARTY_NOTICES.md" }
 classifiers = ["License :: Other/Proprietary License"]
@@ -21,7 +21,7 @@ Issues = "https://github.com/ICAMS/grace-runtime/issues"
 [project.optional-dependencies]
 torchsim = ["torch>=2; python_version >= '3.12'", "torch-sim-atomistic>=0.6; python_version >= '3.12'"]
 phonons = ["phonopy>=2.20"]
-test = ["pytest"]
+test = ["pytest", "pyyaml"]
 
 [tool.scikit-build]
 # pyproject at the repository root so the sdist carries libgrace/ and cmake/ next to python/

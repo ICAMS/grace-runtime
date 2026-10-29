@@ -1,0 +1,76 @@
+site_name: grace-runtime
+site_description: Fast GRACE interatomic potentials on CPU and GPU
+repo_url: https://github.com/ICAMS/grace-runtime
+edit_uri: edit/master/docs/
+
+theme:
+  name: material
+  icon:
+    logo: material/library
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.expand
+    - navigation.tracking
+  palette:
+    - media: "(prefers-color-scheme)"
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+nav:
+  - Getting started:
+      - Overview: index.md
+      - Installation: installation.md
+      - GPU backends: backends.md
+      - Models: models.md
+  - Guides:
+      - ASE and batch workflows: usage.md
+      - Relaxation: relax.md
+      - Properties: properties.md
+      - Dispersion: dispersion.md
+      - PACE models: pace.md
+      - TorchSim: torchsim.md
+  - Reference:
+      - Performance and diagnostics: advanced.md
+      - API reference: api.md
+      - Development: development.md
+
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: "#"
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+
+hooks:
+  - docs/hooks/api_reference.py
+
+exclude_docs: |
+  /hooks/
+  /requirements.txt
+
+watch:
+  - python/grace_runtime
+  - python/src/core.cpp

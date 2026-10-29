@@ -3,6 +3,8 @@
 // GRACE-1L / 2L bond kernels), the build switches they depend on, and the on / off decision of those kernels.
 #pragma once
 
+#include "grace/kk/support.h"    // env_switch
+
 #include <Kokkos_Core.hpp>
 
 #include <string>
@@ -66,6 +68,7 @@ inline KernelChoice wave64_switch(const char *var, int env)
                           : std::string("no 64-lane wavefronts in this build target")};
 #endif
 }
+inline KernelChoice wave64_switch(const char *var) { return wave64_switch(var, env_switch(var)); }
 inline KernelChoice mfma_switch(const char *var, int env, bool fits)
 {
   const std::string v(var);

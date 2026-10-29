@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // Hand-written fp32 GEMM in Kokkos (no BLAS library): C = alpha op(A) op(B) + beta C, column-major operands as in
-// BLAS, batched either by strides or by device pointer arrays, launched on the execution space instance exec. Used on
-// HIP by grace/kk/blas.h when rocBLAS is not loaded, so the engines' GEMM paths do not need a BLAS library.
-// Generic (sgemm_tiled): team per (batch, 64 x 64 tile of C), 256 threads with a 4 x 4 register tile each (rows
-// tx + 16 r, columns ty + 16 c), k in steps of 16 through padded team scratch; fp32 accumulation in k order.
-// beta == 0 does not read C (both kernels).
+// BLAS, batched either by strides or by device pointer arrays, launched on the execution space instance exec. Used by
+// grace/kk/blas.h when cuBLAS (CUDA) or rocBLAS (HIP) is not loaded, so the engines' GEMM paths do not need a BLAS
+// library. Kernels: sgemm_reg on CUDA (register-blocked tiles chosen by m and n), sgemm_mfma on CDNA, sgemm_tiled on
+// other HIP targets. Generic (sgemm_tiled): team per (batch, 64 x 64 tile of C), 256 threads with a 4 x 4 register
+// tile each (rows tx + 16 r, columns ty + 16 c), k in steps of 16 through padded team scratch; fp32 accumulation in k
+// order. beta == 0 does not read C (all kernels).
 #pragma once
 
 #include "grace/kk/kk_mfma.h"    // GRACE_KK_GEMM_MFMA, GRACE_KK_MFMA_DEVICE
 
 #include <Kokkos_Core.hpp>
 
+#include <cstdint>
 #include <type_traits>
 
 namespace grace {
@@ -99,6 +101,141 @@ void sgemm_tiled(const Exec &exec, int m, int n, int k, float alpha, const Ops &
     }
   });
 }
+
+#if defined(KOKKOS_ENABLE_CUDA)    // CUDA only (float4 loads); the dispatcher uses it for Kokkos::Cuda
+// Register-blocked variant (sgemm_reg): team of 256 threads per (batch, BM x BN tile of C), thread (tx, ty) of a
+// (BM / TM) x (BN / TN) grid holds a TM x TN register tile (rows tx + (BM / TM) r, columns ty + (BN / TN) c: the
+// team-scratch reads of a warp are consecutive or broadcast); k steps of BK through team scratch, the next step's
+// global loads issued into registers before the current step's products (one-stage software pipeline). fp32
+// accumulation in k order, as sgemm_tiled.
+template<class Exec, bool TA, bool TB, int BM, int BN, int TM, int TN, int BK, class Ops>
+void sgemm_reg(const Exec &exec, int m, int n, int k, float alpha, const Ops &ops, int lda, int ldb, float beta, int ldc,
+               int batch)
+{
+  constexpr int NT = 256, MB = 2, GX = BM / TM, GY = BN / TN, LA = BM + 4, LB = BN + 4;
+  static_assert(GX * GY == NT, "sgemm_reg: (BM / TM) (BN / TN) must be the team size");
+  constexpr int NAL = BM * BK / NT, NBL = BN * BK / NT;
+  static_assert(NAL * NT == BM * BK && NBL * NT == BN * BK, "sgemm_reg: tile loads must divide the team");
+  if (m <= 0 || n <= 0 || batch <= 0) return;
+  const int tm = (m + BM - 1) / BM, tn = (n + BN - 1) / BN;
+  // MB = 2: teams per multiprocessor the registers are budgeted for (at most 128 per thread)
+  using policy_t = Kokkos::TeamPolicy<Exec, Kokkos::LaunchBounds<NT, MB>>;
+  using member_t = typename policy_t::member_type;
+  const size_t shm = sizeof(float) * BK * (LA + LB);
+  policy_t pol(exec, (long) batch * tm * tn, NT);
+  pol = pol.set_scratch_size(0, Kokkos::PerTeam(shm));
+  Kokkos::parallel_for("kk:sgemm_reg", pol, KOKKOS_LAMBDA(const member_t &t) {
+    float *As = (float *) t.team_shmem().get_shmem(sizeof(float) * BK * (LA + LB));
+    float *Bs = As + BK * LA;
+    const int lr = t.league_rank(), b = lr / (tm * tn), rr = lr - b * (tm * tn);
+    const int bj = rr / tm, bi = rr - bj * tm;
+    const float *A = ops.a(b), *B = ops.bm(b);
+    float *C = ops.c(b);
+    const int tid = t.team_rank(), tx = tid % GX, ty = tid / GX;
+
+    const int i0 = bi * BM, j0 = bj * BN;
+    float acc[TM][TN];
+#pragma unroll
+    for (int r = 0; r < TM; r++)
+#pragma unroll
+      for (int c = 0; c < TN; c++) acc[r][c] = 0.0f;
+    float ra[NAL], rb[NBL];
+    // global -> registers: contiguous reads along i for op(A) = A, along k for A^T; along k for op(B) = B, j for B^T
+    // 16-byte global reads of op(A) = A (and op(B) = B^T) when the operand is 16-byte aligned with ld % 4 == 0: the
+    // thread's NAL elements as NAL / 4 groups of 4 consecutive rows (columns); scratch layout as in the scalar loads
+    constexpr bool QA = !TA && NAL % 4 == 0, QB = TB && NBL % 4 == 0;
+    const bool qa = QA && lda % 4 == 0 && ((std::uintptr_t) A & 15) == 0 && i0 + BM <= m;
+    const bool qb = QB && ldb % 4 == 0 && ((std::uintptr_t) B & 15) == 0 && j0 + BN <= n;
+    auto load = [&](int k0) {
+      if (qa) {
+#pragma unroll
+        for (int u = 0; u < NAL / 4; u++) {
+          const int e = 4 * (tid + u * NT), ii = e % BM, kk = e / BM, gk = k0 + kk;
+          float4 v = {0.0f, 0.0f, 0.0f, 0.0f};
+          if (gk < k) v = *reinterpret_cast<const float4 *>(A + i0 + ii + (long) gk * lda);
+          ra[4 * u] = v.x; ra[4 * u + 1] = v.y; ra[4 * u + 2] = v.z; ra[4 * u + 3] = v.w;
+        }
+      } else {
+#pragma unroll
+        for (int u = 0; u < NAL; u++) {
+          const int e = QA ? 4 * (tid + (u / 4) * NT) + u % 4 : tid + u * NT;
+          const int ii = TA ? e / BK : e % BM, kk = TA ? e % BK : e / BM;
+          const int gi = i0 + ii, gk = k0 + kk;
+          ra[u] = (gi < m && gk < k) ? (TA ? A[gk + (long) gi * lda] : A[gi + (long) gk * lda]) : 0.0f;
+        }
+      }
+      if (qb) {
+#pragma unroll
+        for (int u = 0; u < NBL / 4; u++) {
+          const int e = 4 * (tid + u * NT), jj = e % BN, kk = e / BN, gk = k0 + kk;
+          float4 v = {0.0f, 0.0f, 0.0f, 0.0f};
+          if (gk < k) v = *reinterpret_cast<const float4 *>(B + j0 + jj + (long) gk * ldb);
+          rb[4 * u] = v.x; rb[4 * u + 1] = v.y; rb[4 * u + 2] = v.z; rb[4 * u + 3] = v.w;
+        }
+      } else {
+#pragma unroll
+        for (int u = 0; u < NBL; u++) {
+          const int e = QB ? 4 * (tid + (u / 4) * NT) + u % 4 : tid + u * NT;
+          const int jj = TB ? e % BN : e / BK, kk = TB ? e / BN : e % BK;
+          const int gj = j0 + jj, gk = k0 + kk;
+          rb[u] = (gj < n && gk < k) ? (TB ? B[gj + (long) gk * ldb] : B[gk + (long) gj * ldb]) : 0.0f;
+        }
+      }
+    };
+    load(0);
+    for (int k0 = 0; k0 < k; k0 += BK) {
+#pragma unroll
+      for (int u = 0; u < NAL; u++) {
+        const int e = QA ? 4 * (tid + (u / 4) * NT) + u % 4 : tid + u * NT;
+        const int ii = TA ? e / BK : e % BM, kk = TA ? e % BK : e / BM;
+        As[kk * LA + ii] = ra[u];
+      }
+#pragma unroll
+      for (int u = 0; u < NBL; u++) {
+        const int e = QB ? 4 * (tid + (u / 4) * NT) + u % 4 : tid + u * NT;
+        const int jj = TB ? e % BN : e / BK, kk = TB ? e / BN : e % BK;
+        Bs[kk * LB + jj] = rb[u];
+      }
+      t.team_barrier();
+      if (k0 + BK < k) load(k0 + BK);
+#pragma unroll
+      for (int kk = 0; kk < BK; kk++) {
+        float a[TM], bb[TN];
+#pragma unroll
+        for (int r = 0; r < TM; r++) a[r] = As[kk * LA + tx + GX * r];
+#pragma unroll
+        for (int c = 0; c < TN; c++) bb[c] = Bs[kk * LB + ty + GY * c];
+#pragma unroll
+        for (int r = 0; r < TM; r++)
+#pragma unroll
+          for (int c = 0; c < TN; c++) acc[r][c] += a[r] * bb[c];
+      }
+      t.team_barrier();
+    }
+#pragma unroll
+    for (int c = 0; c < TN; c++) {
+      const int gj = j0 + ty + GY * c;
+      if (gj >= n) continue;
+#pragma unroll
+      for (int r = 0; r < TM; r++) {
+        const int gi = i0 + tx + GX * r;
+        if (gi >= m) continue;
+        float &o = C[gi + (long) gj * ldc];
+        o = beta == 0.0f ? alpha * acc[r][c] : alpha * acc[r][c] + beta * o;
+      }
+    }
+  });
+}
+template<class Exec, int BM, int BN, int TM, int TN, int BK, class Ops>
+void sgemm_reg_op(const Exec &exec, bool ta, bool tb, int m, int n, int k, float alpha, const Ops &ops, int lda, int ldb,
+                  float beta, int ldc, int batch)
+{
+  if (!ta && !tb) sgemm_reg<Exec, false, false, BM, BN, TM, TN, BK>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+  else if (!ta && tb) sgemm_reg<Exec, false, true, BM, BN, TM, TN, BK>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+  else if (ta && !tb) sgemm_reg<Exec, true, false, BM, BN, TM, TN, BK>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+  else sgemm_reg<Exec, true, true, BM, BN, TM, TN, BK>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+}
+#endif
 
 // CDNA (gfx90a, gfx94x; wave64; GRACE_KK_GEMM_MFMA, kk_mfma.h): the same GEMM on the fp32 matrix cores
 // (v_mfma_f32_32x32x2f32, full fp32 products and fp32 accumulation, as rocBLAS uses them); RDNA (wave32) and other
@@ -239,10 +376,21 @@ void sgemm(const Exec &exec, bool ta, bool tb, int m, int n, int k, float alpha,
     return;
   }
 #endif
-  if (!ta && !tb) sgemm_tiled<Exec, false, false>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
-  else if (!ta && tb) sgemm_tiled<Exec, false, true>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
-  else if (ta && !tb) sgemm_tiled<Exec, true, false>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
-  else sgemm_tiled<Exec, true, true>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+#if defined(KOKKOS_ENABLE_CUDA)
+  // register-blocked tiles by shape (L40S, the GRACE-3L shapes: m = chunk rows, n and k 16-128, 25 batches)
+  if constexpr (std::is_same_v<Exec, Kokkos::Cuda>) {
+    if (m <= 64) sgemm_reg_op<Exec, 64, 128, 4, 8, 16>(exec, ta, tb, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else if (n > 64) sgemm_reg_op<Exec, 128, 128, 8, 8, 8>(exec, ta, tb, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else if (n <= 32) sgemm_reg_op<Exec, 128, 32, 8, 2, 16>(exec, ta, tb, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else sgemm_reg_op<Exec, 128, 64, 8, 4, 8>(exec, ta, tb, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+  } else    // (no sgemm_tiled instantiations on CUDA)
+#endif
+  {
+    if (!ta && !tb) sgemm_tiled<Exec, false, false>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else if (!ta && tb) sgemm_tiled<Exec, false, true>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else if (ta && !tb) sgemm_tiled<Exec, true, false>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    else sgemm_tiled<Exec, true, true>(exec, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+  }
 }
 
 }    // namespace gemm

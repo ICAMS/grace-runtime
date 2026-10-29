@@ -1,4 +1,4 @@
-# TF reference of the two-group coupling, GRACE-2L-SMAX-OMAT-medium, WMo54; ref_cpl_tf.py, lmp lammps-ace feature/4d-decoupling bee68d9266
+# TF reference of the two-group coupling, GRACE-2L-SMAX-OMAT-medium, WMo54
 # mask (1 group 1, 2 group 2, 0 neither); then per case: case eq lambda E dE/dlambda vxx vyy vzz vxy vxz vyz, and 54 lines fx fy fz (eV, eV/A)
 mask 2 2 0 1 2 2 2 1 2 2 1 1 2 2 1 2 0 2 2 2 1 1 2 1 1 2 1 2 1 2 2 1 2 1 0 2 0 2 2 2 2 1 2 2 1 1 2 2 0 2 0 2 2 2
 case 0 0 -642.80004119873047 0 20.391703103430274 20.528505330167128 19.907803917391345 -0.4078737561723228 0.2420387734146234 0.076074515483612173

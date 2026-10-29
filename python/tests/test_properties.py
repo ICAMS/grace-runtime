@@ -229,3 +229,14 @@ def test_elastic_singular_keeps_keys():
     strains = np.linspace(-0.005, 0.005, 5)
     r = _elastic_from_stresses(strains, np.array([[C[:, j] * e for e in strains] for j in range(6)]))
     assert r["BH"] is None and r["S"] is None and np.isclose(r["BV"], 100.0)
+
+
+def test_eos_and_elastic_range_validation():
+    at = bulk("W", "bcc", a=3.17, cubic=True)
+    for bad in (0.0, -0.1, 1.0, 1.5, float("nan"), float("inf"), (30.0,), (30.0, 32.0, 34.0),
+                (30.0, 30.0), (0.0, 30.0), (-5.0, 30.0), (30.0, float("nan")), (30.0, float("inf"))):
+        with pytest.raises(ValueError, match="volume_range"):
+            eos_batch(None, [at], volume_range=bad)
+    for bad in (0.0, -0.005, 1.0, 2.0, float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError, match="eps_range"):
+            elastic_batch(None, [at], eps_range=bad)

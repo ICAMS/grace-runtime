@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-"""Native CPU inference of GRACE interatomic potentials (libgrace) with an ASE calculator."""
+"""Fast CPU and GPU inference of GRACE and PACE interatomic potentials with ASE, batching and TorchSim."""
 from importlib.metadata import PackageNotFoundError, version
 
 try:

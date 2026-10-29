@@ -75,7 +75,7 @@ def test_no_dispersion_unchanged(models):
 def test_energy_only_then_forces(models):
     c = MODEL_CASES[0]
     at = c["atoms"].copy()
-    at.calc = GRACERuntimeCalculator(models["1l"], device="cpu", dispersion=c["d3"])
+    at.calc = GRACERuntimeCalculator(models["1l"], device="cpu", dispersion=c["d3"], energy_only=True)
     e = at.get_potential_energy()
     assert "forces" not in at.calc.results and "dispersion_forces" not in at.calc.results
     _close(at.calc.get_property("dispersion_energy", at), c["energy"], 1e-9 * abs(c["energy"]))
@@ -89,7 +89,7 @@ def test_energies_then_forces(models):
     """per-atom energies of an earlier call get the correction once: a later forces-only call keeps them"""
     c = MODEL_CASES[0]
     at = c["atoms"].copy()
-    at.calc = GRACERuntimeCalculator(models["1l"], device="cpu", dispersion=c["d3"])
+    at.calc = GRACERuntimeCalculator(models["1l"], device="cpu", dispersion=c["d3"], energy_only=True)
     e1 = at.get_potential_energies().copy()
     at.get_forces()
     _close(at.get_potential_energies(), e1, 1e-12)

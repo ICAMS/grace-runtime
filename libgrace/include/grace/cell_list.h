@@ -22,6 +22,16 @@ inline int64_t bin_reach(double rc, double w, int64_t nbin, bool pbc)
   return pbc ? r : std::min(r, nbin - 1);
 }
 
+// a cell (rows a, b, c = the three cell vectors) the neighbour search can use: |det| above 1e-12 |a| |b| |c|, so a
+// nearly flat cell is rejected (its inverse and bin counts blow up) as well as a singular one
+inline bool full_rank_cell(const double *a, double det)
+{
+  const double na = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  const double nb = std::sqrt(a[3] * a[3] + a[4] * a[4] + a[5] * a[5]);
+  const double nc = std::sqrt(a[6] * a[6] + a[7] * a[7] + a[8] * a[8]);
+  return std::abs(det) > 1e-12 * na * nb * nc;
+}
+
 class CellList {
  public:
   // pos [n][3] in the caller's order, cell [3][3] (rows = vectors, full rank; open directions padded by the caller),
@@ -31,9 +41,15 @@ class CellList {
     if (!(bin_size > 0.0) || !std::isfinite(bin_size))
       throw std::invalid_argument("cell list: bin size must be positive");
     n_ = n;
+    max_bin_ = 0;
     for (int k = 0; k < 9; k++) cell_[k] = cell[k];
-    for (int k = 0; k < 3; k++) pbc_[k] = pbc[k];
+    for (int k = 0; k < 3; k++) {
+      pbc_[k] = pbc[k];
+      nbin_[k] = 1;
+      width_[k] = 1.0;
+    }
     perm_.assign(n, 0);
+    slot_.clear();
     start_.clear();
     xw_.assign(3 * n, 0.0);
     b3_.assign(3 * n, 0);
@@ -42,7 +58,8 @@ class CellList {
     const double *a = cell;
     const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) +
                        a[2] * (a[3] * a[7] - a[4] * a[6]);
-    if (!(std::abs(det) > 0.0)) throw std::invalid_argument("neighbour search needs a full-rank cell");
+    if (!std::isfinite(det) || !full_rank_cell(a, det))
+      throw std::invalid_argument("neighbour search needs a full-rank cell");
     const double d = 1.0 / det;
     const double inv[9] = {(a[4] * a[8] - a[5] * a[7]) * d, (a[2] * a[7] - a[1] * a[8]) * d,
                            (a[1] * a[5] - a[2] * a[4]) * d, (a[5] * a[6] - a[3] * a[8]) * d,
@@ -71,8 +88,12 @@ class CellList {
         lo[k] = mn;
         span[k] = std::max(mx - mn, 1e-12);
       }
-    for (int k = 0; k < 3; k++) nbin_[k] = std::max<int64_t>(1, (int64_t) std::floor(span[k] * h[k] / bin_size));
-    while (nbin_[0] * nbin_[1] * nbin_[2] > 8 * n + 64) {
+    const int64_t max_bins = 8 * n + 64;
+    for (int k = 0; k < 3; k++) {
+      const double nb = std::floor(span[k] * h[k] / bin_size);
+      nbin_[k] = (int64_t) std::min<double>(std::max(nb, 1.0), (double) max_bins);
+    }
+    while ((double) nbin_[0] * (double) nbin_[1] * (double) nbin_[2] > (double) max_bins) {
       const int k = (int) (std::max_element(nbin_, nbin_ + 3) - nbin_);
       nbin_[k] = std::max<int64_t>(1, nbin_[k] / 2);
     }

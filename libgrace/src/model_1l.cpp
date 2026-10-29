@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE (lammps-ace, feature/grace-fused); contributing author: Yury Lysogorskiy (ICAMS)
+// Contributing author: Yury Lysogorskiy (ICAMS)
 #include "grace/model_1l.h"
 #include "grace/error.h"
 
@@ -17,6 +17,7 @@ void GRACE1LModel::load_arrays(const cnpy::npz_t &npz) {
   // a second load into the same object (LAMMPS pair_coeff twice) must keep nothing of the previous model: arrays
   // read only when present (UQ head, optional blocks) would otherwise survive
   *this = GRACE1LModel();
+  check_grace_format(npz, "GRACE-1L");
 
   // Every array is checked against the model's declared sizes before anything is sized from it: the CPU and Kokkos
   // engines index these flat without bounds checks, so a truncated or corrupted file must fail here.
@@ -251,7 +252,7 @@ void GRACE1LModel::load_arrays(const cnpy::npz_t &npz) {
         throw Error("GRACE-1L/KK UQ: element index " + std::to_string(e) +
             " has no GMM clusters; uqv6 artifacts must cover all elements. Re-export the UQ "
             "artifacts with a current grace_utils.");
-      } else if (uq_n_clusters[e] > uq_max_clusters) {    // every GMM loop indexes the arrays by cluster (lammps-ace 3cd0775d99)
+      } else if (uq_n_clusters[e] > uq_max_clusters) {    // every GMM loop indexes the arrays by cluster
         throw Error("GRACE-1L/KK UQ: element index " + std::to_string(e) + " has " + std::to_string(uq_n_clusters[e]) +
             " GMM clusters, more than uq_max_clusters = " + std::to_string(uq_max_clusters));
       }

@@ -27,7 +27,13 @@ namespace cnpy {
             shape(_shape), word_size(_word_size), fortran_order(_fortran_order)
         {
             num_vals = 1;
-            for(size_t i = 0;i < shape.size();i++) num_vals *= shape[i];
+            for(size_t i = 0;i < shape.size();i++) {
+                if (shape[i] != 0 && num_vals > SIZE_MAX / shape[i])
+                    throw std::runtime_error("NpyArray: shape size overflow");
+                num_vals *= shape[i];
+            }
+            if (word_size != 0 && num_vals > SIZE_MAX / word_size)
+                throw std::runtime_error("NpyArray: byte size overflow");
             data_holder = std::shared_ptr<std::vector<char>>(
                 new std::vector<char>(num_vals * word_size));
         }

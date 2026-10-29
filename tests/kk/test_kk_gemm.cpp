@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // The hand-written Kokkos fp32 GEMMs of grace/kk/kk_gemm.h (C = alpha op(A) op(B) + beta C, column-major, batched by
-// strides or by device pointer arrays) against a host fp64 reference: the dispatcher sgemm, sgemm_tiled and, in builds
-// for CDNA GPUs, sgemm_mfma with each of its three tile shapes; m, n, k off the tile sizes, leading dimensions larger
-// than the matrices, beta 0 (C holds NaN: must not be read) and 0.5, op N / T on both sides. Elements of C outside
-// op(A) op(B) (padding rows, gaps between batches) must stay untouched. Tolerance: fp32 accumulation, per element
-// 2 (k + 2) u sum_k |alpha a b| + |beta c| (u = 2^-24). GPU backends only (the kernels use teams of 256 threads).
+// strides or by device pointer arrays) against a host fp64 reference: the dispatcher sgemm, sgemm_tiled, on CUDA
+// sgemm_reg with each of its four tile shapes and, in builds for CDNA GPUs, sgemm_mfma with each of its three tile
+// shapes; m, n, k off the tile sizes, leading dimensions larger than the matrices (odd, and multiples of 4 with
+// strides of multiples of 4: sgemm_reg's 16-byte loads), beta 0 (C holds NaN: must not be read) and 0.5, op N / T
+// on both sides. Elements of C outside op(A) op(B) (padding rows, gaps between batches) must stay untouched.
+// Tolerance: fp32 accumulation, per element 2 (k + 2) u sum_k |alpha a b| + |beta c| (u = 2^-24). GPU backends only
+// (the kernels use teams of 256 threads).
 // The same problems through grace/kk/blas.h (cuBLAS; on HIP rocBLAS or, without it, the kernels above). Every launch
 // goes to a second instance of the device (its own stream: the kernels' exec argument, blas::set_stream), and the
 // result is read back on that instance alone, without a device-wide fence.
@@ -36,6 +38,7 @@ bl::handle_t g_blas = nullptr;
 
 struct Case {
   int m, n, k, batch;
+  bool aligned = false;    // leading dimensions and batch strides multiples of 4 (else odd)
 };
 
 // one kernel variant: (ta, tb, ops) -> launch
@@ -46,11 +49,12 @@ template<bool TA, bool TB> struct Problem {
   std::vector<double> S, Sabs;          // sum_k a b and sum_k |a b| per (batch, i, j)
   Problem(const Case &c, std::mt19937 &rng) : m(c.m), n(c.n), k(c.k), batch(c.batch)
   {
-    lda = (TA ? k : m) + 3;
-    ldb = (TB ? n : k) + 5;
+    const int pa = c.aligned ? 4 : 3, pb = c.aligned ? 8 : 5;    // aligned: ld and strides multiples of 4
+    lda = ((TA ? k : m) + pa) / (c.aligned ? 4 : 1) * (c.aligned ? 4 : 1);
+    ldb = ((TB ? n : k) + pb) / (c.aligned ? 4 : 1) * (c.aligned ? 4 : 1);
     ldc = m + 7;
-    sA = (long long) lda * (TA ? m : k) + 11;
-    sB = (long long) ldb * (TB ? k : n) + 13;
+    sA = (long long) lda * (TA ? m : k) + (c.aligned ? 12 : 11);
+    sB = (long long) ldb * (TB ? k : n) + (c.aligned ? 16 : 13);
     sC = (long long) ldc * n + 17;
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     A.resize(sA * batch);
@@ -180,6 +184,22 @@ template<bool TA, bool TB> void run_ops(const Case &c, std::mt19937 &rng)
   run_variant(p, "sgemm_tiled", [&](const auto &ops, float alpha, float beta) {
     g::sgemm_tiled<Dev, TA, TB>(*g_ex, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
   });
+#if defined(KOKKOS_ENABLE_CUDA)
+  if constexpr (std::is_same_v<Dev, Kokkos::Cuda>) {    // each tile of the dispatcher, on every shape
+    run_variant(p, "sgemm_reg 64x128", [&](const auto &ops, float alpha, float beta) {
+      g::sgemm_reg<Dev, TA, TB, 64, 128, 4, 8, 16>(*g_ex, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    });
+    run_variant(p, "sgemm_reg 128x128", [&](const auto &ops, float alpha, float beta) {
+      g::sgemm_reg<Dev, TA, TB, 128, 128, 8, 8, 8>(*g_ex, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    });
+    run_variant(p, "sgemm_reg 128x32", [&](const auto &ops, float alpha, float beta) {
+      g::sgemm_reg<Dev, TA, TB, 128, 32, 8, 2, 16>(*g_ex, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    });
+    run_variant(p, "sgemm_reg 128x64", [&](const auto &ops, float alpha, float beta) {
+      g::sgemm_reg<Dev, TA, TB, 128, 64, 8, 4, 8>(*g_ex, m, n, k, alpha, ops, lda, ldb, beta, ldc, batch);
+    });
+  }
+#endif
 #if GRACE_KK_GEMM_MFMA
   if constexpr (std::is_same_v<Dev, Kokkos::HIP>) {
     run_variant(p, "sgemm_mfma 256x32", [&](const auto &ops, float alpha, float beta) {
@@ -284,15 +304,18 @@ int main(int argc, char **argv)
   std::printf("kk_gemm: blas %s\n", g_blas ? bl::name() : "none (not checked)");
 #endif
   std::mt19937 rng(12345);
-  // off-tile m / n / k (tiles: 64 x 64 x 16 tiled, 256 x 32 / 256 x 64 / 128 x 128 x 16 MFMA); the 3L shape last
+  // off-tile m / n / k (tiles: 64 x 64 x 16 tiled; 64 x 128 x 16, 128 x 128 x 8, 128 x 32 x 16, 128 x 64 x 8 reg;
+  // 256 x 32 / 256 x 64 / 128 x 128 x 16 MFMA); aligned: full tiles past the first through the 16-byte loads (k off
+  // BK); the 3L shape last
   const Case cases[] = {{37, 5, 3, 3}, {64, 64, 16, 2}, {129, 65, 17, 3}, {300, 33, 40, 2}, {200, 130, 50, 2},
-                        {1, 1, 1, 1}, {8192, 64, 128, 2}};
+                        {1, 1, 1, 1}, {300, 16, 40, 2}, {300, 260, 41, 2, true}, {520, 32, 23, 3, true},
+                        {8192, 64, 128, 2, true}};
   for (const Case &c : cases) {
     run_ops<false, false>(c, rng);
     run_ops<false, true>(c, rng);
     run_ops<true, false>(c, rng);
     run_ops<true, true>(c, rng);
-    std::printf("kk_gemm m %5d n %4d k %4d batch %d: ok\n", c.m, c.n, c.k, c.batch);
+    std::printf("kk_gemm m %5d n %4d k %4d batch %d%s: ok\n", c.m, c.n, c.k, c.batch, c.aligned ? " aligned" : "");
   }
 #ifdef GRACE_KK_GEMM
   if (g_blas) check_selftest_error();
