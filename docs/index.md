@@ -4,6 +4,12 @@ Run GRACE-1L, GRACE-2L and GRACE-3L interatomic potentials on CPU or GPU without
 CPU execution is standalone; GPU execution uses Kokkos for NVIDIA CUDA and AMD HIP.
 The kernels also run in LAMMPS, with MPI support.
 
+One call computes energy, forces and stress. On one NVIDIA H200 that takes about 1 µs per atom for GRACE-1L,
+3.5 µs for GRACE-2L and 13 µs for GRACE-3L (large OMAT models); a 16-core Xeon is 5 to 13 times slower.
+[Benchmarks](benchmarks.md) gives the setup and the largest system per GPU.
+
+![Time per atom for GRACE-1L, 2L and 3L on NVIDIA H200, AMD MI250X, NVIDIA L40S and a 16-core Xeon](images/benchmarks-time.png)
+
 Start with [installation](installation.md), then try a calculation below.
 The optional TorchSim adapter requires PyTorch and TorchSim.
 

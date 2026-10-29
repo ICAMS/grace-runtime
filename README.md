@@ -5,6 +5,12 @@ CPU execution is standalone; GPU execution uses Kokkos for NVIDIA CUDA and AMD H
 Use ASE-compatible calculators, batch processing, an optional TorchSim adapter or the shared kernels in LAMMPS with MPI.
 PACE (ACE) potentials fitted with pacemaker run from their `.yaml` ([PACE models](https://github.com/ICAMS/grace-runtime/blob/master/docs/pace.md)).
 
+One call computes energy, forces and stress. On one NVIDIA H200 that takes about 1 µs per atom for GRACE-1L,
+3.5 µs for GRACE-2L and 13 µs for GRACE-3L (large OMAT models); a 16-core Xeon is 5 to 13 times slower.
+[Benchmarks](https://github.com/ICAMS/grace-runtime/blob/master/docs/benchmarks.md) gives the setup and the largest system per GPU.
+
+![Time per atom for GRACE-1L, 2L and 3L on NVIDIA H200, AMD MI250X, NVIDIA L40S and a 16-core Xeon](https://raw.githubusercontent.com/ICAMS/grace-runtime/master/docs/images/benchmarks-time.png)
+
 **[Read the manual](https://github.com/ICAMS/grace-runtime/blob/master/docs/index.md)** · [Installation](https://github.com/ICAMS/grace-runtime/blob/master/docs/installation.md) · [API reference](https://github.com/ICAMS/grace-runtime/blob/master/docs/api.md)
 
 ## Install
