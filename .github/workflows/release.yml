@@ -26,7 +26,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: cpu-wheels
+          pattern: cpu-wheels*    # x86_64 and the sdist, macOS arm64
+          merge-multiple: true
           path: dist
       - name: version = release tag
         run: |
