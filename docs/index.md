@@ -48,6 +48,7 @@ print([r["energy"] for r in results])
 | Add DFT-D3 | [Dispersion](dispersion.md) |
 | Run PACE (ACE) models from pacemaker `.yaml` | [PACE models](pace.md) |
 | Use TorchSim integrators and optimizers | [TorchSim](torchsim.md) |
+| Build LAMMPS and run GRACE or PACE in it | [LAMMPS](lammps.md) |
 | Manage memory, threads and fallbacks | [Performance and diagnostics](advanced.md) |
 | Look up parameters, defaults, CLI and results | [API reference](api.md) |
 | Build and test | [Development](development.md) |
@@ -56,5 +57,5 @@ print([r["energy"] for r in results])
 
 The [LAMMPS fork](https://github.com/yury-lysogorskiy/lammps/tree/grace-runtime) supplies pair styles
 `grace/runtime` (CPU) and `grace/runtime/kk` (GPU) for GRACE-1L / 2L / 3L models (`kokkos.npz`), and
-`pace/runtime` / `pace/runtime/kk` for [PACE models](pace.md). Follow that repository's build instructions;
-installing the Python package does not install LAMMPS.
+`pace/runtime` / `pace/runtime/kk` for [PACE models](pace.md). Installing the Python package does not install
+LAMMPS: [LAMMPS](lammps.md) shows how to build it (CPU, CUDA, HIP) and run a first input.

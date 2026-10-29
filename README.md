@@ -46,8 +46,8 @@ The [manual](docs/index.md#guides) covers [batching and MD](docs/usage.md), [rel
 
 The [LAMMPS fork](https://github.com/yury-lysogorskiy/lammps/tree/grace-runtime) supplies pair styles
 `grace/runtime` (CPU) and `grace/runtime/kk` (GPU), which take the GRACE-1L / 2L / 3L model from the `kokkos.npz` given to
-`pair_coeff`, and `pace/runtime(/kk)` for PACE models. Follow that repository's build instructions; installing the
-Python package does not install LAMMPS.
+`pair_coeff`, and `pace/runtime(/kk)` for PACE models. Installing the Python package does not install LAMMPS:
+[build and run it](docs/lammps.md).
 
 ## Licence
 

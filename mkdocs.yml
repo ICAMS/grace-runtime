@@ -47,6 +47,7 @@ nav:
       - Dispersion: dispersion.md
       - PACE models: pace.md
       - TorchSim: torchsim.md
+      - LAMMPS: lammps.md
   - Reference:
       - Performance and diagnostics: advanced.md
       - API reference: api.md
