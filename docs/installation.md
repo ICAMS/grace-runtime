@@ -16,7 +16,7 @@ micromamba activate grace-runtime
 
 | Backend | Install | Wheel requirements |
 | --- | --- | --- |
-| CPU | `pip install grace-runtime` | Linux x86-64 (AVX2/FMA); macOS arm64 (Apple M1 and newer) |
+| CPU | `pip install grace-runtime` | Linux x86-64 (AVX2/FMA), also [WSL2 on Windows](#windows); macOS arm64 (Apple M1 and newer) |
 | NVIDIA CUDA 12 | `pip install "grace-runtime-cuda12[cublas]"` | Linux x86-64, compatible NVIDIA driver |
 | AMD ROCm 6 | `pip install grace-runtime-rocm6` | Linux x86-64, system ROCm 6.2+ |
 
@@ -37,11 +37,26 @@ grace-runtime info
 Then run the [first calculation](index.md#first-calculation). If a visible GPU cannot run natively,
 `grace-runtime info` returns 1; see [backend diagnostics](advanced.md#backend-diagnostics).
 
+## Windows
+
+Native Windows is not supported yet. Use [WSL2](https://learn.microsoft.com/windows/wsl/install) (Windows 10 or 11)
+with an Ubuntu distribution, and install the Linux packages inside it:
+
+```bash
+pip install grace-runtime                    # CPU
+pip install "grace-runtime-cuda12[cublas]"   # NVIDIA GPU
+grace-runtime info
+```
+
+NVIDIA GPUs work through the Windows NVIDIA driver ([CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/)):
+install the driver on Windows only, not inside WSL. `grace-runtime info` shows whether the GPU is visible.
+
 ## Build from source
 
 ### CPU from source
 
-If needed, install a compiler with C++17 and OpenMP support:
+If needed, install a compiler with C++17 and OpenMP support. Use GCC 12 or newer: older GCC builds much slower CPU
+kernels (with GCC 11 GRACE-3L about 37 % slower, with GCC 9 up to 6.6x slower).
 
 ```bash
 micromamba install -c conda-forge cxx-compiler
