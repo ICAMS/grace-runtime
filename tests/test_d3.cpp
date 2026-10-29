@@ -58,13 +58,22 @@ void test_formulas()
     CHECK(w[a] == (a == 4 ? 1.0 : 0.0));
   }
   grace::d3::weights(2.2, cref, grace::d3_data::kNRef[6], w, dw);
+  double w_nodw[grace::d3::kMaxRef];
+  grace::d3::weights(2.2, cref, grace::d3_data::kNRef[6], w_nodw, nullptr);
   double sw = 0.0, sdw = 0.0;
   for (int a = 0; a < grace::d3::kMaxRef; a++) {
+    CHECK(w_nodw[a] == w[a]);
     sw += w[a];
     sdw += dw[a];
   }
   CHECK_NEAR(sw, 1.0, 1e-14);
   CHECK_NEAR(sdw, 0.0, 1e-13);
+  const auto sa = grace::d3::atm_side<double>(9.0, rc, ron);
+  const auto sb = grace::d3::atm_side<double>(10.0, rc, ron);
+  const auto sc = grace::d3::atm_side<double>(11.0, rc, ron);
+  double dg[3];
+  const double eatm = grace::d3::atm<double>(sa, sb, sc, 100.0, dg);
+  CHECK(grace::d3::atm<double>(sa, sb, sc, 100.0, static_cast<double *>(nullptr)) == eatm);
   // dw/dCN against a central difference, near the references and ~10 from all of them (Gaussians ~1e-174: the
   // largest reference has w = 1 to round-off, so dw ~ 0; the form g dnorm / norm^2 gave -80 there)
   for (const double cn : {2.7, 7.0, 14.0}) {
@@ -102,6 +111,25 @@ void test_errors()
   const auto &q = grace::d3bj_preset("pbe");
   CHECK(q.a1 == 0.4289 && q.s8 == 0.7875 && q.a2_bohr == 4.4407 && q.s6 == 1.0);
   CHECK(grace::d3bj_preset("r2scan").a1 == 0.49484001);
+
+  // CellList: reuse with n == 0 resets max_gather; overflowing det is rejected; huge cell / bin_size ratio coarsens
+  // without signed int64 overflow
+  grace::CellList cl;
+  const double x2[6] = {0.0, 0.0, 0.0, 1.5, 0.0, 0.0};
+  const double cell10[9] = {10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0};
+  const bool pbc3[3] = {true, true, true};
+  cl.build(x2, 2, cell10, pbc3, 2.0);
+  CHECK(cl.max_gather(4.0) > 0);
+  cl.build(nullptr, 0, cell10, pbc3, 2.0);
+  CHECK(cl.size() == 0 && cl.max_gather(4.0) == 0);
+  const double huge_cell[9] = {1e200, 0.0, 0.0, 0.0, 1e200, 0.0, 0.0, 0.0, 1e200};
+  thrown = false;
+  try { cl.build(x2, 2, huge_cell, pbc3, 2.0); } catch (const std::invalid_argument &) { thrown = true; }
+  CHECK(thrown);
+  const double big_cell[9] = {2.5e6, 0.0, 0.0, 0.0, 2.5e6, 0.0, 0.0, 0.0, 2.5e6};
+  cl.build(x2, 2, big_cell, pbc3, 1.0);
+  grace::CellList::Hits hits;
+  CHECK(cl.gather_half(0, 2.0, hits) + cl.gather_half(1, 2.0, hits) == 1);
 }
 
 }    // namespace

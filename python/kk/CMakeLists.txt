@@ -64,7 +64,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/GraceRuntime.cmake")
 set(_lg "${GRACE_RUNTIME_ROOT}/libgrace")
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 add_library(grace_kk_cpu STATIC ${_lg}/src/model_1l.cpp ${_lg}/src/model_2l.cpp ${_lg}/src/model_3l.cpp
-            ${_lg}/src/uq.cpp ${_lg}/src/uq_head.cpp
+            ${_lg}/src/model_kind.cpp ${_lg}/src/uq.cpp ${_lg}/src/uq_head.cpp ${_lg}/src/pace_model.cpp
+            ${_lg}/src/pace_tables.cpp ${_lg}/src/pace_convert.cpp ${_lg}/src/pace_yaml.cpp
             ${_lg}/third_party/grace_cnpy/cnpy.cpp)
 target_include_directories(grace_kk_cpu PUBLIC ${GRACE_RUNTIME_INCLUDE_DIRS} PRIVATE ${GRACE_RUNTIME_PRIVATE_INCLUDE_DIRS})
 target_compile_options(grace_kk_cpu PRIVATE -O3)

@@ -155,7 +155,7 @@ int main()
     for (int q = 0; q < c.n; q++) CHECK(a.gamma[q] == b.gamma[q] && a.cluster[q] == b.cluster[q]);
     for (int q = 0; q < 3 * c.n; q++) CHECK(a.f[q] == b.f[q]);
   }
-  {    // 2L without stored layer 1 (P5 recomputes layer 1): same UQ
+  {    // 2L without stored layer 1 (P5 recomputes layer 1): same UQ; energy_only skips backward buffers until needed
     grace::FusedSettings s;
     s.store_l1 = 0;
     grace::Grace2LFused d2r(m2, s, {});
@@ -163,6 +163,35 @@ int main()
     d2r.enable_uq();
     const Res a = run(d2, c, 2, true), b = run(d2r, c, 2, true);
     for (int q = 0; q < c.n; q++) CHECK(a.gamma[q] == b.gamma[q] && a.cluster[q] == b.cluster[q]);
+    grace::Grace2LFused d2_eo(m2, {}, {});
+    d2_eo.setup_types(2, type2mu_for(m2->element_names));
+    d2_eo.enable_uq();
+    const Res eo = run(d2_eo, c, 1, true, true);
+    CHECK(d2_eo.store_info().kept && d2_eo.store_info().need_gb > 0.0);    // decided on the grow, placed later
+    CHECK(d2_eo.memory_bytes() > 0 && d2_eo.memory_bytes() < d2.memory_bytes());
+    const Res ref1 = run(d2, c, 1, true), full = run(d2_eo, c, 1, true, false);
+    CHECK(d2_eo.memory_bytes() == d2.memory_bytes() && full.e == ref1.e && full.f == ref1.f);
+    CHECK(eo.e == ref1.e);    // the energy_only call itself: energy and UQ as with forces
+    for (int q = 0; q < c.n; q++) CHECK(eo.gamma[q] == ref1.gamma[q] && eo.cluster[q] == ref1.cluster[q]);
+  }
+  {    // store limits: 0 GB declines the forward store and the reverse recomputes it, with the same results; the
+       // default (half the available memory) keeps it for 54 atoms
+    grace::FusedSettings s;
+    s.store_l1_max_gb = s.store_fwd_max_gb = 0.0;
+    grace::Grace2LFused d2z(m2, s, {});
+    grace::Grace3LFused d3z(m3, s, {});
+    d2z.setup_types(2, type2mu_for(m2->element_names));
+    d3z.setup_types(2, type2mu_for(m3->element_names));
+    d2z.enable_uq();
+    d3z.enable_uq();
+    const Res a2 = run(d2, c, 1, true), b2 = run(d2z, c, 1, true), a3 = run(d3, c, 1, true), b3 = run(d3z, c, 1, true);
+    for (const grace::StoreInfo &k : {d2.store_info(), d3.store_info()})
+      CHECK(k.kept && k.need_gb > 0.0 && k.limit_gb >= k.need_gb);
+    for (const grace::StoreInfo &z : {d2z.store_info(), d3z.store_info()})
+      CHECK(!z.kept && z.need_gb > 0.0 && z.limit_gb == 0.0);
+    CHECK(a2.e == b2.e && a3.e == b3.e);
+    for (int q = 0; q < 3 * c.n; q++) CHECK(a2.f[q] == b2.f[q] && a3.f[q] == b3.f[q]);
+    for (int q = 0; q < c.n; q++) CHECK(a2.gamma[q] == b2.gamma[q] && a3.gamma[q] == b3.gamma[q]);
   }
   {    // isolated atom: zero basis except the A self term (no bonds): finite
     Cell iso;

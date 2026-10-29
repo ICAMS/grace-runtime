@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-2L Kokkos engine (from the LAMMPS style grace/2l/kk, lammps-ace feature/grace-runtime a6ba5104dd;
-// contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies positions, types, a
-// full neighbour list, the output views and the exchange of the layer-1 messages with ghost atoms through RunInput,
-// and the Kokkos view types through Traits (grace/kk/traits.h). Implementation: grace/kk/grace_2l_kk_impl.h,
-// included by one translation unit per consumer.
+// GRACE-2L Kokkos engine (contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies
+// positions, types, a full neighbour list, the output views and the exchange of the layer-1 messages with ghost atoms
+// through RunInput, and the Kokkos view types through Traits (grace/kk/traits.h). Implementation:
+// grace/kk/grace_2l_kk_impl.h, included by one translation unit per consumer.
 #pragma once
 
 #include "grace/coupling.h"
@@ -53,7 +52,7 @@ class Grace2LKK {
   struct TagComputeUQ_L1basis{};    // basis-RP: L1 part of z = b_inv*R, captured in Phase 1 (d_A.. current)
   struct TagComputeUQ{};            // basis-RP: add L2 part + GMM (gamma/sigma/gmm_cluster) in Phase 3 — forward only
 #ifdef KOKKOS_ENABLE_CUDA
-  // Opt-2L-15: batched cuBLAS radial-MLP support kernels (CUDA + NNScalar=float only).
+  // batched cuBLAS radial-MLP support kernels (CUDA + NNScalar=float only).
   struct TagMLPAssemble{};          // pack row-major X[M x nradbase] + dX[M x nradbase]; zero padding rows
   struct TagMLPActDeriv{};          // fused value+deriv silu between GEMMs (2L MLP has no bias)
   struct TagMLPScatterR{};          // scatter LayoutRight [M x d3] -> LayoutLeft d_{R,DR}{,1}_nl(ii,jj,n,l)
@@ -98,7 +97,7 @@ class Grace2LKK {
   struct RunInput {
     typename Traits::t_kkfloat_1d_3_lr_randomread x;    // [nall] positions, local atoms then ghosts
     typename Traits::t_kkacc_1d_3 f;
-    typename Traits::t_int_1d_randomread type, ilist, numneigh;
+    typename Traits::t_int_1d_randomread type, ilist, numneigh;    // ilist: mapped types only (grace/type_map.h)
     typename Traits::t_neighbors_2d neighbors;
     int inum = 0, nlocal = 0, nall = 0, ntypes = 0;
     int eflag_global = 0, eflag_atom = 0, vflag_global = 0, vflag_atom = 0, cvflag_atom = 0;
@@ -139,7 +138,7 @@ class Grace2LKK {
   bool couple_supported = false;
   double memory_usage();
 
-  // ---- message rows for an Exchange: comm_width() doubles per atom ----
+  // ---- message rows for an Exchange: comm_width() doubles per atom (valid from set_model() on) ----
   int comm_width() const { return I_n_funcs * I_n_out; }
   // device buffers (LAMMPS pack_forward_comm_kokkos ...); return the number of doubles packed
   int pack_forward(int n, const typename Traits::t_int_1d &sendlist, const typename Traits::t_double_1d &buf);
@@ -208,9 +207,9 @@ class Grace2LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagMLPAssemble, const int) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPActDeriv, const int) const;
+  void operator() (TagMLPActDeriv, const int64_t) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPScatterR, const int) const;
+  void operator() (TagMLPScatterR, const int64_t) const;
 #endif
 
   template<int NEIGHFLAG, int EVFLAG>
@@ -267,7 +266,7 @@ class Grace2LKK {
   int L1_nradmax, L2_nradmax;
   int L1_fc_n_out, L2_fc_n_out;
   int I1_n_out, I1_n_funcs;
-  int I_n_out, I_n_funcs;
+  int I_n_out = 0, I_n_funcs = 0;    // set by set_model(): comm_width() before setup()
   int rho_n_out;
   int B_n_out, B_n_funcs;
   int I2_n_out;
@@ -317,6 +316,7 @@ class Grace2LKK {
     realloc_all = true;
     grow(1, 1);
     grow_global(1);
+    grace::kk::MemKK::drop(h_I_global, h_grad_I_global);
     realloc_all = true;
     chunk_auto = 0;
   }
@@ -380,7 +380,7 @@ class Grace2LKK {
 
   // Layer 1 MLP radial
   t_nn_4d d_R_nl;              // [chunk_size, maxneigh, L1_nradmax, lmax+1]
-  // Opt-2L-16 precision specialization (allocated per instantiation, see grow):
+  // Precision specialization (allocated per instantiation, see grow):
   //  - float (fp32/mixed): d_DR_nl holds the output-layer radial derivative,
   //    precomputed once (cuBLAS DR SGEMM / fused hand kernel) so ComputeDerivative
   //    just reads it (register relief). d_dh2_R unused.
@@ -451,7 +451,7 @@ class Grace2LKK {
   t_nn_2d d_I_nl_LN_adj_global; // [nall, rho_n_out] — energy MLP adjoint for L1 backward
 
   // Host mirrors for MPI communication
-  grace::kk::View64<typename t_nn_3d::host_mirror_type> h_I_global;    // 64-bit offsets (issue #1)
+  grace::kk::View64<typename t_nn_3d::host_mirror_type> h_I_global;    // 64-bit offsets
   grace::kk::View64<typename t_nn_3d::host_mirror_type> h_grad_I_global;
 
   // ---------- Adjoint views (Layer 1 backward) ----------
@@ -468,6 +468,11 @@ class Grace2LKK {
 
   // ---------- Adjoint views (Layer 2 backward) ----------
   t_nn_2d d_I_0_LN_adj;        // [chunk_size, I2_n_out]
+  // ReverseMLPEnergy's per-atom scratch [chunk_size, (energy_n_layers + 1) energy_max_dim]: the pre-activations of
+  // the hidden layers and two adjoint rows. As a chunk buffer it is counted by chunksize auto; as a kernel-local
+  // array of the compile-time maximum (8.4 KB per thread) its first launch needed ~1 GB of local memory (RTX 3090)
+  // and failed on a nearly full GPU
+  t_nn_2d d_emlp_work;
   t_nn_2d d_I2_adj;             // [chunk_size, I2_n_out]
   t_nn_3d d_BBBB_adj;
   t_nn_3d d_BB2_adj;
@@ -567,7 +572,7 @@ class Grace2LKK {
   int mlp_rad_R1_max_dim;
 
 #ifdef KOKKOS_ENABLE_CUDA
-  // ---- Opt-2L-15: cuBLAS true-fp32 radial-MLP scratch + launch state ----
+  // ---- cuBLAS true-fp32 radial-MLP scratch + launch state ----
   // Active only for the CUDA device instantiation with NNScalar=float (fp32 &
   // Mixed styles). The fp64 device style and all host/non-CUDA backends keep the
   // hand kernels (handle stays null -> compute_mlp_radial() takes the fallback).
@@ -593,7 +598,7 @@ class Grace2LKK {
   int mlp_act_n = 0;            // n_out width for the activation kernel
   NNScalar mlp_act_norm = 1;    // per-layer norm for the activation kernel
 
-  // ---- Opt-2L-17: cuBLAS true-fp32 block-sparse FC (forward) ----
+  // ---- cuBLAS true-fp32 block-sparse FC (forward) ----
   // Each FC output is out(ii,k,func) [=|+=] norm*nof(func) * Σ_n W(k,n,tile(func))
   // * in(ii,n,src(func)), i.e. a contraction over n with a per-function TILE-
   // selected weight (5-27 tiles). Reformulated as: gather in-columns grouped by
@@ -601,11 +606,11 @@ class Grace2LKK {
   // -> scatter. The scatter keeps the hand kernel's (ii,k)-parallel, function-order
   // accumulation (no atomics) so only the Σ_n order changes vs the hand kernel.
   // Active only for CUDA device + NNScalar=float; fp64/host keep the FC hand kernels.
-  // FCCublasOp is public because it appears in the signature of the public method
-  // fc_forward_cublas (nvcc's extended-lambda registration needs the type visible);
+  // FCBlasOp is public because it appears in the signature of the public method
+  // fc_forward_blas (nvcc's extended-lambda registration needs the type visible);
   // the op instances themselves stay protected.
  public:
-  struct FCCublasOp {
+  struct FCBlasOp {
     int n_out = 0, n_in_l = 0, n_in_r = 0, N_l = 0, N_r = 0, ntiles = 0;
     NNScalar nl = 1, nr = 1;
     t_nn_1d Wl_packed, Wr_packed;   // [ntiles * n_out * n_in] col-major per tile
@@ -615,13 +620,13 @@ class Grace2LKK {
     std::vector<int> L_pstart, L_count, R_pstart, R_count;  // host, [ntiles]
     bool active = false;
   };
-  // Opt-2L-19: element-independent ReduceN (B <- YI, B0). Each connection c maps
+  // element-independent ReduceN (B <- YI, B0). Each connection c maps
   // an input func fi(c) to an output func fo(c) with a tile: B(ii,k,fo) += norm *
   // Σ_n W(k,n,tile) * X(ii,n,fi). Same gather->per-tile SGEMM->scatter shape as
   // the FC collect-half (accumulate, no left/assign half, single scalar norm, no
-  // nof). Public for the same reason as FCCublasOp (appears in the signature of
-  // the public reduce_forward_cublas). Float + CUDA only.
-  struct ReduceCublasOp {
+  // nof). Public for the same reason as FCBlasOp (appears in the signature of
+  // the public reduce_forward_blas). Float + CUDA only.
+  struct ReduceBlasOp {
     int n_out = 0, n_in = 0, N = 0, ntiles = 0;
     NNScalar norm = 1;
     t_nn_1d W_packed;               // [ntiles * n_out * n_in] col-major per tile
@@ -631,10 +636,10 @@ class Grace2LKK {
     bool active = false;
   };
  protected:
-  FCCublasOp fc_op_A1, fc_op_AA1, fc_op_AA2, fc_op_B1, fc_op_BB1, fc_op_BB2;
-  ReduceCublasOp reduce_op_B_YI, reduce_op_B_B0;
+  FCBlasOp fc_op_A1, fc_op_AA1, fc_op_AA2, fc_op_B1, fc_op_BB1, fc_op_BB2;
+  ReduceBlasOp reduce_op_B_YI, reduce_op_B_B0;
   t_nn_1d d_fc_G, d_fc_C;         // shared gather / GEMM-output scratch (float)
-  int fc_cublas_max_nin = 0, fc_cublas_max_nout = 0, fc_cublas_max_N = 0;
+  int fc_blas_max_nin = 0, fc_blas_max_nout = 0, fc_blas_max_N = 0;
 #endif
 
   // YI CG coupling (sorted by output function, then y_idx = lr_inds[t*2])
@@ -740,26 +745,26 @@ class Grace2LKK {
   void grow_global(int nall);
   void copy_weights_to_device();
   void precompute_harmonics();
-  // Opt-2L-15: radial MLP forward (value R + output-layer radial derivative DR)
+  // radial MLP forward (value R + output-layer radial derivative DR)
   // for `which` (0 = R/L1, 1 = R1/L2). Dispatches to the batched true-fp32
   // cuBLAS SGEMM chain (CUDA + NNScalar=float + 3-layer MLP) or the hand kernel
   // fallback (every other case). Bit-reproduces the hand kernel's d_R{,1}_nl and
   // d_DR{,1}_nl outputs. Replaces the inline TagComputeMLPRadial_R{,1} launches.
   void compute_mlp_radial(int which);
 #ifdef KOKKOS_ENABLE_CUDA
-  // Opt-2L-15 helper: C[M x n_out] = alpha * In[M x n_in] * Wg[n_in x n_out]
+  // Helper: C[M x n_out] = alpha * In[M x n_in] * Wg[n_in x n_out]
   // (true-fp32 SGEMM, CUBLAS_PEDANTIC_MATH). Row-major operands; ld* are physical
   // row strides (allocated widths).
   void mlp_sgemm(const NNScalar* Wg, const NNScalar* In, NNScalar* C,
       int n_out, int M, int n_in, int ldW, int ldIn, int ldC, NNScalar alpha);
-  // Opt-2L-15 hard gate: verify the layer-0 SGEMM (transpose/leading-dim
+  // Hard gate: verify the layer-0 SGEMM (transpose/leading-dim
   // convention + true-fp32 path) reproduces a host fp64 reference before use.
-  void mlp_cublas_selftest();
-  // Opt-2L-17: build the tile-sorted metadata + repacked per-tile weights for one
+  void mlp_blas_selftest();
+  // build the tile-sorted metadata + repacked per-tile weights for one
   // block-sparse FC (host-side, from the model FCWeights). Also tracks scratch maxes.
-  void build_fc_cublas_op(FCCublasOp &op, const GRACE2LModel::FCWeights &fc);
-  // Opt-2L-19: same, for one element-independent ReduceN source (from ReduceWeights).
-  void build_reduce_cublas_op(ReduceCublasOp &op, const GRACE2LModel::ReduceWeights &rw,
+  void build_fc_blas_op(FCBlasOp &op, const GRACE2LModel::FCWeights &fc);
+  // same, for one element-independent ReduceN source (from ReduceWeights).
+  void build_reduce_blas_op(ReduceBlasOp &op, const GRACE2LModel::ReduceWeights &rw,
       int n_out);
 #endif
 
@@ -771,7 +776,7 @@ class Grace2LKK {
   // recompute branches must call this after L2_ComputeNeigh refreshes d_rhats,
   // otherwise d_Y_bond holds stale values from Phase 1's last chunk.
   void compute_Y_bond_chunk();
-  // Bond stages of compute(); virtual so grace/2l/fused/kk can replace them.
+  // Bond stages of compute(); virtual so Grace2LFusedKK can replace them.
   virtual void stage_L1_bond();
   virtual void stage_L1_bond_recompute();
   virtual void stage_L2_bond_fwd();
@@ -820,7 +825,7 @@ class Grace2LKK {
   virtual bool fc_forward_own(FCLayer, const t_nn_3d &, const t_nn_3d &, const t_nn_3d &) { return false; }
   // the cuBLAS FC and B-reduction ops (CUDA, float): built in setup, with their scratch, only for an engine that may
   // call them; the fused engine runs every FC layer and its reductions on its own kernels
-  virtual bool uses_cublas_ops() const { return true; }
+  virtual bool uses_blas_ops() const { return true; }
   // forward FC layer `which`: the engine's own kernels (fc_forward_own), else cuBLAS (CUDA, float); false: the
   // caller runs the hand kernel
   bool fc_forward_fast(FCLayer which, const t_nn_3d &in_left, const t_nn_3d &in_right, const t_nn_3d &out)
@@ -828,10 +833,10 @@ class Grace2LKK {
     if (fc_forward_own(which, in_left, in_right, out)) return true;
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr (sizeof(NNScalar) == 4) {
-      FCCublasOp *const ops[] = {&fc_op_A1, &fc_op_AA1, &fc_op_AA2, &fc_op_B1, &fc_op_BB1, &fc_op_BB2};
-      FCCublasOp &op = *ops[(int) which];
+      FCBlasOp *const ops[] = {&fc_op_A1, &fc_op_AA1, &fc_op_AA2, &fc_op_B1, &fc_op_BB1, &fc_op_BB2};
+      FCBlasOp &op = *ops[(int) which];
       if (blas_handle && op.active) {
-        fc_forward_cublas(op, in_left, in_right, out);
+        fc_forward_blas(op, in_left, in_right, out);
         return true;
       }
     }
@@ -839,24 +844,24 @@ class Grace2LKK {
     return false;
   }
 #ifdef KOKKOS_ENABLE_CUDA
-  // Opt-2L-17: run one forward FC (left assign + right accumulate) via gather ->
+  // run one forward FC (left assign + right accumulate) via gather ->
   // per-tile true-fp32 SGEMM -> scatter, into out (float only). Public for the
   // same reason as compute_Y_bond_chunk (contains extended device lambdas).
-  void fc_forward_cublas(FCCublasOp &op, const t_nn_3d &in_left,
+  void fc_forward_blas(FCBlasOp &op, const t_nn_3d &in_left,
       const t_nn_3d &in_right, const t_nn_3d &out);
-  // Opt-2L-19: run one element-independent ReduceN source (X -> Bout) via gather ->
+  // run one element-independent ReduceN source (X -> Bout) via gather ->
   // per-tile true-fp32 SGEMM -> scatter-accumulate (float only). zero_first zeroes
   // all nBf output funcs before the first source. Public for the same reason as
-  // fc_forward_cublas (contains extended device lambdas).
-  void reduce_forward_cublas(ReduceCublasOp &op, const t_nn_3d &X,
+  // fc_forward_blas (contains extended device lambdas).
+  void reduce_forward_blas(ReduceBlasOp &op, const t_nn_3d &X,
       const t_nn_3d &Bout, bool zero_first, int nBf);
   // cuBLAS DGEMM UQ projection (two phases, sharing the d_uq_z carry):
   //  _L1 (Phase 1, d_A.. live): gather the rho block -> DGEMM -> RAW L1 proj into
   //      d_uq_z, and ||B^(L1)||^2 into d_uq_n2L1.
   //  _L2 (Phase 3, d_B.. live): gather the I2 block -> DGEMM -> add to d_uq_z ->
   //      normalize by the combined ||B|| -> density -> GMM.
-  void compute_uq_cublas_L1();
-  void compute_uq_cublas_L2();
+  void compute_uq_blas_L1();
+  void compute_uq_blas_L2();
 #endif
  protected:
 

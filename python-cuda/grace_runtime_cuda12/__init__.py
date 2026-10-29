@@ -4,7 +4,7 @@ with its own static Kokkos; loaded by grace_runtime._cuda through the entry poin
 import re
 from pathlib import Path
 
-ABI = 5    # = grace_runtime._cuda.ABI (the C++ interface kk_api.h of the modules)
+ABI = 6    # = grace_runtime._cuda.ABI (the C++ interface kk_api.h of the modules)
 
 try:
     from importlib.metadata import PackageNotFoundError, version

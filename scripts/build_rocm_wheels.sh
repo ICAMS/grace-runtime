@@ -10,7 +10,7 @@
 #     come from the ROCm installed on the user's machine).
 #   * a wheel for your own GPU with the ROCm installed on your machine, no container:
 #     ROCM_PATH=/opt/rocm GRACE_KK_ARCHS=gfx1100 PYTHONS=3.12 bash scripts/build_rocm_wheels.sh (python3.12 on PATH;
-#     the wheel gets the platform tag of your machine).
+#     the wheel gets the tag its own glibc symbols allow, without the ROCm runtime's: for this machine only).
 # Never in the wheels and never linked: rocBLAS (loaded at run time when the system has it), hipBLAS, rocSOLVER.
 # Kokkos (pinned in python-rocm6/CMakeLists.txt) is built once per architecture and ROCm version into
 # GRACE_KOKKOS_CACHE. The sources are staged with the repository layout (python/kk, python/src, libgrace, cmake).
@@ -173,7 +173,7 @@ V=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")
 sed -i -e "s/^version = \".*\"/version = \"$V\"/" -e "s/\"grace-runtime==[^\"]*\"/\"grace-runtime==$V\"/" "$STAGE/pyproject.toml"
 
 mkdir -p "$OUT/raw"
-rm -f "$OUT"/raw/*.whl
+rm -f "$OUT"/raw/*.whl "$OUT"/*.whl     # wheels of earlier runs would fail the tag check
 for py in $PYTHONS; do
   ensure_venv "$py"
   v=$(venv_for "$py")
@@ -184,9 +184,11 @@ for py in $PYTHONS; do
          grep -a -m 10 -E "error:|Killed|signal" "$OUT/build-$py.log"; tail -8 "$OUT/build-$py.log"; free -g; exit 1; }
 done
 "$V0/bin/python" -m build --no-isolation --sdist -o "$OUT" "$STAGE" > "$OUT/build-sdist.log" 2>&1
-# the HIP runtime and the libraries it loads stay out of the wheel: they come with the user's ROCm
+# the HIP runtime and the libraries it loads stay out of the wheel: they come with the user's ROCm.
+# --only-plat: the requested tag alone; auditwheel would add manylinux2014 from the module's glibc symbols, but the
+# excluded ROCm runtime needs glibc 2.27 (libamd_comgr)
 for w in "$OUT"/raw/*.whl; do
-  "$V0/bin/auditwheel" repair --plat "${AUDITWHEEL_PLAT:-auto}" --exclude libamdhip64.so.6 \
+  "$V0/bin/auditwheel" repair --plat "${AUDITWHEEL_PLAT:-auto}" --only-plat --exclude libamdhip64.so.6 \
     --exclude libhsa-runtime64.so.1 --exclude libamd_comgr.so.2 --exclude librocprofiler-register.so.0 -w "$OUT" "$w"
 done
 # every wheel: one module per architecture, no bundled or linked rocBLAS / hipBLAS / rocSOLVER / Tensile files, ...

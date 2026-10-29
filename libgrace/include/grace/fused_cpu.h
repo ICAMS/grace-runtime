@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE (lammps-ace, feature/grace-fused); contributing author: Yury Lysogorskiy (ICAMS)
+// Contributing author: Yury Lysogorskiy (ICAMS)
 #ifndef GRACE_FUSED_CPU_H
 #define GRACE_FUSED_CPU_H
 
@@ -11,11 +11,19 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace grace {
@@ -33,6 +41,132 @@ constexpr int MAX_LMAX = 6;
 constexpr int MAX_NLM = (MAX_LMAX + 1) * (MAX_LMAX + 1);
 
 inline int pad16(int n) { return (n + 15) / 16 * 16; }
+
+// the memory limit of the process's cgroup in MB (Slurm --mem, containers): the smallest limit of the cgroup and its
+// ancestors (total) and the smallest limit - usage (avail, at least 1 MB; the usage without the inactive page cache,
+// the "working set" of container tools); false, and total / avail unchanged, when no level has a limit. proc_cgroup
+// and root: /proc/self/cgroup and /sys/fs/cgroup (the tests pass a fake tree). cgroup v2: the smaller of memory.max
+// and memory.high, memory.current, memory.stat inactive_file; v1: the memory controller's memory.limit_in_bytes,
+// memory.usage_in_bytes, memory.stat total_inactive_file (a limit near 2^63: none). Only the usual mounts are looked at
+// (/sys/fs/cgroup, v1 memory under /sys/fs/cgroup/memory).
+inline bool cgroup_memory_mb(const char *proc_cgroup, const std::string &root, double &total, double &avail)
+{
+  std::FILE *f = std::fopen(proc_cgroup, "r");
+  if (!f) return false;
+  std::string path;
+  bool v1 = false;
+  char buf[4096];
+  while (std::fgets(buf, sizeof buf, f)) {    // "<id>:<controllers>:<path>"; v2: "0::<path>"
+    std::string line(buf);
+    while (!line.empty() && line.back() == '\n') line.pop_back();
+    const size_t a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1);
+    if (b == std::string::npos) continue;
+    const std::string ctrl = "," + line.substr(a + 1, b - a - 1) + ",";
+    if (ctrl.find(",memory,") != std::string::npos) {
+      path = line.substr(b + 1);
+      v1 = true;
+    } else if (!v1 && ctrl == ",," && line.compare(0, a, "0") == 0) {
+      path = line.substr(b + 1);
+    }
+  }
+  std::fclose(f);
+  // no cgroup, or a ".." component (outside the cgroup namespace)
+  if (path.empty() || path[0] != '/' || (path + "/").find("/../") != std::string::npos) return false;
+  const auto bytes = [](const std::string &file, double &v) {
+    std::FILE *g = std::fopen(file.c_str(), "r");
+    if (!g) return false;
+    char w[64];
+    const bool ok = std::fscanf(g, "%63s", w) == 1;
+    std::fclose(g);
+    const double x = ok ? std::strtod(w, nullptr) : 0.0;    // "max" -> 0
+    if (!(x > 0.0 && x < 4e18)) return false;
+    v = x;
+    return true;
+  };
+  static const struct {
+    const char *sub, *limit, *high, *usage, *inactive;
+  } files[2] = {{"", "/memory.max", "/memory.high", "/memory.current", "inactive_file"},
+                {"/memory", "/memory.limit_in_bytes", nullptr, "/memory.usage_in_bytes", "total_inactive_file"}};
+  const auto &c = files[v1];
+  const auto cache = [&](const std::string &dir) {    // the inactive page cache from memory.stat, 0 when absent
+    double v = 0.0;
+    if (std::FILE *g = std::fopen((dir + "/memory.stat").c_str(), "r")) {
+      char key[64];
+      double x;
+      while (std::fscanf(g, "%63s %lf", key, &x) == 2)
+        if (!std::strcmp(key, c.inactive)) v = x;
+      std::fclose(g);
+    }
+    return v;
+  };
+  constexpr double none = 1e300;
+  double t = none, a = none;
+  for (std::string p = path;;) {    // the cgroup, then its ancestors up to the root
+    const std::string dir = root + c.sub + (p == "/" ? "" : p);
+    double lim = none, x = 0.0;
+    if (bytes(dir + c.limit, x)) lim = x;
+    if (c.high && bytes(dir + c.high, x)) lim = std::min(lim, x);
+    if (lim < none) {
+      t = std::min(t, lim);
+      a = std::min(a, bytes(dir + c.usage, x) ? lim - std::max(0.0, x - cache(dir)) : lim);
+    }
+    if (p == "/") break;
+    const size_t k = p.rfind('/');
+    p = k == 0 ? "/" : p.substr(0, k);
+  }
+  if (t >= none) return false;
+  total = t / 1048576.0;
+  avail = std::max(a / 1048576.0, 1.0);    // a full cgroup: 1 MB, not 0 (host_memory_mb's "unreadable")
+  return true;
+}
+
+// host memory in MB (Linux: /proc/meminfo MemTotal / MemAvailable, capped by the cgroup limit; macOS: sysctl +
+// host_statistics64); 0 when unreadable
+inline void host_memory_mb(double &total, double &avail)
+{
+  total = avail = 0.0;
+#if defined(__linux__)
+  if (FILE *f = std::fopen("/proc/meminfo", "r")) {
+    char key[64];
+    double kb;
+    while (std::fscanf(f, "%63s %lf kB", key, &kb) == 2) {
+      if (!std::strcmp(key, "MemTotal:")) total = kb / 1024.0;
+      if (!std::strcmp(key, "MemAvailable:")) avail = kb / 1024.0;
+    }
+    std::fclose(f);
+  }
+  double ct = 0.0, ca = 0.0;
+  if (cgroup_memory_mb("/proc/self/cgroup", "/sys/fs/cgroup", ct, ca)) {
+    if (total <= 0.0 || ct < total) total = ct;
+    if (avail <= 0.0 || ca < avail) avail = ca;
+  }
+#elif defined(__APPLE__)
+  uint64_t mem = 0;
+  size_t len = sizeof(mem);
+  if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) total = (double) mem / 1048576.0;
+  vm_size_t page_size = 0;
+  mach_port_t host = mach_host_self();
+  vm_statistics64_data_t vmstat;
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_page_size(host, &page_size) == KERN_SUCCESS &&
+      host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vmstat), &count) == KERN_SUCCESS) {
+    const uint64_t pages = (uint64_t) vmstat.free_count + vmstat.inactive_count + vmstat.speculative_count;
+    avail = (double) pages * (double) page_size / 1048576.0;
+  }
+  mach_port_deallocate(mach_task_self(), host);
+#endif
+}
+
+// size limit (GB) of a per-atom store: max_gb when >= 0, else half the available host memory per process of the node
+// (8 GB where the memory query fails)
+inline double store_budget_gb(double max_gb, int ranks_per_node)
+{
+  if (max_gb >= 0.0) return max_gb;
+  double total = 0.0, avail = 0.0;
+  host_memory_mb(total, avail);
+  if (avail <= 0.0) return 8.0;
+  return 0.5 * avail * 1048576.0 / 1e9 / std::max(1, ranks_per_node);
+}
 
 // G2LF_PROF=1 (environment): wall time per category, measured on OpenMP thread 0 only
 enum { T_BOND, T_RAD1, T_FC1, T_PROD1, T_RED1, T_RAD1B, T_FC1B, T_PROD1B, T_RED1B, T_RAD2, T_FC2, T_PROD2,
@@ -579,7 +713,7 @@ inline void red_bwd(const Red &R, int ty, const float *gOut, float *const *gX)
   }
 
 // ---- bond geometry: neighbours within the cutoff, unit vectors, real spherical harmonics Y[lm] and the
-// gradient G[lm][3] of their polynomial extension (dual numbers). Shared by grace/1l/fused and grace/2l/fused.
+// gradient G[lm][3] of their polynomial extension (dual numbers). Shared by the CPU GRACE-1L and 2L drivers.
 
 inline void sh_coefs(int lmax, std::vector<double> &a, std::vector<double> &b, std::vector<double> &c,
                      std::vector<double> &d)
@@ -970,7 +1104,7 @@ inline void spline_eval(const float *tab, int N, int nl, int P, double x, float 
   }
 }
 
-// per-atom virial of one bond (del = x_i - x_j, f = force on i): half to each atom, as grace/2l/kk
+// per-atom virial of one bond (del = x_i - x_j, f = force on i): half to each atom, as Grace2LKK
 inline void add_vatom(double **vatom, int i, int j, const double *rh, double r, const double *fv)
 {
   const double dx = -rh[0] * r, dy = -rh[1] * r, dz = -rh[2] * r;
@@ -1013,7 +1147,7 @@ void build_fc(FC &f, const FCW &w, int nil, int nir, int pinl, int pinr, int pou
   for (int t : w.w_tile_right) f.ntr = std::max(f.ntr, t + 1);
   f.ntr = std::max(f.ntr, w.w_shape_right);
   if ((size_t) f.nout * nil * f.ntl != w.w_left.size() || (size_t) f.nout * nir * f.ntr != w.w_right.size())
-    throw Error("pair grace/fused: FC weight shape mismatch");
+    throw Error("GRACE CPU engine: FC weight shape mismatch");
   f.nof.resize(f.nfl);
   for (int q = 0; q < f.nfl; q++) f.nof[q] = (float) w.norm_out_factor[q];
   // right connections sorted by target
@@ -1044,7 +1178,7 @@ void build_fc(FC &f, const FCW &w, int nil, int nir, int pinl, int pinr, int pou
   f.pinl = pinl;
   f.pinr = pinr;
   f.pout = pout;
-  if (pinl % 16 || pinr % 16 || pout % 16 || pinl > 128 || pinr > 128 || pout > 128) throw Error("pair grace/fused: FC width > 128");
+  if (pinl % 16 || pinr % 16 || pout % 16 || pinl > 128 || pinr > 128 || pout > 128) throw Error("GRACE CPU engine: FC width > 128");
   f.gf.clear();
   f.gb.clear();
   for (int t = 0; t < f.ntl; t++) {
@@ -1114,14 +1248,14 @@ void build_red(Red &R, const std::vector<const RW *> &rw, const std::vector<int>
     S.nt = std::max(1, w.w_shape);
     const size_t per = (size_t) S.nin * S.nt;
     const size_t nel = elem ? (size_t) cx.n_elements : 1;
-    if (w.W.size() % (per * nel) != 0) throw Error("pair grace/fused: reduce weight shape mismatch");
+    if (w.W.size() % (per * nel) != 0) throw Error("GRACE CPU engine: reduce weight shape mismatch");
     const int nout = w.W.size() / (per * nel);
-    if (nout > pout) throw Error("pair grace/fused: reduce width exceeds padding");
+    if (nout > pout) throw Error("GRACE CPU engine: reduce width exceeds padding");
     for (int c = 0; c < (int) w.collect_ind.size(); c++) {
       S.ci.push_back(w.collect_ind[c]);
       S.tile.push_back(w.w_l_tile[c]);
       const int fo = fo_fixed[s] >= 0 ? fo_fixed[s] : w.total_sum_ind[c];
-      if (fo >= nfo) throw Error("pair grace/fused: reduce output index out of range");
+      if (fo >= nfo) throw Error("GRACE CPU engine: reduce output index out of range");
       S.fo.push_back(fo);
     }
     S.W.assign((size_t) nty * S.nt * S.nin * pout, 0.0f);
@@ -1144,12 +1278,12 @@ void build_red(Red &R, const std::vector<const RW *> &rw, const std::vector<int>
     R.src.push_back(std::move(S));
   }
   R.pout = pout;
-  if (pout % 16 || pout > 128) throw Error("pair grace/fused: reduce width > 128");
+  if (pout % 16 || pout > 128) throw Error("GRACE CPU engine: reduce width > 128");
   R.gf.clear();
   R.gb.clear();
   for (size_t s = 0; s < R.src.size(); s++) {
     const auto &S = R.src[s];
-    if (S.pin % 16 || S.pin > 128) throw Error("pair grace/fused: reduce input width > 128");
+    if (S.pin % 16 || S.pin > 128) throw Error("GRACE CPU engine: reduce input width > 128");
     for (int t = 0; t < S.nt; t++) {
       MVG gF, gB;
       gF.M = S.W.data() + (size_t) t * S.nin * pout;
@@ -1170,7 +1304,7 @@ void build_red(Red &R, const std::vector<const RW *> &rw, const std::vector<int>
   }
 }
 
-// ---- UQ (schema v6 basis-RP as the KOKKOS grace styles; projection in fp32, norms and GMM in fp64)
+// ---- UQ (schema v6 basis-RP as Grace1LKK / Grace2LKK; projection in fp32, norms and GMM in fp64)
 // The basis rows of the projection matrix R are the collected functions of a scalar reduce's sources in model
 // order (source, input channel, collected function).
 // The projection matrix (3-4 MB in fp32) would be streamed from L3 once per atom: atoms are queued per thread

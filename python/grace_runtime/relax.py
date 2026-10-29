@@ -14,7 +14,7 @@ from ase.stress import voigt_6_to_full_3x3_stress
 
 from ._core import Model
 from .batch import _gpu_batch, _gpu_compute, _species_of
-from .calculator import _chunk_arg, _CpuEngine, _select_device, _virial_to_stress, default_threads
+from .calculator import _chunk_arg, _CpuEngine, _select_device, _type_lut, _virial_to_stress, default_threads
 from .dispersion import resolve as _resolve_dispersion
 
 # [13/13] Pade coefficients and the 1-norm bound of scipy.linalg.expm_frechet (Al-Mohy, Higham 2009)
@@ -209,6 +209,7 @@ class _GPUForces:
     def __init__(self, kk, m, species, chunk, max_nall, disp):
         self.kk, self.m, self.chunk, self.max_nall, self.disp = kk, m, chunk, max_nall, disp
         self.species, self.b = [], None
+        self._types_key, self._types = None, None    # the types of pool.starts' atoms (identity: _Pool._index)
         self.add_species(species)
 
     def add_species(self, symbols):
@@ -216,11 +217,15 @@ class _GPUForces:
         new = sorted(set(self.species) | set(symbols))
         if new and (new != self.species or self.b is None):
             self.species = new
+            self._types_key, self._types = None, None
             self.b = _gpu_batch(self.kk, self.m, new, self.chunk, keep=True, dispersion=self.disp)
 
     def __call__(self, pool, pos, cells):
+        if self._types_key is not pool.starts:
+            self._types = np.ascontiguousarray(_type_lut(self.species)[pool.numbers], dtype=np.int32)
+            self._types_key = pool.starts
         out = _gpu_compute(self.b, self.species, pool.natoms, pool.numbers, pos, cells, pool.pbc,
-                           max_nall=self.max_nall)
+                           max_nall=self.max_nall, starts=pool.starts, types=self._types)
         stress = np.zeros((len(cells), 6))
         r3 = pool.rank3
         stress[r3] = _virial_to_stress(out["virial"][r3], np.abs(np.linalg.det(cells[r3])))
@@ -249,7 +254,8 @@ class _CPUForces:
                                    pool.frames[k].copy())
             eng, at = self.engines[i]
             a0, a1 = pool.starts[k], pool.starts[k + 1]
-            at.set_cell(cells[k], apply_constraint=False)    # a FixSymmetry of the input: the cell as it is
+            if pool.filt:
+                at.set_cell(cells[k], apply_constraint=False)    # a FixSymmetry of the input: the cell as it is
             at.positions[:] = pos[a0:a1]
             r = eng.compute(at)
             energy[k] = r["energy"]
@@ -416,26 +422,28 @@ def relax_batch_iter(model, structures, fmax: float = 0.05, max_steps: int = 500
                      symprec: float = 0.01, dispersion=None):
     """Relax many structures together; yields (input index, result) as each one finishes (completion order).
 
-    model: path to a kokkos.npz, a registry name or a grace_runtime.Model.
+    model: path to a kokkos.npz, a registry name, a PACE .yaml or a grace_runtime.Model.
     structures: ASE Atoms, any iterable (read lazily: a structure is read when there is room in the batch).
     fmax: convergence as ase.optimize.Optimizer: the largest force row (eV/A) below fmax; with the cell filter the
         rows of ase.filters.FrechetCellFilter (atom forces in the frame of the initial cell, and the cell rows).
     max_steps: FIRE steps per structure (as Optimizer.run(fmax, steps)); a structure is checked before each step, so
         n_steps steps take n_steps + 1 force evaluations.
     cell_filter: None (positions only) or "frechet" (positions and cell, as ase.filters.FrechetCellFilter).
-    scalar_pressure (eV/A^3), hydrostatic_strain, constant_volume, mask (6 Voigt or 3x3 booleans), exp_cell_factor
-        (default: the number of atoms of each structure): as FrechetCellFilter; only with cell_filter="frechet".
+    scalar_pressure, hydrostatic_strain, constant_volume, mask, exp_cell_factor: as FrechetCellFilter (scalar_pressure
+        in eV/A^3, mask as 6 Voigt or 3x3 booleans, exp_cell_factor defaulting to the number of atoms of each
+        structure); only with cell_filter="frechet".
     dt, maxstep, dtmax, Nmin, finc, fdec, astart, fa, a: as ase.optimize.FIRE (maxstep limits the norm of the whole
         step of one structure, atoms and cell together).
-    device, max_nall, num_threads, chunksize: as compute_batch. max_atoms: atoms in flight (one GPU call per step).
+    device, max_atoms, max_nall, num_threads, chunksize: as compute_batch (max_atoms is the atoms in flight in one
+        GPU call per step).
     dispersion: a dispersion correction added to the model, as compute_batch (a grace_runtime.D3 or "d3-pbe",
         "d3-r2scan"); the relaxation follows the sums, and the results are the sums.
-    callback(step, indices, atoms): after each force evaluation, for the structures still running (input indices;
-        Atoms with the current positions, cell and a SinglePointCalculator; built only for a callback). It may return
-        input indices to stop now (result converged=False, stopped=True).
-    fix_symmetry: keep the space group of every structure as ase.constraints.FixSymmetry (forces, stress, position
-        and cell steps averaged over the symmetry operations; no refinement of the input), the operations found by
-        spglib with symprec (A).
+    callback: optional callable callback(step, indices, atoms) invoked after each force evaluation for the structures
+        still running (input indices; Atoms with the current positions, cell and a SinglePointCalculator; built only
+        for a callback). It may return input indices to stop now (result converged=False, stopped=True).
+    fix_symmetry, symprec: keep the space group of every structure as ase.constraints.FixSymmetry (forces, stress,
+        position and cell steps averaged over the symmetry operations; no refinement of the input), the operations
+        found by spglib with symprec (A).
 
     Constraints of the input Atoms are kept: FixAtoms (their atoms do not move; their forces count as zero) and
     FixSymmetry (that structure keeps its symmetry, with the constraint's operations, as in ASE); other constraints,

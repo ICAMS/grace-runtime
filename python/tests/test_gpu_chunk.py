@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """chunksize (atoms per engine pass) of the GPU path: "auto" (the default) lets the engine choose it from the free GPU
-memory (one pass while it fits) and, on a device allocation failure, halves it down to 1024 (the failed engine and its
+memory (one pass while it fits) and, on a device allocation failure, halves it down to 512 (the failed engine and its
 memory dropped); a structure that does not fit even then
 is a clear RuntimeError, not "model not supported". Small-card cases run only on such cards (dandolo RTX 4070 SUPER
 12 GB, belgica RTX 2070 8 GB)."""
@@ -29,8 +29,9 @@ def total_gb():
     return gpu_total_gb()
 
 
-def hea128k():
-    a = bulk("W", "bcc", a=3.165, cubic=True).repeat((40, 40, 40))
+def hea(k):
+    """bcc HEA of 2 k^3 atoms, 25 elements"""
+    a = bulk("W", "bcc", a=3.165, cubic=True).repeat((k, k, k))
     a.set_chemical_symbols(np.random.default_rng(20261008).permutation(np.resize(HEA, len(a))))
     return a
 
@@ -72,14 +73,16 @@ def test_auto_chunk_fits_a_large_system_on_a_small_card(model):
     r = subprocess.run([sys.executable, "-c", SNIPPET, str(model)], capture_output=True, text=True, timeout=1200)
     assert r.returncode == 0, r.stderr[-1500:]
     ok, finite, chunk = r.stdout.split()[-3:]
-    assert ok == "OK" and finite == "True" and 1024 <= int(chunk) <= 65536
+    assert ok == "OK" and finite == "True" and 512 <= int(chunk) <= 65536
 
 
 @pytest.mark.skipif(not 0 < (total_gb() if gpu_ok() else 0) <= 10, reason="for cards up to 10 GB")
 def test_does_not_fit_is_a_clear_error():
-    at = hea128k()
+    """2L-large, 1 024 000 atoms (the per-atom layer-1 buffers alone ~10 GB; the RTX 2070 8 GB limit is ~370k): the
+    clear error after the smaller chunks, also when the out of memory comes from a kernel launch"""
+    at = hea(80)
     at.calc = GRACERuntimeCalculator(str(M2L), device=GPU)
-    with pytest.raises(RuntimeError, match="does not fit"):
+    with pytest.raises(RuntimeError, match="does not fit the GPU memory even with smaller chunks"):
         at.get_forces()
 
 
@@ -133,9 +136,11 @@ def test_3l_auto_chunk_from_free_memory(case):
     whose atoms + images per pass do not fit (1000 cells: ~64 KB per image row) retries with fewer per pass on the same
     engine"""
     import subprocess, sys
+    import grace_runtime
     m3 = CACHE / "GRACE-3L-OMAT-large" / "kokkos.npz"
     if not m3.exists():
         pytest.skip("GRACE-3L-OMAT-large not in the test cache")
+    grace_runtime.free_gpu_memory()    # the GPU memory this pytest process holds from earlier tests is not the child's
     r = subprocess.run([sys.executable, "-c", AUTO_3L, str(m3), case], capture_output=True, text=True, timeout=1200)
     assert r.returncode == 0, r.stderr[-1500:]
     assert r.stdout.split()[-1] == "1", r.stdout[-500:]

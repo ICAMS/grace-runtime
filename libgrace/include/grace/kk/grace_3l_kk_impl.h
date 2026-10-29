@@ -2,8 +2,7 @@
 // Implementation of grace::kk::Grace3LKK (see grace_3l_kk.h): model setup, device weights, buffers, the layered
 // message exchange and run(); the kernels follow in grace_3l_kk_{radial,spbf,cpl,dense}.h (included at the end).
 // Included by one translation unit per consumer, which instantiates the engine for its Traits (LAMMPS:
-// src/KOKKOS/pair_grace_3l_kokkos.cpp; python: _kk module). Moved from the LAMMPS style grace/3l/kk (lammps-ace
-// feature/grace-runtime 5f5ab57aa7, pair_grace_3l_kokkos.cpp): same kernels, launch shapes and GRACE3L_* switches.
+// the grace/runtime/kk style; python: _kk module).
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
@@ -120,6 +119,20 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::set_model(std::share
   setup_done = false;
   chunk_auto = 0;        // chunksize auto: decided again for the new model's buffers
   g3l_detail::group_reduce_inputs(*grace_model, log);
+  // the message indicators and their dims here, not in setup(): callers size their comm buffers with comm_width()
+  // before setup() (setup() refuses a model without eq1_norm / eq2_norm)
+  const auto eqnorm = [&](const char *name, int &idx, int &n_funcs, int &n_out) {
+    idx = -1;
+    n_funcs = n_out = 0;
+    for (int i = 0; i < (int) grace_model->eqnorm.size() && idx < 0; i++)
+      if (grace_model->eqnorm[i].name == name) {
+        idx = i;
+        n_funcs = grace_model->eqnorm[i].n_out;
+        n_out = grace_model->eqnorm[i].M;
+      }
+  };
+  eqnorm("eq1_norm", idx_eqnorm_eq1_norm, I_n_funcs, I_n_out);
+  eqnorm("eq2_norm", idx_eqnorm_eq2_norm, I2_n_funcs, I2_n_out);
 
   // Publish the UQ availability flag now (LAMMPS: at pair_coeff time) so `fix pair` can extract the
   // gamma/atomic_sigma/gmm_cluster triggers, which it queries at fix-creation time — BEFORE setup() stages the GMM
@@ -128,7 +141,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::set_model(std::share
 
   {
     auto &m = *grace_model;
-    // Loaded-architecture summary (validation-gate anchor line).
+    // Loaded-architecture summary.
     int emlp_in  = m.energy_mlp.n_layers > 0 ? m.energy_mlp.n_in.front()  : 0;
     int emlp_hid = m.energy_mlp.n_layers > 1 ? m.energy_mlp.n_out.front() : 0;
     int emlp_out = m.energy_mlp.n_layers > 0 ? m.energy_mlp.n_out.back()  : 0;
@@ -215,7 +228,20 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 typename Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::TypeTables
 Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::type_tables() const
 {
-  return {h_type2model, d_map, k_cutsq, spline_on, n_sp, d_sp_of_mu, d_splR};
+  TypeTables t;
+  t.type2model = h_type2model;
+  t.map = d_map;
+  t.cutsq = k_cutsq;
+  t.spline_on = spline_on;
+  t.n_sp = n_sp;
+  t.sp_of_mu = d_sp_of_mu;
+  t.splR = d_splR;
+  std::copy(spl_N, spl_N + 3, t.spl_N);
+  std::copy(spl_off, spl_off + 3, t.spl_off);
+  t.spl_Ntot = spl_Ntot;
+  t.spl_ld = spl_ld;
+  t.spl_mus = spl_mus;
+  return t;
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -233,7 +259,12 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::use_type_tables(cons
   spline_on = t.spline_on;
   n_sp = t.n_sp;
   d_sp_of_mu = t.sp_of_mu;
-  d_splR = t.splR;
+  d_splR = t.splR;    // with its shape (a later setup may have built tables of another shape)
+  std::copy(t.spl_N, t.spl_N + 3, spl_N);
+  std::copy(t.spl_off, t.spl_off + 3, spl_off);
+  spl_Ntot = t.spl_Ntot;
+  spl_ld = t.spl_ld;
+  spl_mus = t.spl_mus;
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -351,7 +382,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
         GRACE_KK_ERROR("GRACE-3L/KK: fc_{}.n_out={} exceeds GRACE3L_MAX_FC_NOUT={}", f.name, f.n_out, GRACE3L_MAX_FC_NOUT);
       if (f.w_shape_right > GRACE3L_MAX_FC_TILE)
         GRACE_KK_ERROR("GRACE-3L/KK: fc_{} tile={} exceeds GRACE3L_MAX_FC_TILE={}", f.name, f.w_shape_right, GRACE3L_MAX_FC_TILE);
-      // TagFCRight2Left (Task 2.6) accumulates into a GRACE3L_MAX_FC_NFUNCS-sized
+      // TagFCRight2Left accumulates into a GRACE3L_MAX_FC_NFUNCS-sized
       // stack array indexed by n_funcs_left/right; catch an overflowing model here
       // rather than silently corrupting the stack on device.
       if (f.n_funcs_left > GRACE3L_MAX_FC_NFUNCS)
@@ -396,7 +427,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   copy_weights_to_device();
   build_radial_splines();
 
-  // ---- Task 2.6: locate A1_2_red / fc_A1_2a by name (index-parallel with
+  // ---- locate A1_2_red / fc_A1_2a by name (index-parallel with
   // d_reduce/d_fc, filled in the same loop order by copy_weights_to_device
   // above). Match by NAME (not position) so a re-ordered npz still resolves. ----
   idx_reduce_A1_2_red = -1;
@@ -416,7 +447,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   if (idx_fc_A1_2a < 0)
     GRACE_KK_ERROR("GRACE-3L/KK: FC 'A1_2a' not found in loaded model");
 
-  // ---- Task 2.7: locate the remaining L1 chain by NAME (index-parallel with
+  // ---- locate the remaining L1 chain by NAME (index-parallel with
   // d_prod/d_reduce/d_fc/d_eqnorm/d_rmsnorm, filled in the same order as
   // grace_model->{prod,reduce,fc,eqnorm,rmsnorm} by copy_weights_to_device). ----
   idx_prod_A1_3 = -1;
@@ -491,10 +522,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
     GRACE_KK_ERROR("GRACE-3L/KK: reduce 'rho1' not found in loaded model");
   resolve_l1_roles(m.reduce[idx_reduce_rho1], rho1_input_role);
 
-  idx_eqnorm_eq1_norm = -1;
-  for (int i = 0; i < (int) m.eqnorm.size(); i++)
-    if (m.eqnorm[i].name == "eq1_norm") { idx_eqnorm_eq1_norm = i; break; }
-  if (idx_eqnorm_eq1_norm < 0)
+  if (idx_eqnorm_eq1_norm < 0)    // resolved in set_model()
     GRACE_KK_ERROR("GRACE-3L/KK: eqnorm 'eq1_norm' not found in loaded model");
 
   idx_rmsnorm_rho1_norm = -1;
@@ -503,7 +531,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   if (idx_rmsnorm_rho1_norm < 0)
     GRACE_KK_ERROR("GRACE-3L/KK: rmsnorm 'rho1_norm' not found in loaded model");
 
-  // ---- Task 2.8: locate the L2 SPBF "A2" (equivariant) by NAME (defensive;
+  // ---- locate the L2 SPBF "A2" (equivariant) by NAME (defensive;
   // spbf order is [A1,A2,A3]). Used by the radial-MLP + A2-assembly kernels. ----
   idx_spbf_A2 = -1;
   for (int i = 0; i < (int) m.spbf.size(); i++)
@@ -513,8 +541,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   if (!m.spbf[idx_spbf_A2].equivariant)
     GRACE_KK_ERROR("GRACE-3L/KK: SPBF 'A2' is not equivariant (unexpected schema)");
 
-  // ---- Task 2.9: locate the remaining L2 chain by NAME (index-parallel with
-  // d_prod/d_reduce/d_fc/d_eqnorm/d_rmsnorm, same convention as the Task 2.7
+  // ---- locate the remaining L2 chain by NAME (index-parallel with
+  // d_prod/d_reduce/d_fc/d_eqnorm/d_rmsnorm, same convention as the
   // L1 block above). L2 differs from L1 in ONE structural way: every
   // downstream product/FC here is built on A2_red (a reduce of the raw SPBF
   // output A2), not on A2 itself — so there is one extra reduce (A2_red)
@@ -624,10 +652,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
     GRACE_KK_ERROR("GRACE-3L/KK: reduce 'rho2' not found in loaded model");
   resolve_l2_roles(m.reduce[idx_reduce_rho2], rho2_input_role);
 
-  idx_eqnorm_eq2_norm = -1;
-  for (int i = 0; i < (int) m.eqnorm.size(); i++)
-    if (m.eqnorm[i].name == "eq2_norm") { idx_eqnorm_eq2_norm = i; break; }
-  if (idx_eqnorm_eq2_norm < 0)
+  if (idx_eqnorm_eq2_norm < 0)    // resolved in set_model()
     GRACE_KK_ERROR("GRACE-3L/KK: eqnorm 'eq2_norm' not found in loaded model");
 
   idx_rmsnorm_rho2_norm = -1;
@@ -636,7 +661,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
   if (idx_rmsnorm_rho2_norm < 0)
     GRACE_KK_ERROR("GRACE-3L/KK: rmsnorm 'rho2_norm' not found in loaded model");
 
-  // ---- Task 2.10: locate the L3 SPBF "A3" (equivariant) by NAME (defensive;
+  // ---- locate the L3 SPBF "A3" (equivariant) by NAME (defensive;
   // spbf order is [A1,A2,A3]). Its indicator is eq2_norm (parity-doubled). ----
   idx_spbf_A3 = -1;
   for (int i = 0; i < (int) m.spbf.size(); i++)
@@ -660,7 +685,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
                "size L1_nradmax={} (d_R1_nl/d_DR1_nl sized to L1_nradmax)",
                m.spbf[idx_spbf_A3].n_rad_max, L1_nradmax);
 
-  // ---- Task 2.10: remaining L3 chain by NAME. Structurally identical to L2
+  // ---- remaining L3 chain by NAME. Structurally identical to L2
   // (built on A3_red, a reduce of the raw SPBF output A3), EXCEPT L3 is
   // TERMINAL: it produces ONLY rho3/rho3_norm — there is NO eq3. ----
   idx_reduce_A3_red = -1;
@@ -790,19 +815,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
                  uq_d_basis_rho1, uq_d_basis_rho2, uq_d_basis_rho3, m.uq_d_basis);
   }
 
-  // ---- Task 2.8/2.10: inter-layer message comm sizing. Round 1 forward-comms
+  // ---- inter-layer message comm sizing. Round 1 forward-comms
   // the Layer-2 indicator eq1_norm [nall, n_out=64, M=25] (I_n_funcs*I_n_out =
   // 1600/atom); round 2 forward-comms the Layer-3 indicator eq2_norm
   // [nall, n_out=64, M=50] (I2_n_funcs*I2_n_out = 3200/atom, PARITY-DOUBLED).
   // comm_forward is the MAX of the two payloads so the shared comm buffer fits
   // both stages; comm_stage selects which at each forward_comm. comm_reverse is
-  // ALSO the MAX (Task 3.2): round-1 reverse-comms grad_I [I_n_funcs*I_n_out=1600]
-  // (Task 3.3), round-2 reverse-comms the eq2_norm message adj [I2_n_funcs*
-  // I2_n_out=3200]; the shared reverse buffer must fit the larger stage. ----
-  I_n_funcs = m.eqnorm[idx_eqnorm_eq1_norm].n_out;
-  I_n_out   = m.eqnorm[idx_eqnorm_eq1_norm].M;
-  I2_n_funcs = m.eqnorm[idx_eqnorm_eq2_norm].n_out;
-  I2_n_out   = m.eqnorm[idx_eqnorm_eq2_norm].M;
+  // ALSO the MAX: round-1 reverse-comms grad_I [I_n_funcs*I_n_out=1600],
+  // round-2 reverse-comms the eq2_norm message adj [I2_n_funcs*
+  // I2_n_out=3200]; the shared reverse buffer must fit the larger stage. The dims are set in set_model(). ----
   log.info(fmt("[GRACE-3L/KK] Initialization complete: weights on device "
                "(SPBF={} products={} reduces={} FCs={} eqnorms={} rmsnorms={}) | "
                "comm_forward={} (round1 I_n_funcs={} I_n_out={}; "
@@ -811,15 +832,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
                std::max(comm_width(0), comm_width(1)), I_n_funcs, I_n_out, I2_n_funcs, I2_n_out));
 
 #ifdef GRACE_KK_GEMM
-  // ---- Opt 15: create the BLAS handle (grace/kk/blas.h) once, bind it to the SAME stream the
+  // ---- create the BLAS handle (grace/kk/blas.h) once, bind it to the SAME stream the
   // Kokkos parallel_fors launch on (the default DeviceType instance), and force
   // TRUE fp32 (CUBLAS_PEDANTIC_MATH disables the Ampere+ tf32 default). Same-stream
   // binding makes the GEMMs and the surrounding Kokkos assembly/activation kernels
   // execute in issue order with NO race and NO explicit fences. Without cuBLAS
   // (GRACE_KK_CUBLAS_DLOPEN and no libcublas, or GRACE_RUNTIME_NO_CUBLAS) the handle stays
-  // null and every cuBLAS path takes its hand-written kernel. ----
-  // HIP: fp32 engines only. rocBLAS (loaded at run time) for the fp32 GEMM paths (cp_l projections Opt 16 / 18,
-  // ReduceN Opt 17, FC GEMM; the radial MLP stays on the tables / hand kernels). Created here, not in the first
+  // null and every BLAS path takes its hand-written kernel. ----
+  // HIP: fp32 engines only. rocBLAS (loaded at run time) for the fp32 GEMM paths (cp_l projections,
+  // ReduceN, FC GEMM; the radial MLP stays on the tables / hand kernels). Created here, not in the first
   // compute, so the library is loaded during setup. Without librocblas or with GRACE_RUNTIME_NO_ROCBLAS: the same GEMM
   // paths on the hand-written Kokkos GEMMs (kk_gemm.h); GRACE_RUNTIME_NO_KKGEMM as well: no handle, the fused
   // hand-written kernels.
@@ -827,13 +848,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
     if (!blas_handle && blas::available()) {
       if (blas::create(&blas_handle) != blas::SUCCESS) {
         blas_handle = nullptr;    // optional BLAS (e.g. no device memory left): the hand-written kernels
-        if constexpr (!blas::optional) GRACE_KK_ERROR("GRACE-3L/KK: cublasCreate failed");
+        if constexpr (!blas::optional) GRACE_KK_ERROR("GRACE-3L/KK: BLAS handle creation failed");
       }
       if (blas_handle) {
         blas_owner.reset(blas_handle, [](blas::handle_t h) { blas::destroy(h); });
         blas::set_stream(blas_handle, DeviceType());
         blas::set_pedantic_math(blas_handle);
-        mlp_cublas_selftest();   // tiny-case transpose/leading-dim gate (aborts on mismatch)
+        mlp_blas_selftest();   // tiny-case transpose/leading-dim gate (aborts on mismatch)
       }
     }
   }
@@ -851,7 +872,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
 #endif
 #else
   log.info(fmt("[GRACE-3L/KK] radial MLP: hand-written Kokkos kernels "
-               "(cuBLAS is CUDA-only; default on non-CUDA backends, e.g. HIP/AMD)\n"));
+               "(host build, no GEMM library)\n"));
 #endif
   build_fc_fold();
   setup_done = true;
@@ -987,7 +1008,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
     }
     Kokkos::deep_copy(ds.mlp_W, hW); Kokkos::deep_copy(ds.mlp_b, hb);
 #ifdef GRACE_KK_GEMM
-    // Opt 15: pack each layer's weights TIGHTLY row-major [n_in x n_out] for cuBLAS
+    // pack each layer's weights TIGHTLY row-major [n_in x n_out] for cuBLAS
     // (the padded LayoutLeft ds.mlp_W is not a contiguous per-layer block). lda=n_out.
     for (int l = 0; l < nl; l++) {
       const int ni = mlp.n_in[l], no = mlp.n_out[l];
@@ -1070,7 +1091,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
       // dense CG couple: [(lmax+1)^2 * n_lm_ind, nfunc]
       const int cg_rows = (int) (s.cg_W.size() / std::max(s.nfunc, 1));
       copy_2d(s.cg_W, ds.cg_W, cg_rows, s.nfunc, "g3l:spbf_cg_W");
-      // Opt 9: build sparse CSC/CSR forms of cg_W. CG selection rules make the
+      // build sparse CSC/CSR forms of cg_W. CG selection rules make the
       // matrix ~99% zeros (mean ~3-6 nnz per row/column), so the dense couple
       // loops in TagComputeSPBFFused (per-f over P) and TagComputeAdjProd
       // (per-p over f) wasted ~100-200x compute + L2 bandwidth streaming zeros.
@@ -1149,7 +1170,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
     copy_1d_int(c.left_ind, dc.left_ind, "g3l:prod_li");
     copy_1d_int(c.right_ind, dc.right_ind, "g3l:prod_ri");
     copy_1d_int(c.m_sum_ind, dc.m_sum_ind, "g3l:prod_si");
-    // Opt 14: pack (m_sum_ind, right_ind, left_ind) into one int32 per entry so
+    // pack (m_sum_ind, right_ind, left_ind) into one int32 per entry so
     // the fused couple loops stream half the index bytes. Hard-check the packing
     // bounds (li/ri < 256, m < 65536) — far beyond any plausible cp_l dims
     // (nlm <= (Lmax+1)^2, nfunc <= a few thousand).
@@ -1286,7 +1307,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
           [&](int i) { return c.left_ind[i]; }, dc.roff, dc.ra, dc.rb, dc.rcg, "g3l:prod_rcsr");
     }
 #ifdef GRACE_KK_GEMM
-    // Opt 16: pre-gather + transpose U/V into cuBLAS-friendly per-lm-slab weights
+    // pre-gather + transpose U/V into BLAS-friendly per-lm-slab weights
     // for the batched CPLBwdProject GEMM. Uw(w,n,r) = U(group_left(w), r, n) so each
     // w-slab is a tight col-major [rank x n_left] matrix (ldb=rank, w-stride=n_left*rank).
     // Same for Vw. One-time; ~a few MB total across all products.
@@ -1423,7 +1444,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
   }
 
 #ifdef GRACE_KK_GEMM
-  // ---- Opt 17: cuBLAS batched-GEMM scratch for the element-independent, non-only_invar,
+  // ---- BLAS batched-GEMM scratch for the element-independent, non-only_invar,
   //      single-instruction product reduces (A*_*_red). Fold norm*norm_map(f) into a
   //      per-connection col-major [n_out x n_in] weight block Wsc[c] (serves BOTH the
   //      forward rounds and the backward single batch), and precompute the forward round
@@ -1431,24 +1452,24 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
   //      beta=1 batched accumulate into `out` is race-free within a round). collect_ind must
   //      be a bijection over the input lm-columns so the backward writes DISTINCT adj_in
   //      slabs -> a single beta=1 batch with no scatter; this is verified per reduce below
-  //      and cuBLAS is disabled (hand-kernel fallback) for any reduce that violates it. ----
+  //      and BLAS is disabled (hand-kernel fallback) for any reduce that violates it. ----
   reduceN_max_conn = 0;
   for (int ri = 0; ri < n_reduces; ri++) {
     const auto &r = m.reduce[ri];
     ReduceHost &hr = h_reduce[ri];
-    hr.cublas_ok = (!r.elem_dep && !r.only_invar && r.instr.size() == 1);
-    if (!hr.cublas_ok) continue;
+    hr.gemm_form_ok = (!r.elem_dep && !r.only_invar && r.instr.size() == 1);
+    if (!hr.gemm_form_ok) continue;
     const auto &ins = r.instr[0];
-    // The cuBLAS backward accumulates into adj_in slabs indexed by collect_ind in a single
+    // The BLAS backward accumulates into adj_in slabs indexed by collect_ind in a single
     // beta=1 batch, which is only race-free if collect_ind is a bijection (distinct value
-    // per connection). Verify it here; if any index repeats, disable cuBLAS for this reduce
+    // per connection). Verify it here; if any index repeats, disable BLAS for this reduce
     // and fall back to the hand kernel (which scatters safely).
     {
       std::unordered_set<int> seen_ci;
       bool ci_unique = true;
       for (int c = 0; c < ins.n_conn; c++)
         if (!seen_ci.insert(ins.collect_ind[c]).second) { ci_unique = false; break; }
-      if (!ci_unique) { hr.cublas_ok = false; continue; }
+      if (!ci_unique) { hr.gemm_form_ok = false; continue; }
     }
     const int n_out = r.n_out, n_in = ins.n_in, n_conn = ins.n_conn, w_shape = ins.w_shape;
     const int n_f = r.n_funcs;
@@ -1476,7 +1497,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
     int maxr = 0;
     for (int f = 0; f < n_f; f++) maxr = std::max(maxr, (int) byf[f].size());
     if (maxr > GRACE3L_MAX_REDUCE_ROUNDS)
-      GRACE_KK_ERROR("GRACE-3L/KK: reduce {} needs {} cuBLAS fwd rounds > cap {}",
+      GRACE_KK_ERROR("GRACE-3L/KK: reduce {} needs {} BLAS fwd rounds > cap {}",
                  r.name, maxr, GRACE3L_MAX_REDUCE_ROUNDS);
     hr.fwd_order.clear();
     hr.round_ptr[0] = 0;
@@ -1645,9 +1666,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
 }
 
 // ======================================================================
-// grow: allocate per-chunk geometry arrays (Task 2.3). Later Phase 2/3 tasks
-// extend this with per-atom / per-bond NN intermediate arrays as they add
-// the kernels that need them.
+// grow: allocate the per-chunk geometry arrays and the per-atom / per-bond NN
+// intermediate arrays.
 // ======================================================================
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -1689,14 +1709,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
       cpl_ld = natom;
       MemKK::realloc_kokkos(d_cpl_store, "g3l:cpl_store", std::max(tot, 1L));
     }
-    // FunctionReduceN / FCRight2Left outputs (Task 2.6).
+    // FunctionReduceN / FCRight2Left outputs.
     MemKK::realloc_kokkos(d_A1_2_red, "g3l:A1_2_red", natom,
                           std::max(d_reduce[idx_reduce_A1_2_red].n_out, 1),
                           std::max(d_reduce[idx_reduce_A1_2_red].n_funcs, 1));
     MemKK::realloc_kokkos(d_A1_2a, "g3l:A1_2a", fold_on[0] ? 1 : natom,
                           std::max(d_fc[idx_fc_A1_2a].n_out, 1),
                           std::max(d_fc[idx_fc_A1_2a].n_funcs_left, 1));
-    // Remaining L1 chain (Task 2.7).
+    // Remaining L1 chain.
     pool_add(fwd, d_A1_3, std::max(d_prod[idx_prod_A1_3].rank, 1), std::max(d_prod[idx_prod_A1_3].nfunc, 1));
     MemKK::realloc_kokkos(d_A1_3_red, "g3l:A1_3_red", natom,
                           std::max(d_reduce[idx_reduce_A1_3_red].n_out, 1),
@@ -1720,9 +1740,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_rho1_norm, "g3l:rho1_norm", natom,
                           std::max(d_rmsnorm[idx_rmsnorm_rho1_norm].n_out, 1),
                           std::max(d_reduce[idx_reduce_rho1].n_funcs, 1));
-    // Task 2.8: L2 equiv-ind SPBF basis A2 [atoms, A2_n_rad_max, A2_nfunc].
+    // L2 equiv-ind SPBF basis A2 [atoms, A2_n_rad_max, A2_nfunc].
     pool_add(fwd, d_A2, std::max(d_spbf[idx_spbf_A2].n_rad_max, 1), std::max(d_spbf[idx_spbf_A2].nfunc, 1));
-    // Task 2.9: remaining L2 chain (identical structure to L1's Task 2.6/2.7
+    // remaining L2 chain (identical structure to L1's
     // allocations, EXCEPT everything downstream of A2 here is built on
     // A2_red — the one extra reduce L2 has that L1 does not).
     MemKK::realloc_kokkos(d_A2_red, "g3l:A2_red", natom,
@@ -1758,8 +1778,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_rho2_norm, "g3l:rho2_norm", natom,
                           std::max(d_rmsnorm[idx_rmsnorm_rho2_norm].n_out, 1),
                           std::max(d_reduce[idx_reduce_rho2].n_funcs, 1));
-    // Task 2.10: L3 equiv-ind SPBF basis A3 [atoms, A3_n_rad_max, A3_nfunc] +
-    // the terminal L3 chain. Identical structure to L2's Task 2.9 allocations
+    // L3 equiv-ind SPBF basis A3 [atoms, A3_n_rad_max, A3_nfunc] +
+    // the terminal L3 chain. Identical structure to L2's allocations
     // (everything downstream of A3 is built on A3_red) EXCEPT there is NO eq3;
     // A3_3/A3_4 are Lmax=0 so their dims come from the resolved metadata.
     pool_add(fwd, d_A3, std::max(d_spbf[idx_spbf_A3].n_rad_max, 1), std::max(d_spbf[idx_spbf_A3].nfunc, 1));
@@ -1790,13 +1810,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_rho3_norm, "g3l:rho3_norm", natom,
                           std::max(d_rmsnorm[idx_rmsnorm_rho3_norm].n_out, 1),
                           std::max(d_reduce[idx_reduce_rho3].n_funcs, 1));
-    // Task 2.11: per-atom readout energy (fp64), chunk-local like rho3_norm.
+    // per-atom readout energy (fp64), chunk-local like rho3_norm.
     MemKK::realloc_kokkos(d_e_atom, "g3l:e_atom", natom);
 
-    // ---- Task 3.1: backward adjoint buffers (each mirrors its forward tensor's
-    // shape). rho{1,2}_(norm_)adj are produced for Tasks 3.2/3.3 reuse; only the
-    // rho3 -> L3 -> A3 chain is exercised/gated here. ----
-    // Task 3.5b: d_rho1_norm_adj/d_rho2_norm_adj are now natom ([nall]) and
+    // ---- backward adjoint buffers (each mirrors its forward tensor's
+    // shape). d_rho{1,2}_norm_adj are seeded by the readout backward (P3) and
+    // consumed in P4 / P5. ----
+    // d_rho1_norm_adj/d_rho2_norm_adj are natom ([nall]) and
     // allocated in grow_global(); here we allocate only their chunk-scratch
     // gather targets (fed to the shared TagRMSNormBwd per chunk in P5/P4).
     MemKK::realloc_kokkos(d_rho1_norm_adj_local, "g3l:rho1_norm_adj_local", natom,
@@ -1839,7 +1859,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
                           std::max(d_reduce[idx_reduce_A3_4_red].n_out, 1),
                           std::max(d_reduce[idx_reduce_A3_4_red].n_funcs, 1));
     pool_add(adj, d_A3_adj, std::max(d_spbf[idx_spbf_A3].n_rad_max, 1), std::max(d_spbf[idx_spbf_A3].nfunc, 1));
-    // Opt 4: shared adj_prod buffer. Sized to the MAX over the equiv layers
+    // shared adj_prod buffer. Sized to the MAX over the equiv layers
     // (A2/A3) of n_rad_max and P = nlm_y*n_lm_ind, so one buffer serves both.
     {
       const int nlm_y = (lmax + 1) * (lmax + 1);
@@ -1858,7 +1878,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_cpl_adjbuf, "g3l:cpl_adjbuf",
                           (size_t) natom * 2 * std::max(cpl_scratch_rank, 1) * std::max(cpl_scratch_nlm, 1));
 
-    // ---- Task 3.2: Layer-2 backward adjoint buffers (mirror the L3 d_A3_* set;
+    // ---- Layer-2 backward adjoint buffers (mirror the L3 d_A3_* set;
     // each matches its forward L2 tensor's shape). d_rho2_(norm_)adj already
     // allocated above. ----
     MemKK::realloc_kokkos(d_A2_red_adj, "g3l:A2_red_adj", natom,
@@ -1890,7 +1910,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_eq2_norm_adj_local, "g3l:eq2_norm_adj_local", natom,
                           std::max(I2_n_funcs, 1), std::max(I2_n_out, 1));
 
-    // ---- Task 3.3: Layer-1 backward adjoint buffers (mirror the L1 forward
+    // ---- Layer-1 backward adjoint buffers (mirror the L1 forward
     // tensor shapes). d_A1_adj is the direct fan-out target (raw A1). ----
     pool_add(adj, d_A1_2_adj, std::max(d_prod[0].rank, 1), std::max(d_prod[0].nfunc, 1));
     MemKK::realloc_kokkos(d_A1_2_red_adj, "g3l:A1_2_red_adj", natom,
@@ -1915,7 +1935,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     MemKK::realloc_kokkos(d_eq1_adj, "g3l:eq1_adj", natom,
                           std::max(d_reduce[idx_reduce_eq1].n_out, 1),
                           std::max(d_reduce[idx_reduce_eq1].n_funcs, 1));
-    // d_rho1_adj already allocated with the rho{1,2,3}_adj set (Task 3.1).
+    // d_rho1_adj already allocated with the rho{1,2,3}_adj set.
     MemKK::realloc_kokkos(d_eq1_norm_adj_local, "g3l:eq1_norm_adj_local", natom,
                           std::max(I_n_funcs, 1), std::max(I_n_out, 1));
   }
@@ -1947,14 +1967,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
     for (int si : {idx_spbf_A2, idx_spbf_A3}) ydy = ydy || (spbf_fast_ok(si) && spbf_use_mfma(si));
     if (ydy) MemKK::realloc_kokkos(d_spbf_ydy, "g3l:spbf_ydy", natom, (lmax + 1) * (lmax + 1), 4 * maxneigh_in);
     else MemKK::drop(d_spbf_ydy);
-    // Task 3.3: the per-bond envelope derivative and the per-bond force buffer.
+    // the per-bond envelope derivative and the per-bond force buffer.
     MemKK::realloc_kokkos(d_denv, "g3l:denv", natom, maxneigh_in);
     MemKK::realloc_kokkos(d_f_ij, "g3l:f_ij", natom, maxneigh_in);
 #ifdef KOKKOS_ENABLE_CUDA
-    // Opt 15: batched cuBLAS radial-MLP scratch (value path). M = natom*maxneigh
+    // batched cuBLAS radial-MLP scratch (value path). M = natom*maxneigh
     // bonds; hidden widths = max n_out of layers 0/1 across all radial SPBFs.
     {
-      int Mrows = natom * maxneigh_in;
+      int64_t Mrows = (int64_t) natom * maxneigh_in;
       int nin0 = 1, mh0 = 1, mh1 = 1, mout = 1;
       for (int si = 0; si < n_spbf; si++) {
         const auto &mlp = grace_model->spbf[si].mlp;
@@ -1966,15 +1986,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
       // the assembled input X/dX is needed only by layers without the layer-0 split
       bool all_split = true;
       for (int si = 0; si < n_spbf; si++) all_split = all_split && mlp_split[si];
-      const int Mx = (all_split || spline_on) ? 1 : std::max(Mrows, 1);
+      const int64_t Mx = (all_split || spline_on) ? 1 : std::max<int64_t>(Mrows, 1);
       if (spline_on) Mrows = 1;
       MemKK::realloc_kokkos(d_mlp_X,  "g3l:mlp_X",  Mx, nin0);
-      MemKK::realloc_kokkos(d_mlp_h0, "g3l:mlp_h0", std::max(Mrows, 1), mh0);
-      MemKK::realloc_kokkos(d_mlp_h1, "g3l:mlp_h1", std::max(Mrows, 1), mh1);
-      // Opt 15b deriv-path scratch: dX is Chebyshev-only (nradbase cols).
+      MemKK::realloc_kokkos(d_mlp_h0, "g3l:mlp_h0", std::max<int64_t>(Mrows, 1), mh0);
+      MemKK::realloc_kokkos(d_mlp_h1, "g3l:mlp_h1", std::max<int64_t>(Mrows, 1), mh1);
+      // deriv-path scratch: dX is Chebyshev-only (nradbase cols).
       MemKK::realloc_kokkos(d_mlp_dX,  "g3l:mlp_dX",  Mx, std::max(nradbase, 1));
-      MemKK::realloc_kokkos(d_mlp_dh0, "g3l:mlp_dh0", std::max(Mrows, 1), mh0);
-      MemKK::realloc_kokkos(d_mlp_dh1, "g3l:mlp_dh1", std::max(Mrows, 1), mh1);
+      MemKK::realloc_kokkos(d_mlp_dh0, "g3l:mlp_dh0", std::max<int64_t>(Mrows, 1), mh0);
+      MemKK::realloc_kokkos(d_mlp_dh1, "g3l:mlp_dh1", std::max<int64_t>(Mrows, 1), mh1);
       (void) mout;   // the output GEMMs write d_R1_nl / d_DR1_nl directly
     }
 #endif
@@ -1996,11 +2016,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow(int natom, int 
 }
 
 // ======================================================================
-// grow_global (Task 2.8): allocate the global (nall-sized) inter-layer comm
+// grow_global: allocate the global (nall-sized) inter-layer comm
 // arrays for the Layer-2 indicator (eq1_norm) + its host mirror. Mirrors
-// GRACE-2L's grow_global; d_grad_I_global is sized too so the (unused-in-this-
-// task) reverse-comm path stays well-formed. Sized to I_n_funcs/I_n_out set
-// in setup().
+// GRACE-2L's grow_global; d_grad_I_global (the round-1 reverse-comm buffer) is
+// sized here too. Sized to I_n_funcs/I_n_out set in set_model().
 // ======================================================================
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -2012,20 +2031,20 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow_global(int nall
     h_I_global = decltype(h_I_global)();    // host copies: on first use (copy_rows_to_host, host comm only)
     h_grad_I_global = decltype(h_grad_I_global)();
   }
-  // Round-2 (L3) indicator buffer (Task 2.10): eq2_norm is parity-doubled
+  // Round-2 (L3) indicator buffer: eq2_norm is parity-doubled
   // (I2_n_out=50 vs I_n_out=25), so it needs its own [nall, I2_n_funcs, I2_n_out]
   // array — d_I_global cannot hold it. Separate extent check (distinct dims).
   if (realloc_all || (int) d_eq2_norm_global.extent(0) < nall) {
     MemKK::realloc_kokkos(d_eq2_norm_global, "g3l:eq2_norm_global", nall, I2_n_funcs, I2_n_out);
     h_eq2_norm_global = decltype(h_eq2_norm_global)();
   }
-  // Task 3.1: L3 message adjoint d_eq2_norm_adj — same [nall, I2_n_funcs, I2_n_out]
+  // L3 message adjoint d_eq2_norm_adj — same [nall, I2_n_funcs, I2_n_out]
   // sizing as d_eq2_norm_global (scattered by atomic_add to owned+ghost neighbors).
   if (realloc_all || (int) d_eq2_norm_adj.extent(0) < nall) {
     MemKK::realloc_kokkos(d_eq2_norm_adj, "g3l:eq2_norm_adj", nall, I2_n_funcs, I2_n_out);
     h_eq2_norm_adj = decltype(h_eq2_norm_adj)();    // host copy for the reverse-comm host path, on first use
   }
-  // Task 3.5a: natom promotions of d_rho1_norm/d_rho2_norm (see .h comment).
+  // natom promotions of d_rho1_norm/d_rho2_norm (see .h comment).
   // grow() above always runs before grow_global() in compute(), so
   // d_rho1_norm/d_rho2_norm already carry their correct (natom-independent)
   // trailing dims by this point — reuse them rather than re-deriving from the
@@ -2038,7 +2057,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::grow_global(int nall
     MemKK::realloc_kokkos(d_rho2_norm_full, "g3l:rho2_norm_full", nall,
                           (int) d_rho2_norm.extent(1), (int) d_rho2_norm.extent(2));
   }
-  // Task 3.5b: natom promotions of the rho1/rho2 readout-adjoint SEEDS. Written
+  // natom promotions of the rho1/rho2 readout-adjoint SEEDS. Written
   // by TagReadoutBwd at (ii+chunk_offset) across ALL P3 chunks (every owned row
   // fully ASSIGNED -> no pre-zero), then gathered natom->_local per chunk in
   // P5/P4. Trailing dims mirror d_rho{1,2}_norm (== d_rho3_norm_adj's dims, which
@@ -2300,11 +2319,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 // ======================================================================
 // Kernel: ComputeRadialBasis — Chebyshev (kind=1) basis T_1..T_nradbase,
 // RAW (no envelope folded in) + a separate polynomial cutoff envelope d_env.
-// Adapted from the validated GRACE-2L KOKKOS style: 2L multiplies the
+// Adapted from Grace2LKK: 2L multiplies the
 // envelope into d_radial_basis and also tracks its r-derivative; the 3L
-// oracle (numpy_forward_3l.chebyshev_basis/envelope) keeps them SEPARATE and
-// this task does not yet need the derivative (added by the force-kernel
-// task), so both are dropped here.
+// reference (chebyshev_basis / envelope) keeps them SEPARATE: the
+// envelope and its r-derivative go to d_env / d_denv.
 // ======================================================================
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -2353,9 +2371,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// Kernel: ComputeA1 (Task 2.4) — Layer-1 scalar-indicator SPBF assembly,
+// Kernel: ComputeA1 — Layer-1 scalar-indicator SPBF assembly,
 // per (central-atom ii, radial-channel n). Reproduces
-// numpy_forward_3l.spbf_scalar EXACTLY:
+// the reference spbf_scalar EXACTLY:
 //   a_nl[lm] = R1_nl[n, l_tile[lm]] * Y_bond[lm] * z_tr[mu_j][n] * env
 //   A1[ii,n,lm] = inv_avg_n_neigh * Sum_{j in neigh(ii)} a_nl[lm]
 // z_tr is the PRECOMPUTED per-element species table (norm folded once at
@@ -2399,21 +2417,20 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// Kernel: ComputeMLPEnergy (Task 2.11) — 3-density readout -> per-atom energy.
-// Oracle: numpy_forward_3l.py readout() (out1_origins = [rho1_norm, rho2_norm,
+// Kernel: ComputeMLPEnergy — 3-density readout -> per-atom energy.
+// Reference: readout() (out1_origins = [rho1_norm, rho2_norm,
 // rho3_norm]). For each origin, s = origin[:, :, 0] (the l=0 slice, LAST axis
 // index 0); channel 0 is a weightless linear skip, channels 1..31 feed the
 // MLP(31->64 silu ->1). ae_nn = e_mlp + lin; E_atom = ae_nn*output_scale +
 // shift[species]. rho3_norm is a chunk-scratch buffer indexed by the SAME
 // chunk-local ii used by the L3 rho kernels (written+read within this SAME P3
 // chunk, so that is safe). rho1_norm/rho2_norm are instead read from the natom
-// buffers d_rho{1,2}_norm_full at ii+chunk_offset (Task 3.5a) — the chunk-local
+// buffers d_rho{1,2}_norm_full at ii+chunk_offset — the chunk-local
 // d_rho1_norm/d_rho2_norm were written back in P1/P2 and, under multi-chunk,
 // hold only the LAST chunk by the time P3 runs, so reading them chunk-local
 // here would silently pick up the wrong atoms' densities for every chunk but
-// the last. Backward (readout_bwd, TagReadoutBwd below) is UNCHANGED — it
-// still reads d_rho1_norm/d_rho2_norm chunk-local, which is fine only in the
-// single-chunk regime and stays a known limitation until Task 3.5b.
+// the last. The backward (TagReadoutBwd) reads the same natom buffers and writes
+// the rho1/rho2 adjoints to d_rho{1,2}_norm_adj at ii+chunk_offset.
 // ======================================================================
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -2744,14 +2761,11 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_rows_to_host(int layer, bool reverse)
 {
   // the host copies exist only for the host comm path (LAMMPS legacy pair comm): made here on first use
-  auto mirror = [](auto &h, const auto &d) {
-    if (h.extent(0) != d.extent(0) || h.extent(1) != d.extent(1) || h.extent(2) != d.extent(2))
-      h = Kokkos::create_mirror_view(d.base());
-  };
-  mirror(h_I_global, d_I_global);
-  mirror(h_grad_I_global, d_grad_I_global);
-  mirror(h_eq2_norm_global, d_eq2_norm_global);
-  mirror(h_eq2_norm_adj, d_eq2_norm_adj);
+  using M = grace::kk::MemKK;
+  M::ensure_mirror(h_I_global, d_I_global);
+  M::ensure_mirror(h_grad_I_global, d_grad_I_global);
+  M::ensure_mirror(h_eq2_norm_global, d_eq2_norm_global);
+  M::ensure_mirror(h_eq2_norm_adj, d_eq2_norm_adj);
   if (layer == 1) {
     if (reverse) Kokkos::deep_copy(h_eq2_norm_adj.base(), d_eq2_norm_adj.base());
     else Kokkos::deep_copy(h_eq2_norm_global.base(), d_eq2_norm_global.base());
@@ -2925,8 +2939,8 @@ template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Trait
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagPackReverseComm, const int& idx) const
 {
-  // Stage 2 (Task 3.2): pack the round-2 eq2_norm message adjoint (d_eq2_norm_adj,
-  // parity-doubled lm); stage 1: pack round-1 grad_I (d_grad_I_global, Task 3.3).
+  // Stage 2: pack the round-2 eq2_norm message adjoint (d_eq2_norm_adj,
+  // parity-doubled lm); stage 1: pack round-1 grad_I (d_grad_I_global).
   const int i = idx / comm_nfo, q = idx - i * comm_nfo;
   const int j = comm_first + i;
   if (comm_stage == 2) v_buf(idx) = d_eq2_norm_adj(j, q / I2_n_out, q % I2_n_out);
@@ -2957,7 +2971,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagUnpac
 }
 
 // ======================================================================
-// Task 3.5b: forward-chunk recompute helpers. l1_forward_chunk() runs the full
+// forward-chunk recompute helpers. l1_forward_chunk() runs the full
 // Layer-1 forward body (geometry -> A1 chain -> eq1_norm/rho1_norm + the natom
 // ScatterRho1Norm) for the CURRENT chunk (member chunk_offset/chunk_size), but
 // STOPS BEFORE the global eq1_norm scatter (P1 does that; the backward recompute
@@ -2994,21 +3008,21 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l1_forward_chunk()
     Kokkos::parallel_for("ComputeRadialBasis", policy, *this);
   }
 
-  // ---- Stage 3: ComputeMLPRadial — Layer-1 radial MLP (Task 2.4) ----
-  // ---- Stage 4: ComputeA1 — Layer-1 scalar-indicator SPBF basis (Task 2.4) ----
+  // ---- Stage 3: ComputeMLPRadial — Layer-1 radial MLP ----
+  // ---- Stage 4: ComputeA1 — Layer-1 scalar-indicator SPBF basis ----
   radial_mlp_spbf = 0;   // A1
   if (l1_radial_fused()) {
     compute_A1_tables();    // fuse_radial: the radial from the tables inside ComputeA1
   } else {
-    compute_mlp_radial();  // Opt 15: cuBLAS SGEMM path (or hand-kernel fallback)
+    compute_mlp_radial();  // cuBLAS SGEMM path (or hand-kernel fallback)
     Kokkos::parallel_for("ComputeA1",
         Kokkos::RangePolicy<DeviceType, TagComputeA1>(0, chunk_size * L1_nradmax), *this);
   }
 
-  // ---- Stage 5: cp_l product A1_2 = cp_l(A1, A1) (Task 2.5) ----
+  // ---- Stage 5: cp_l product A1_2 = cp_l(A1, A1) ----
   compute_cp_l(d_prod[0], d_A1, d_A1, d_A1_2);
 
-  // ---- Stage 6: FunctionReduceN A1_2_red = reduce_n({"A1_2": A1_2}) (Task 2.6) ----
+  // ---- Stage 6: FunctionReduceN A1_2_red = reduce_n({"A1_2": A1_2}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A1_2;   // matches reduce["A1_2_red"].instr[0].name == "A1_2" (checked in setup())
@@ -3024,7 +3038,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l1_forward_chunk()
     compute_cp_l(d_prod[idx_prod_A1_3], d_A1_2a, d_A1, d_A1_3);
   }
 
-  // ---- Stage 9: FunctionReduceN A1_3_red = reduce_n({"A1_3": A1_3}) (Task 2.7) ----
+  // ---- Stage 9: FunctionReduceN A1_3_red = reduce_n({"A1_3": A1_3}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A1_3;   // matches reduce["A1_3_red"].instr[0].name == "A1_3" (checked in setup())
@@ -3039,7 +3053,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l1_forward_chunk()
     compute_cp_l(d_prod[idx_prod_A1_4], d_A1_2b, d_A1_2b, d_A1_4);
   }
 
-  // ---- Stage 12: FunctionReduceN A1_4_red = reduce_n({"A1_4": A1_4}) (Task 2.7) ----
+  // ---- Stage 12: FunctionReduceN A1_4_red = reduce_n({"A1_4": A1_4}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A1_4;   // matches reduce["A1_4_red"].instr[0].name == "A1_4" (checked in setup())
@@ -3071,7 +3085,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l1_forward_chunk()
   // ---- Stage 16: InvariantLayerRMSNorm rho1_norm = invariant_rms_norm(rho1) ----
   compute_invariant_rms_norm(d_rmsnorm[idx_rmsnorm_rho1_norm], d_rho1, d_rho1_norm);
 
-  // ---- Stage 16b (Task 3.5a): scatter rho1_norm into the natom buffer
+  // ---- Stage 16b: scatter rho1_norm into the natom buffer
   // d_rho1_norm_full (dense list-order index ii+chunk_offset; local-only, no comm). ----
   {
     auto rho1n = d_rho1_norm;
@@ -3118,11 +3132,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
   // (fuse_radial: the fast SPBF forward reads the tables itself)
   radial_mlp_spbf = idx_spbf_A2;
   if (!(fuse_radial && spline_on && spbf_rm_ok(idx_spbf_A2, idx_reduce_A2_red)))
-    compute_mlp_radial();  // Opt 15: cuBLAS SGEMM path (or hand-kernel fallback)
+    compute_mlp_radial();  // cuBLAS SGEMM path (or hand-kernel fallback)
 
-  // ---- L2 Stage 2: ComputeA2 — equiv-indicator SPBF basis (Task 2.8) ----
-  // Opt 6: fused team+shared kernel (indicator = d_I_global, out = d_A2).
-  // ---- L2 Stage 3: FunctionReduceN A2_red = reduce_n({"A2": A2}) (Task 2.9) ----
+  // ---- L2 Stage 2: ComputeA2 — equiv-indicator SPBF basis ----
+  // fused team+shared kernel (indicator = d_I_global, out = d_A2).
+  // ---- L2 Stage 3: FunctionReduceN A2_red = reduce_n({"A2": A2}) ----
 #ifdef GRACE_KK_GEMM
   if (spbf_rm_ok(idx_spbf_A2, idx_reduce_A2_red)) {
     spbf_fwd_fast(idx_spbf_A2, d_I_global, d_A2, true);
@@ -3136,10 +3150,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
     compute_reduceN(d_reduce[idx_reduce_A2_red], inputs, d_A2_red);
   }
 
-  // ---- L2 Stage 4: cp_l product A2_2 = cp_l(A2_red, A2_red) (Task 2.9) ----
+  // ---- L2 Stage 4: cp_l product A2_2 = cp_l(A2_red, A2_red) ----
   compute_cp_l(d_prod[idx_prod_A2_2], d_A2_red, d_A2_red, d_A2_2);
 
-  // ---- L2 Stage 5: FunctionReduceN A2_2_red = reduce_n({"A2_2": A2_2}) (Task 2.9) ----
+  // ---- L2 Stage 5: FunctionReduceN A2_2_red = reduce_n({"A2_2": A2_2}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A2_2;   // matches reduce["A2_2_red"].instr[0].name == "A2_2" (checked in setup())
@@ -3155,7 +3169,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
     compute_cp_l(d_prod[idx_prod_A2_3], d_A2_2a, d_A2_red, d_A2_3);
   }
 
-  // ---- L2 Stage 8: FunctionReduceN A2_3_red = reduce_n({"A2_3": A2_3}) (Task 2.9) ----
+  // ---- L2 Stage 8: FunctionReduceN A2_3_red = reduce_n({"A2_3": A2_3}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A2_3;   // matches reduce["A2_3_red"].instr[0].name == "A2_3" (checked in setup())
@@ -3171,7 +3185,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
     compute_cp_l(d_prod[idx_prod_A2_4], d_A2_2b, d_A2_2b, d_A2_4);
   }
 
-  // ---- L2 Stage 11: FunctionReduceN A2_4_red = reduce_n({"A2_4": A2_4}) (Task 2.9) ----
+  // ---- L2 Stage 11: FunctionReduceN A2_4_red = reduce_n({"A2_4": A2_4}) ----
   {
     t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR];
     inputs[0] = d_A2_4;   // matches reduce["A2_4_red"].instr[0].name == "A2_4" (checked in setup())
@@ -3203,7 +3217,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
   // ---- L2 Stage 15: InvariantLayerRMSNorm rho2_norm = invariant_rms_norm(rho2) ----
   compute_invariant_rms_norm(d_rmsnorm[idx_rmsnorm_rho2_norm], d_rho2, d_rho2_norm);
 
-  // ---- L2 Stage 15b (Task 3.5a): scatter rho2_norm into the natom buffer
+  // ---- L2 Stage 15b: scatter rho2_norm into the natom buffer
   // d_rho2_norm_full (dense list-order index ii+chunk_offset; local-only, no comm). ----
   {
     auto rho2n = d_rho2_norm;
@@ -3220,12 +3234,12 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::l2_forward_chunk()
 }
 
 // ======================================================================
-// Task 3.5b: scatter_forces_chunk — scatter the CURRENT chunk's per-bond force
+// scatter_forces_chunk — scatter the CURRENT chunk's per-bond force
 // buffer d_f_ij into the global force array f[] (atomic; F_i += f_ij, F_j -=
 // f_ij) and accumulate the per-bond virial into virial[] (+=) / d_vatom /
-// d_cvatom. Extracted VERBATIM from the old single-shot PHASE 6b. Called once
-// per layer per chunk (after that layer's force kernel), so each layer's
-// partial force accumulates into f[]/virial[] independently -> identical total.
+// d_cvatom. Called once per layer per chunk (after that layer's force kernel),
+// so each layer's partial force accumulates into f[]/virial[] independently ->
+// identical total.
 // ======================================================================
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::scatter_forces_chunk()
@@ -3393,7 +3407,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
   if (couple_eq && (d_cpl.extent(0) < d_rnorms.extent(0) || d_cpl.extent(1) < d_rnorms.extent(1)))
     MemKK::realloc_kokkos(d_cpl, "g3l:cpl", d_rnorms.extent(0), d_rnorms.extent(1));
 
-  // Global (nall-sized) arrays for the inter-layer message comm (Task 2.8).
+  // Global (nall-sized) arrays for the inter-layer message comm.
   nall = in.nall;
   grow_global(nall);
   realloc_all = false;
@@ -3402,7 +3416,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
   // ghost rows by comm->forward_comm; zeroing guards any atom left untouched.
   Kokkos::deep_copy(d_I_global.base(), NNScalar(0.0));
   // Round-2 (L3) indicator buffer: owned rows written by the L2 loop's eq2_norm
-  // scatter, ghost rows by the round-2 forward_comm (Task 2.10). Zero first.
+  // scatter, ghost rows by the round-2 forward_comm. Zero first.
   Kokkos::deep_copy(d_eq2_norm_global.base(), NNScalar(0.0));
 
   // ---- UQ / extrapolation grade: allocate per-atom outputs up front. The
@@ -3442,7 +3456,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     select_fwd_store(1, chunk_offset / std::min(chunk_lim, inum));
     l1_forward_chunk();
 
-    // ---- Stage 14b: scatter eq1_norm into the global indicator array (Task 2.8).
+    // ---- Stage 14b: scatter eq1_norm into the global indicator array.
     // d_eq1_norm is chunk-indexed (ii); write it to d_I_global at the atom's
     // LAMMPS local index i=d_ilist(ii+chunk_offset) so forward_comm can then
     // fill the ghost rows. Layout matches: (n_out, M) == (I_n_funcs, I_n_out). ----
@@ -3474,14 +3488,14 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     chunk_offset += chunk_size;
   }
 
-  // ============ PHASE 1.5: forward-comm eq1_norm to ghost atoms (Task 2.8) ====
+  // ============ PHASE 1.5: forward-comm eq1_norm to ghost atoms ====
   // Every owned atom's eq1_norm now lives in d_I_global; forward_comm copies
   // owned rows into their ghost images so the A2 kernel can read the neighbor
   // indicator at ghost ind_j. When legacy pair comm is active (GPU-aware MPI
   // off / multi-proc host path), LAMMPS pack/unpack reads h_I_global, so sync
   // device->host before and host->device after; otherwise the kokkos-native
   // pack/unpack operates on d_I_global directly. (Mirrors GRACE-2L.)
-  if (in.ex) in.ex->forward(0);   // round 1: eq1_norm rows of d_I_global (Task 2.10)
+  if (in.ex) in.ex->forward(0);   // round 1: eq1_norm rows of d_I_global
 
   // ============ PHASE 2: Layer-2 forward (chunked) — A2 ============
   // The per-chunk geometry arrays (d_ncount/d_nearest/d_rhats/d_radial_basis/
@@ -3500,7 +3514,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     l2_forward_chunk();
 
     // ---- L2 Stage 13b: scatter eq2_norm into the round-2 global indicator
-    // array (Task 2.10). d_eq2_norm is chunk-indexed (ii); write it to
+    // array. d_eq2_norm is chunk-indexed (ii); write it to
     // d_eq2_norm_global at the atom's LAMMPS local index i=d_ilist(ii+chunk_offset)
     // so the round-2 forward_comm (after all L2 chunks) can fill the ghost rows.
     // Layout matches: (n_out, M) == (I2_n_funcs, I2_n_out). Mirrors Stage 14b. ----
@@ -3532,7 +3546,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     chunk_offset += chunk_size;
   }
 
-  // ============ PHASE 2.5: forward-comm eq2_norm to ghost atoms (Task 2.10) ====
+  // ============ PHASE 2.5: forward-comm eq2_norm to ghost atoms ====
   // Every owned atom's eq2_norm now lives in d_eq2_norm_global; forward_comm
   // copies owned rows into their ghost images so the A3 kernel can read the
   // neighbor indicator at ghost ind_j. comm_stage=2 selects the round-2 buffer +
@@ -3546,7 +3560,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
   // A3's indicator is eq2_norm (in d_eq2_norm_global). L3 is TERMINAL: the
   // A3_red..rho3 chain mirrors L2's A2_red..rho2, but ends at rho3/rho3_norm —
   // there is NO eq3.
-  // Task 3.5b: zero the L3 message adjoint d_eq2_norm_adj ONCE, BEFORE the P3
+  // zero the L3 message adjoint d_eq2_norm_adj ONCE, BEFORE the P3
   // loop. It is an [nall] buffer that compute_A3_spbf_bwd atomic_add-scatters
   // across ALL chunks; zeroing it per-chunk (its old spot, inside the loop)
   // would wipe earlier chunks' contributions under multi-chunk.
@@ -3581,7 +3595,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
       Kokkos::parallel_for("L3_ComputeRadialBasis", policy, *this);
     }
 
-    // ---- L3 Stage 1: A3 radial MLP (spbf idx_spbf_A3). Opt 13: run the DERIV
+    // ---- L3 Stage 1: A3 radial MLP (spbf idx_spbf_A3). Run the DERIV
     // variant here instead of the plain forward — it reproduces the forward's
     // d_R1_nl bit-identically AND fills d_DR1_nl/d_denv, which Stage 15's force
     // path needs; nothing between Stage 1 and Stage 15 writes those buffers
@@ -3592,7 +3606,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     if (!(fuse_radial && spline_on && spbf_rm_ok(idx_spbf_A3, idx_reduce_A3_red))) compute_mlp_radial_deriv();
 
     // ---- L3 Stage 2: ComputeA3 — equiv-indicator SPBF basis (indicator=eq2_norm) ----
-    // Opt 6: fused team+shared kernel (indicator = d_eq2_norm_global, out = d_A3).
+    // fused team+shared kernel (indicator = d_eq2_norm_global, out = d_A3).
     // ---- L3 Stage 3: FunctionReduceN A3_red = reduce_n({"A3": A3}). L3's
     // downstream products/FCs are ALL built on this reduced A3_red (like L2). ----
 #ifdef GRACE_KK_GEMM
@@ -3685,11 +3699,11 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     // forward feature chain before readout. ----
     compute_invariant_rms_norm(d_rmsnorm[idx_rmsnorm_rho3_norm], d_rho3, d_rho3_norm);
 
-    // ---- L3 Stage 14 (Task 2.11): Readout — 3-density sum -> energy MLP
+    // ---- L3 Stage 14: Readout — 3-density sum -> energy MLP
     // (31->64 silu ->1) + lin skip + shift -> per-atom energy. rho3_norm is
     // read chunk-local (ii) since it was just written above for THIS chunk;
     // rho1_norm/rho2_norm are read from the natom buffers d_rho{1,2}_norm_full
-    // (ii+chunk_offset, Task 3.5a) because their chunk-scratch originals
+    // (ii+chunk_offset) because their chunk-scratch originals
     // (d_rho1_norm/d_rho2_norm, written back in P1/P2) hold only the LAST
     // chunk under multi-chunk by the time P3 runs. ----
     {
@@ -3718,12 +3732,12 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
         });
     }
 
-    // ---- L3 Stage 15 (Task 3.1): readout + Layer-3 backward (adjoints -> A3
+    // ---- L3 Stage 15: readout + Layer-3 backward (adjoints -> A3
     // basis + the L3 message adjoint d_eq2_norm_adj). Skipped in the energy-only
     // fast path (forces not requested); otherwise runs per chunk, reusing this
     // chunk's forward buffers. Zero every ACCUMULATING adjoint buffer, then walk
     // the L3 DAG in reverse topological order, ACCUMULATING (+=) where a tensor
-    // fans out to multiple consumers (see task-3.1 DAG). ----
+    // fans out to multiple consumers. ----
     if (!do_energy_only) {
       Kokkos::deep_copy(d_A3_red_adj, NNScalar(0.0));
       Kokkos::deep_copy(d_A3_2_red_adj, NNScalar(0.0));
@@ -3731,10 +3745,10 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
       Kokkos::deep_copy(d_A3_4_red_adj, NNScalar(0.0));
       if (!fold_on[2]) Kokkos::deep_copy(d_A3_2a_adj, NNScalar(0.0));
       if (!fold_on[2]) Kokkos::deep_copy(d_A3_2b_adj, NNScalar(0.0));
-      // NOTE (Task 3.5b): d_eq2_norm_adj is zeroed ONCE before the P3 loop (it
+      // NOTE: d_eq2_norm_adj is zeroed ONCE before the P3 loop (it
       // is [nall] and accumulated across chunks) — NOT here per chunk.
 
-      // (a) readout bwd -> d_rho{1,2,3}_norm_adj (all EQUAL; GATE 1 = rho3_norm).
+      // (a) readout bwd -> d_rho{1,2,3}_norm_adj (all EQUAL).
       readout_bwd();
 
       // (b) rho3_norm bwd (InvariantLayerRMSNorm, FULL branch) -> d_rho3_adj.
@@ -3779,7 +3793,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
       // (k) A3_2 = cp_l(A3_red, A3_red) self-product -> d_A3_red_adj += (both operands).
       compute_cp_l_bwd(d_prod[idx_prod_A3_2], d_A3_red, d_A3_red, d_A3_2_adj,
                        d_A3_red_adj, d_A3_red_adj);
-      // (l) A3_red -> A3  (d_A3_red_adj is now COMPLETE) => d_A3_adj  [GATE 2].
+      // (l) A3_red -> A3  (d_A3_red_adj is now COMPLETE) => d_A3_adj.
       const bool rm3 = spbf_rm_ok(idx_spbf_A3, idx_reduce_A3_red);
 #ifdef GRACE_KK_GEMM
       if (rm3) compute_reduceN_grouped_rm(idx_reduce_A3_red, d_A3_red_adj, true);   // -> d_spbf_T
@@ -3790,9 +3804,9 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
         t_nn_3d adj_in[GRACE3L_MAX_REDUCE_INSTR]; adj_in[0] = d_A3_adj;
         compute_reduceN_bwd(d_reduce[idx_reduce_A3_red], d_A3_red_adj, adj_in);
       }
-      // (m) A3 equiv-SPBF bwd -> d_eq2_norm_adj (L3 message adj; NOT reverse-comm'd
-      // here — its gate is Task 3.2, after reverse-comm completes ghost contribs).
-      // Opt 4: compute adj_prod ONCE here; A3SPBFBwd AND the later ForceEquiv(A3)
+      // (m) A3 equiv-SPBF bwd -> d_eq2_norm_adj (L3 message adj;
+      // reverse-comm'd in PHASE 3.5, which completes the ghost contributions).
+      // compute adj_prod ONCE here; A3SPBFBwd AND the later ForceEquiv(A3)
       // both read d_adj_prod (not overwritten between them in P3).
       const bool fast3 = spbf_fast_ok(idx_spbf_A3);
       if (!fast3) {
@@ -3800,9 +3814,9 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
         compute_A3_spbf_bwd();
       }
 
-      // ---- Task 3.5b: fold the L3 geometry force into P3 (per chunk). d_A3_adj
+      // ---- fold the L3 geometry force into P3 (per chunk). d_A3_adj
       // is complete for THIS chunk; A3's radial + dR/dr (d_R1_nl/d_DR1_nl/d_denv)
-      // are still resident from Stage 1's deriv run (Opt 13 — nothing in Stages
+      // are still resident from Stage 1's deriv run (nothing in Stages
       // 2-14 writes them), so no radial recompute here. Zero the per-bond force
       // buffer, run the equiv force kernel, and scatter into f[]/virial. f[]
       // (atomic_add) and virial[] (+=) accumulate across the 3 layers/phases and
@@ -3821,22 +3835,22 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
   // force computation; skip it all when forces are not requested. ----
   if (!do_energy_only) {
 
-  // ============ PHASE 3.5 (Task 3.2): reverse-comm the L2 message adjoint ======
+  // ============ PHASE 3.5: reverse-comm the L2 message adjoint ======
   // compute_A3_spbf_bwd scattered d_eq2_norm_adj into owned+ghost rows (the owned
   // PARTIAL); reverse_comm ADDS every ghost image back into its owning rank's row
-  // so the OWNED rows are now COMPLETE (== golden adj_eq2_norm after the tag fold).
+  // so the OWNED rows are now COMPLETE.
   // comm_stage=2 selects the parity-doubled eq2_norm buffer + dims (I2_n_funcs*
   // I2_n_out=3200/atom) in all 4 reverse pack/unpack methods. Mirrors the round-1
   // forward_comm branch structure (device vs legacy-host fallback). Do NOT re-zero
   // d_eq2_norm_adj — the scatter partial must survive into the reverse-comm. ----
   if (in.ex) in.ex->reverse(1);
 
-  // ============ PHASE 4 (Task 3.2/3.5b): Layer-2 backward (CHUNKED) ============
+  // ============ PHASE 4: Layer-2 backward (CHUNKED) ============
   // Each chunk RE-RUNS the L2 forward body (l2_forward_chunk) to repopulate the
   // chunk-scratch L2 forward intermediates (d_A2*, d_eq2, d_rho2, ...) + geometry
   // + A2's radial (d_R1_nl) for THIS chunk (correct because d_I_global is already
   // ghost-complete), gathers the reverse-comm-completed seeds, walks the L2 DAG
-  // -> d_A2_adj [GATE 2] -> A2-SPBF bwd -> d_grad_I_global (= d_eq1_norm_adj,
+  // -> d_A2_adj -> A2-SPBF bwd -> d_grad_I_global (= d_eq1_norm_adj,
   // owned partial), then FOLDS the L2 geometry force into f[]/virial.
   chunk_size = std::min(chunk_lim, inum);
   chunk_offset = 0;
@@ -3848,7 +3862,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
   // scratch) via the reordered compute_mlp_radial_deriv below. Multi-chunk (a later
   // chunk overwrites the earlier chunk's scratch) still recomputes.
   const bool single_chunk = (chunk_size >= inum);
-  // Task 3.5b: zero the round-1 message adjoint ONCE before the loop ([nall]
+  // zero the round-1 message adjoint ONCE before the loop ([nall]
   // buffer, atomic_add-scattered by compute_A2_spbf_bwd across ALL chunks).
   Kokkos::deep_copy(d_grad_I_global.base(), NNScalar(0.0));
   while (chunk_offset < inum) {
@@ -3905,7 +3919,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     if (!fold_on[1]) Kokkos::deep_copy(d_A2_2a_adj, NNScalar(0.0));
     if (!fold_on[1]) Kokkos::deep_copy(d_A2_2b_adj, NNScalar(0.0));
 
-    // (iv) L2 backward body (verbatim).
+    // (iv) L2 backward body.
     // (a) eq2_norm bwd (EquivariantRMSNorm VJP) -> d_eq2_adj (ASSIGN).
     compute_equiv_rms_norm_bwd(d_eqnorm[idx_eqnorm_eq2_norm], d_eq2,
         d_eq2_norm_adj_local, d_eq2_adj);
@@ -3960,7 +3974,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     // (l) A2_2 = cp_l(A2_red, A2_red) self-product -> d_A2_red_adj += (both operands).
     compute_cp_l_bwd(d_prod[idx_prod_A2_2], d_A2_red, d_A2_red, d_A2_2_adj,
                      d_A2_red_adj, d_A2_red_adj);
-    // (m) A2_red -> A2  (d_A2_red_adj now COMPLETE) => d_A2_adj  [GATE 2].
+    // (m) A2_red -> A2  (d_A2_red_adj now COMPLETE) => d_A2_adj.
     const bool rm2 = spbf_rm_ok(idx_spbf_A2, idx_reduce_A2_red);
 #ifdef GRACE_KK_GEMM
     if (rm2) compute_reduceN_grouped_rm(idx_reduce_A2_red, d_A2_red_adj, true);   // -> d_spbf_T
@@ -3984,7 +3998,7 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     if (!(fuse_radial && spline_on && spbf_fast_ok(idx_spbf_A2))) compute_mlp_radial_deriv();
 
     // (o) A2 equiv-SPBF bwd -> d_grad_I_global (= d_eq1_norm_adj, owned partial).
-    // Opt 4: compute adj_prod ONCE here; A2SPBFBwd AND the later ForceEquiv(A2)
+    // compute adj_prod ONCE here; A2SPBFBwd AND the later ForceEquiv(A2)
     // both read d_adj_prod (not overwritten between them in P4).
     // (v) fold the L2 geometry force into f[]/virial for THIS chunk.
     Kokkos::deep_copy(d_f_ij, GeomScalar(0.0));
@@ -4001,22 +4015,22 @@ Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput3 &in)
     chunk_offset += chunk_size;
   }
 
-  // ============ PHASE 4.5 (Task 3.3): reverse-comm the L1 message adjoint ======
+  // ============ PHASE 4.5: reverse-comm the L1 message adjoint ======
   // compute_A2_spbf_bwd scattered d_grad_I_global (= d_eq1_norm_adj) into owned+
   // ghost rows (owned PARTIAL); reverse_comm (comm_stage=1 -> the round-1 grad_I
   // branch in all 4 reverse pack/unpack methods) ADDS every ghost image back into
-  // its owning rank's row, so the OWNED rows are COMPLETE (== golden adj_eq1_norm).
+  // its owning rank's row, so the OWNED rows are COMPLETE.
   // Do NOT re-zero d_grad_I_global — the scatter partial must survive. ----
   if (in.ex) in.ex->reverse(0);
 
-  // ============ PHASE 5 (Task 3.3/3.5b): Layer-1 backward (CHUNKED) ============
+  // ============ PHASE 5: Layer-1 backward (CHUNKED) ============
   // Each chunk RE-RUNS the L1 forward body (l1_forward_chunk) to repopulate the
   // chunk-scratch L1 forward buffers (d_A1, d_A1_2, ..., d_eq1, d_rho1,
   // d_rho1_norm) + geometry + A1's radial (d_R1_nl) for THIS chunk. UNLIKE L2/L3,
   // the L1 chain consumes RAW A1 (there is no A1_red), so d_A1_adj is the DIRECT
   // fan-out target. Dual-seed the 4 l1_input adjoints from BOTH eq1 (equiv) and
-  // rho1 (invariant), walk the L1 DAG -> d_A1_adj [GATE 2], then FOLD the L1
-  // geometry force into f[]/virial. (P5 previously had NO chunk loop.)
+  // rho1 (invariant), walk the L1 DAG -> d_A1_adj, then FOLD the L1
+  // geometry force into f[]/virial.
   chunk_size = std::min(chunk_lim, inum);
   chunk_offset = 0;
   // Perf (single-chunk fast path): the L1 forward chunk-scratch (d_A1*, d_eq1,
@@ -4219,6 +4233,9 @@ double Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::memory_usage()
 
 }    // namespace kk
 }    // namespace grace
+
+// the explicit instantiation of GRACE_KK_EXTERN_3L (grace/kk/grace_3l_kk.h), in one translation unit
+#define GRACE_KK_INSTANTIATE_3L(Device, Traits) template class grace::kk::Grace3LKK<Device, float, float, Traits>
 
 // the kernels and their launchers
 #include "grace/kk/grace_3l_kk_radial.h"

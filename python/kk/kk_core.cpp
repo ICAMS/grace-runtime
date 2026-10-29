@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GPU backend of grace_runtime (kk_api.h): the fused GRACE-1L / 2L and the GRACE-3L Kokkos engines of libgrace on CSR
+// GPU backend of grace_runtime (kk_api.h): the fused GRACE-1L / 2L, the GRACE-3L and the PACE Kokkos engines of libgrace on CSR
 // bonds with ghost images (grace/kk/csr_images.h). Compiled through the Kokkos launch compiler; kk_module.cpp binds it to Python.
 #include "kk_api.h"
 
@@ -10,10 +10,13 @@
 #include "grace/kk/grace_1l_fused_kk_impl.h"
 #include "grace/kk/grace_2l_fused_kk_impl.h"
 #include "grace/kk/grace_3l_fused_kk.h"
+#include "grace/kk/pace_kk.h"
 #include "grace/kk/traits.h"
 #include "grace/model_1l.h"
 #include "grace/model_2l.h"
 #include "grace/model_3l.h"
+#include "grace/model_kind.h"
+#include "grace/pace_model.h"
 
 #include <Kokkos_Core.hpp>
 
@@ -22,7 +25,6 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <chrono>
 #include <limits>
 #include <mutex>
@@ -44,10 +46,11 @@ using Dev = Kokkos::DefaultExecutionSpace;
 using T = grace::kk::DefaultTraits<Dev>;
 using E1 = grace::kk::Grace1LFusedKK<Dev, T>;
 using E2 = grace::kk::Grace2LFusedKK<Dev, T>;
-using E3 = grace::kk::Grace3LFusedKK<Dev, T>;    // as LAMMPS grace/3l/fused/kk (fp32 with fp64 bonds / envelope)
+using E3 = grace::kk::Grace3LFusedKK<Dev, T>;    // as LAMMPS grace/runtime/kk (fp32 with fp64 bonds / envelope)
+using EP = grace::kk::PaceKK<Dev, T>;             // PACE (fp64)
 }    // namespace grace_runtime_kk
-extern template class grace::kk::Grace3LKK<Kokkos::DefaultExecutionSpace, float, float,
-                                           grace::kk::DefaultTraits<Kokkos::DefaultExecutionSpace>>;    // kk_core_3l.cpp
+// instantiated in kk_core_3l.cpp
+GRACE_KK_EXTERN_3L(Kokkos::DefaultExecutionSpace, grace::kk::DefaultTraits<Kokkos::DefaultExecutionSpace>);
 namespace grace_runtime_kk {
 
 namespace {
@@ -68,16 +71,14 @@ struct DeviceState {
 };
 std::set<DeviceState *> g_states;
 
+// "1l" / "2l" / "3l" / "pace" (grace::model_kind); not a model: invalid_argument
 std::string detect_layers(const std::string &path)
 {
-  // the archive's member names tell the generation (as python/src/core.cpp detect_arch)
-  std::ifstream f(path, std::ios::binary);
-  if (!f) throw std::invalid_argument("cannot open " + path);
-  std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  if (data.find("mlp_rad_W0.npy") != std::string::npos) return "1l";
-  if (data.find("B0_lin_transform_W.npy") != std::string::npos) return "2l";
-  if (data.find("prod_names.npy") != std::string::npos) return "3l";
-  throw std::invalid_argument("not a GRACE-1L/2L/3L kokkos.npz: " + path);
+  try {
+    return grace::model_kind_tag(grace::model_kind(path));
+  } catch (const grace::Error &e) {
+    throw std::invalid_argument(e.what());
+  }
 }
 }    // namespace
 
@@ -190,6 +191,8 @@ void debug_fail_alloc(const std::string &label, int nth)
   Kokkos::Tools::Experimental::set_allocate_data_callback(nth > 0 ? fail_alloc_cb : nullptr);
 }
 
+void debug_fail_launch(int nth) { grace::kk::g_fail_launch = std::max(0, nth); }
+
 // ---------------------------------------------------------------- Model
 
 // the fused engine of a Model for one (spline, chunksize): weights, spline tables, cuBLAS and work buffers set up once;
@@ -199,6 +202,7 @@ struct SharedEngine {
   std::unique_ptr<E1> e1;
   std::unique_ptr<E2> e2;
   std::unique_ptr<E3> e3;
+  std::unique_ptr<EP> ep;
   uint64_t owner = 0;    // Engines whose type tables are installed (Engines::id)
   // a device allocation failed in this engine: its work buffers may be half grown (realloc drops the old view first,
   // growth checks one view per block), so no compute uses it again; every holder attaches a fresh engine
@@ -210,6 +214,7 @@ struct SharedEngine {
       e1.release();
       e2.release();
       e3.release();
+      ep.release();
     }
   }
 };
@@ -219,6 +224,7 @@ struct Model::Impl : DeviceState {
   std::shared_ptr<grace::GRACE1LModel> m1;
   std::shared_ptr<grace::GRACE2LModel> m2;
   std::shared_ptr<grace::GRACE3LModel> m3;
+  std::shared_ptr<grace::PaceModel> mp;
   std::mutex emu;
   std::map<std::pair<int, int>, std::shared_ptr<SharedEngine>> engines;    // (spline, chunksize)
   int64_t setups = 0;
@@ -242,6 +248,7 @@ struct Model::Impl : DeviceState {
       kv.second->e1.reset();
       kv.second->e2.reset();
       kv.second->e3.reset();
+      kv.second->ep.reset();
     }
     engines.clear();
   }
@@ -262,7 +269,13 @@ struct Model::Impl : DeviceState {
     if (se) return se;
     auto e = std::make_shared<SharedEngine>();
     try {
-      if (m1) {
+      if (mp) {
+        e->ep = std::make_unique<EP>();
+        e->ep->spline_n = spline;
+        e->ep->chunksize = chunksize;
+        e->ep->set_model(mp, type2mu);
+        e->ep->setup();
+      } else if (m1) {
         e->e1 = std::make_unique<E1>();
         e->e1->spline_n = spline;
         e->e1->chunksize = chunksize;
@@ -297,11 +310,14 @@ struct Model::Impl : DeviceState {
   }
 };
 
-Model::Model(const std::string &path, int /*spline*/) : impl(std::make_shared<Impl>())
+Model::Model(const std::string &path, int /*spline*/, const std::string &asi) : impl(std::make_shared<Impl>())
 {
   impl->layers = detect_layers(path);
   try {
-    if (impl->layers == "1l") {
+    if (impl->layers == "pace") {
+      impl->mp = std::make_shared<grace::PaceModel>();
+      impl->mp->load(path, asi);
+    } else if (impl->layers == "1l") {
       impl->m1 = std::make_shared<grace::GRACE1LModel>();
       impl->m1->load(path);
     } else if (impl->layers == "3l") {
@@ -316,12 +332,19 @@ Model::Model(const std::string &path, int /*spline*/) : impl(std::make_shared<Im
   }
 }
 Model::~Model() = default;
-int Model::layers() const { return impl->m1 ? 1 : impl->m3 ? 3 : 2; }
-bool Model::has_uq() const { return impl->m1 ? impl->m1->has_uq : impl->m3 ? impl->m3->has_uq : impl->m2->has_uq; }
+int Model::layers() const { return impl->mp ? 0 : impl->m1 ? 1 : impl->m3 ? 3 : 2; }
+bool Model::has_uq() const
+{
+  return impl->mp ? impl->mp->has_uq : impl->m1 ? impl->m1->has_uq : impl->m3 ? impl->m3->has_uq : impl->m2->has_uq;
+}
 void Model::validate_uq() const
 {
   try {
-    if (impl->m1) impl->m1->validate_uq();
+    if (impl->mp) {    // the extrapolation grade from the model's active set
+      if (!impl->mp->has_uq)
+        throw grace::Error("the PACE model has no active set for the extrapolation grade: load it with "
+                           "Model(model.yaml, asi=model.asi)");
+    } else if (impl->m1) impl->m1->validate_uq();
     else if (impl->m3) {    // the 3L loader checks its UQ head itself
       if (!impl->m3->has_uq) throw grace::Error("the model has no UQ head (kokkos.npz exported without UQ artifacts)");
     } else impl->m2->validate_uq();
@@ -336,7 +359,8 @@ int64_t Model::engine_setups() const
 }
 std::vector<std::string> Model::element_names() const
 {
-  return impl->m1 ? impl->m1->element_names : impl->m3 ? impl->m3->element_names : impl->m2->element_names;
+  return impl->mp ? impl->mp->element_names : impl->m1 ? impl->m1->element_names
+                 : impl->m3 ? impl->m3->element_names : impl->m2->element_names;
 }
 
 // ---------------------------------------------------------------- System
@@ -363,10 +387,12 @@ struct Engines {
   E1 *e1 = nullptr;    // se's engines (valid while se lives and before finalize)
   E2 *e2 = nullptr;
   E3 *e3 = nullptr;
+  EP *ep = nullptr;
   bool have_tables = false;
   typename E1::TypeTables t1;
   typename E2::TypeTables t2;
   typename E3::TypeTables t3;
+  typename EP::TypeTables tp;
   std::shared_ptr<Model::Impl> mimpl;
   int spline = 1024, chunk = -1;
   // chunksize < 0: the engine's auto chunk (chunk -1: from the free GPU memory at each larger structure); after a
@@ -374,10 +400,14 @@ struct Engines {
   bool auto_chunk = false;
   int64_t last_n = 0;    // atoms of the last compute (chunksize(): one pass or the engine's auto chunk)
 
+  // out of device memory: an allocation (Kokkos), or a kernel launch / runtime call that ran out of it (the engines'
+  // check_kernel_launches, e.g. the local memory of a kernel's first launch on a nearly full GPU)
   static bool is_oom(const std::exception &e)
   {
-    return dynamic_cast<const std::bad_alloc *>(&e) != nullptr ||
-           std::string(e.what()).find("failed to allocate") != std::string::npos;
+    const std::string w = e.what();
+    auto has = [&](const char *s) { return w.find(s) != std::string::npos; };
+    return dynamic_cast<const std::bad_alloc *>(&e) != nullptr || has("failed to allocate") ||
+           has("cudaErrorMemoryAllocation") || has("hipErrorOutOfMemory");
   }
   // the Model's engine for (spline, chunk), switched to this species set's tables
   void attach()
@@ -386,6 +416,7 @@ struct Engines {
     e1 = se->e1.get();
     e2 = se->e2.get();
     e3 = se->e3.get();
+    ep = se->ep.get();
     std::lock_guard<std::mutex> lk(se->mu);
     if (se->owner == id) save_tables();    // this species set made the engine: its tables are installed
   }
@@ -393,11 +424,19 @@ struct Engines {
   int effective_chunk() const
   {
     if (chunk >= 0) return chunk;
-    const int c = e1 ? e1->auto_chunk_size() : e3 ? e3->auto_chunk_size() : e2 ? e2->auto_chunk_size() : 0;
+    const int c = ep ? ep->auto_chunk_size() : e1 ? e1->auto_chunk_size() : e3 ? e3->auto_chunk_size()
+                : e2 ? e2->auto_chunk_size() : 0;
     return c > 0 && c < last_n ? c : 0;
   }
+  // effective_chunk() under the engine's lock (the caller holds its own impl lock: that order, as compute)
+  int effective_chunk_locked() const
+  {
+    std::unique_lock<std::mutex> l;
+    if (se) l = std::unique_lock<std::mutex>(se->mu);
+    return effective_chunk();
+  }
   // auto chunk: the engine of the next smaller chunk (the failed one and its memory dropped): half the chunk in use,
-  // from one pass the power of two below natoms / 2; down to 1024; false: none left
+  // from one pass the power of two below natoms / 2; down to grace::kk::kChunkMin; false: none left
   bool shrink(int64_t natoms)
   {
     if (!auto_chunk) return false;
@@ -405,7 +444,7 @@ struct Engines {
     int64_t next = cur / 2;
     if (cur == 0)
       for (next = 1; next * 2 <= natoms / 2; next *= 2) {}
-    while (next >= 1024) {
+    while (next >= grace::kk::kChunkMin) {
       if (se) mimpl->drop_engine(spline, chunk, se);
       drop();
       chunk = (int) next;
@@ -434,11 +473,12 @@ struct Engines {
     poison();
     if (shrink(natoms)) return;
     drop();
-    throw std::runtime_error("the structure (" + std::to_string(natoms) + " atoms) does not fit the GPU memory " +
-                             (auto_chunk ? std::string("even with smaller chunks (down to 1024 atoms)")
+    const std::string tried = auto_chunk ? "even with smaller chunks (down to " +
+                                               std::to_string(grace::kk::kChunkMin) + " atoms)"
                                          : "with chunksize " + std::to_string(chunk) +
-                                               " (chunksize='auto' tries smaller ones)") +
-                             "; use device='cpu' or a GPU with more memory (" + e.what() + ")");
+                                               " (chunksize='auto' tries smaller ones)";
+    throw std::runtime_error("the structure (" + std::to_string(natoms) + " atoms) does not fit the GPU memory " +
+                             tried + "; use device='cpu' or a GPU with more memory (" + e.what() + ")");
   }
 
   // chunksize < 0: auto (the engine's chunk from the free GPU memory, smaller fixed ones after a failure)
@@ -476,7 +516,8 @@ struct Engines {
   }
   void save_tables()
   {
-    if (e1) t1 = e1->type_tables();
+    if (ep) tp = ep->type_tables();
+    else if (e1) t1 = e1->type_tables();
     else if (e3) t3 = e3->type_tables();
     else t2 = e2->type_tables();
     have_tables = true;
@@ -486,6 +527,8 @@ struct Engines {
     e1 = nullptr;
     e2 = nullptr;
     e3 = nullptr;
+    ep = nullptr;
+    tp = typename EP::TypeTables();
     t1 = typename E1::TypeTables();
     t2 = typename E2::TypeTables();
     t3 = typename E3::TypeTables();
@@ -497,7 +540,7 @@ struct Engines {
   std::unique_lock<std::mutex> lock_engine()
   {
     if (!Kokkos::is_initialized()) throw std::runtime_error("the GPU backend was finalized");
-    if (!se || !(e1 || e2 || e3) || se->poisoned) {
+    if (!se || !(e1 || e2 || e3 || ep) || se->poisoned) {
       drop();
       attach();
     }
@@ -510,11 +553,13 @@ struct Engines {
       se->owner = 0;    // tables in between while switching
       try {
         if (have_tables) {
-          if (e1) e1->use_type_tables(t1);
+          if (ep) ep->use_type_tables(tp);
+          else if (e1) e1->use_type_tables(t1);
           else if (e3) e3->use_type_tables(t3);
           else e2->use_type_tables(t2);
         } else {
-          if (e1) e1->set_types(type2mu);
+          if (ep) ep->set_types(type2mu);
+          else if (e1) e1->set_types(type2mu);
           else if (e3) e3->set_types(type2mu);
           else e2->set_types(type2mu);
           save_tables();
@@ -528,17 +573,21 @@ struct Engines {
   }
   double cutoff_pair(int a, int b) const
   {
-    return e1 ? e1->cutoff(type2mu[a], type2mu[b]) : e3 ? e3->cutoff(type2mu[a], type2mu[b])
-              : e2->cutoff(type2mu[a], type2mu[b]);
+    return ep ? ep->cutoff(type2mu[a], type2mu[b]) : e1 ? e1->cutoff(type2mu[a], type2mu[b])
+              : e3 ? e3->cutoff(type2mu[a], type2mu[b]) : e2->cutoff(type2mu[a], type2mu[b]);
   }
-  bool uq_available() const { return e1 ? e1->uq_available() : e3 ? e3->uq_available() : e2->uq_available(); }
+  bool uq_available() const
+  {
+    return ep ? ep->uq_available() : e1 ? e1->uq_available() : e3 ? e3->uq_available() : e2->uq_available();
+  }
   // the engine's per-atom buffers back to the device (weights and tables stay); under its lock
   void release_engine_buffers()
   {
     if (!se || se->poisoned || !Kokkos::is_initialized()) return;
     std::lock_guard<std::mutex> lk(se->mu);
     try {
-      if (e1) e1->release_buffers();
+      if (ep) ep->release_buffers();
+      else if (e1) e1->release_buffers();
       else if (e3) e3->release_buffers();
       else if (e2) e2->release_buffers();
     } catch (const std::exception &) {    // a shrink that fails leaves a half-grown engine: not used again
@@ -546,10 +595,12 @@ struct Engines {
       mimpl->drop_engine(spline, chunk, se);
     }
   }
-  // the per-atom UQ outputs of the engine in use: f(gamma, sigma, cluster)
+  // the per-atom UQ outputs of the engine in use: f(gamma, sigma, cluster); PACE: the extrapolation grade only (sigma,
+  // cluster empty)
   template<class F> void uq_out(F &&f) const
   {
-    if (e1) f(e1->uq_gamma(), e1->uq_sigma(), e1->uq_cluster());
+    if (ep) f(ep->uq_gamma(), Kokkos::View<double *, Dev>(), Kokkos::View<double *, Dev>());
+    else if (e1) f(e1->uq_gamma(), e1->uq_sigma(), e1->uq_cluster());
     else if (e3) f(e3->uq_gamma(), e3->uq_sigma(), e3->uq_cluster());
     else f(e2->uq_gamma(), e2->uq_sigma(), e2->uq_cluster());
   }
@@ -704,8 +755,16 @@ System::~System()
 }
 
 double System::cutoff() const { return impl->rc; }
-int64_t System::rebuilds() const { return impl->nbuild; }
-int System::chunksize() const { return impl->effective_chunk(); }
+int64_t System::rebuilds() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->nbuild;
+}
+int System::chunksize() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->effective_chunk_locked();
+}
 void System::release_device_buffers()
 {
   std::lock_guard<std::recursive_mutex> dev(g_device_mu);
@@ -802,7 +861,13 @@ static Result system_compute_once(System::Impl &s, int n, const int32_t *types, 
     if (energies) in.eatom = s.eatom;
   };
   try {
-    if (s.e1) {
+    if (s.ep) {
+      typename EP::RunInput in;
+      fill(in);
+      auto out = s.ep->run(in);
+      res.energy = out.eng_vdwl;
+      std::copy(out.virial, out.virial + 6, res.virial);
+    } else if (s.e1) {
       typename E1::RunInput in;
       fill(in);
       auto out = s.e1->run(in);
@@ -847,7 +912,9 @@ static Result system_compute_once(System::Impl &s, int n, const int32_t *types, 
   if (energies) back(s.eatom, res.energies);
   if (uq)
     s.uq_out([&](const auto &g, const auto &sg, const auto &cl) {
-      back(g, res.gamma); back(sg, res.sigma); back(cl, res.cluster);
+      back(g, res.gamma);
+      if (sg.extent(0)) back(sg, res.sigma);
+      if (cl.extent(0)) back(cl, res.cluster);
     });
   if (s.disp.on) {    // dispersion over the list's bins, in the caller's order, added on the host
     const auto d = grace::kk::d3_compute<Dev>(s.disp.t, s.disp.w, s.d_pos, s.d_types, 1, n, s.nl, s.skin, energy_only);
@@ -968,7 +1035,11 @@ struct Batch::Impl : Engines, DeviceState {
       in.vatom = vatom;
     };
     try {
-      if (e1) {
+      if (ep) {
+        typename EP::RunInput in;
+        fill(in);
+        ep->run(in);
+      } else if (e1) {
         typename E1::RunInput in;
         fill(in);
         e1->run(in);
@@ -1012,7 +1083,7 @@ struct Batch::Impl : Engines, DeviceState {
     const Kokkos::View<const double *[3], Kokkos::LayoutRight, Dev> sub =
         Kokkos::subview(pos, std::make_pair(a0, a0 + n), Kokkos::ALL);
     bnl.build(sub, s1 - s0, st.data(), cell + 9 * (size_t) s0, pbc + 3 * (size_t) s0, rc);
-    if ((int) d_types_new.extent(0) < std::max(n, 1)) {
+    if ((int) d_types_new.extent(0) < std::max(n, 1) || (int) d_pos_new.extent(0) < std::max(n, 1)) {
       const int m = std::max(n, 1) + std::max(n, 1) / 8;
       d_types_new = Kokkos::View<int *, Dev>("batch:types_new", m);
       d_pos_new = Kokkos::View<double *[3], Kokkos::LayoutRight, Dev>("batch:pos_new", m);
@@ -1075,7 +1146,9 @@ struct Batch::Impl : Engines, DeviceState {
     if (energies) atom_out(eatom, o.energies, n, a0);
     if (uq)
       uq_out([&](const auto &g, const auto &sg, const auto &cl) {
-        atom_out(g, o.gamma, n, a0); atom_out(sg, o.sigma, n, a0); atom_out(cl, o.cluster, n, a0);
+        atom_out(g, o.gamma, n, a0);
+        if (sg.extent(0) && o.sigma) atom_out(sg, o.sigma, n, a0);
+        if (cl.extent(0) && o.cluster) atom_out(cl, o.cluster, n, a0);
       });
   }
 
@@ -1115,9 +1188,21 @@ Batch::~Batch()
 }
 
 double Batch::cutoff() const { return impl->rc; }
-int Batch::passes() const { return impl->npasses; }
-double Batch::host_seconds() const { return impl->host_s; }
-bool Batch::keep_buffers() const { return impl->keep; }
+int Batch::passes() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->npasses;
+}
+double Batch::host_seconds() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->host_s;
+}
+bool Batch::keep_buffers() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->keep;
+}
 void Batch::release_device_buffers()
 {
   std::lock_guard<std::recursive_mutex> dev(g_device_mu);
@@ -1131,7 +1216,11 @@ void Batch::set_keep_buffers(bool on)
   std::lock_guard<std::mutex> lk(impl->mu);
   impl->keep = on;
 }
-int Batch::chunksize() const { return impl->effective_chunk(); }
+int Batch::chunksize() const
+{
+  std::lock_guard<std::mutex> lk(impl->mu);
+  return impl->effective_chunk_locked();
+}
 
 void Batch::set_dispersion(const grace::DispersionParams *p, const std::vector<int> &atomic_numbers)
 {
@@ -1178,6 +1267,8 @@ static void batch_compute_device_once(Batch::Impl &b, int nsys, const int32_t *n
   const std::vector<int64_t> start = atom_starts(nsys, natoms, ntot, max_nall);
   if (!o.energy) throw std::invalid_argument("compute_device needs the energy output");
   if (uq && !b.uq_available()) throw std::invalid_argument("the model has no usable UQ head (uqv6 gamma_only)");
+  if (uq && !(o.gamma && (b.ep || (o.sigma && o.cluster))))
+    throw std::invalid_argument(b.ep ? "uq needs the gamma output" : "uq needs gamma, atomic_sigma and gmm_cluster");
   const Batch::Impl::PosView p(pos, ntot);
   const Batch::Impl::TypeView t(types, ntot);
   int bad = 0;
@@ -1318,8 +1409,10 @@ static BatchResult batch_compute_once(Batch::Impl &b, int nsys, const int32_t *n
   if (energies) bind(b.io_eatom, ntot, "batch:io_energies", o.energies, res.energies);
   if (uq) {
     bind(b.io_g, ntot, "batch:io_gamma", o.gamma, res.gamma);
-    bind(b.io_s, ntot, "batch:io_sigma", o.sigma, res.sigma);
-    bind(b.io_c, ntot, "batch:io_cluster", o.cluster, res.cluster);
+    if (!b.ep) {    // PACE: the extrapolation grade only
+      bind(b.io_s, ntot, "batch:io_sigma", o.sigma, res.sigma);
+      bind(b.io_c, ntot, "batch:io_cluster", o.cluster, res.cluster);
+    }
   }
   res.dispersion = b.disp.on;
   if (res.dispersion) {
@@ -1361,8 +1454,10 @@ static void compute_with_retry(Batch::Impl &b, int64_t ntot, int64_t max_nall, F
       }
       return;
     } catch (const std::exception &e) {
+      // the batch's own buffers may be half grown (a pass's types grown, its positions not): dropped after any
+      // failure, the next call grows them all
+      b.release_buffers();
       if (Engines::is_oom(e) && max_nall > 16384) {
-        b.release_buffers();
         b.release_engine_buffers();
         max_nall = b.nall_cap = std::max<int64_t>(16384, max_nall / 2);
         continue;

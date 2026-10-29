@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 # test_cuda_wheels.sh <cpu wheelhouse> <cuda wheelhouse> [gpu index]: the GPU tests on a GPU host. A clean micromamba
 # env (CPython 3.12, numpy / ase / pytest from conda-forge) with the grace-runtime and grace-runtime-cuda12 abi3 wheels
-# (and nvidia-cublas-cu12 unless WITH_CUBLAS=0), the tests copied out of the repository; then
-#   1. import, plug-in, architecture, device="auto" backend, cuBLAS in use;
+# (and nvidia-cublas-cu12 with WITH_CUBLAS=1, the default), the tests copied out of the repository; then
+#   1. import, plug-in, architecture, device="auto" backend, the cuBLAS in use: WITH_CUBLAS=1 the wheel's
+#      (site-packages); WITH_CUBLAS=system the host's CUDA 12 toolkit (no extra; the host must have one in the loader
+#      path); WITH_CUBLAS=0 none (steps 1 and 2 set GRACE_RUNTIME_NO_CUBLAS=1, since the host may have a toolkit);
 #   2. the GPU test files (parity with the CPU calculator, batches, auto device, plug-in logic,
 #      memory, allocation failures, chunks, several calculators; TorchSim and device batches with WITH_TORCH=1, which
 #      installs the [torchsim] extra),
@@ -29,16 +31,22 @@ export MAMBA_ROOT_PREFIX=${MAMBA_ROOT_PREFIX:-$HOME/micromamba}
 MM=${MICROMAMBA:-${MAMBA_EXE:-$(command -v micromamba)}}
 export GRACE_CACHE=${GRACE_CACHE:-$HOME/.cache/grace-runtime-test}
 unset GRACE_RUNTIME_DEVICE GRACE_RUNTIME_CUDA_ARCH GRACE_RUNTIME_NO_CUBLAS PYTHONPATH
+case ${WITH_CUBLAS:=1} in 0|1|system) ;; *) echo "WITH_CUBLAS must be 0, 1 or system"; exit 1;; esac
+# torch from PyPI brings nvidia-cublas-cu12, which comes before a system cuBLAS
+[ "$WITH_CUBLAS" = system ] && [ "${WITH_TORCH:-0}" = 1 ] && { echo "WITH_CUBLAS=system needs WITH_TORCH=0"; exit 1; }
+NOCB=(); [ "$WITH_CUBLAS" = 0 ] && NOCB=(GRACE_RUNTIME_NO_CUBLAS=1)    # the built-in GEMMs even with a system cuBLAS
 fail=0
 check() { if [ "$1" = 0 ]; then echo "PASS $2"; else echo "FAIL $2"; fail=1; fi; }
 E=gn-cuda-test-$(hostname -s)
 "$MM" env remove -y -q -n "$E" > /dev/null 2>&1
-"$MM" create -y -q -n "$E" -c conda-forge python=3.12 numpy ase pytest > /dev/null || { echo "FAIL env"; exit 1; }
+"$MM" create -y -q -n "$E" -c conda-forge python=3.12 numpy ase pytest pyyaml > /dev/null || { echo "FAIL env"; exit 1; }
 P="$MAMBA_ROOT_PREFIX/envs/$E/bin/python"
 CPU_WHL=$(ls "$CPU_WH"/grace_runtime-*-cp312-abi3-*.whl | head -1)
 "$P" -m pip install -q "$CPU_WHL" "$GPU_WH"/grace_runtime_cuda12-*-cp312-abi3-*.whl
 check $? "install wheels"
-[ "${WITH_CUBLAS:-1}" = 1 ] && "$P" -m pip install -q "nvidia-cublas-cu12>=12.4,<13"
+if [ "$WITH_CUBLAS" = 1 ]; then
+  "$P" -m pip install -q "nvidia-cublas-cu12>=12.4,<13"; check $? "install nvidia-cublas-cu12"
+fi
 if [ "${WITH_TORCH:-0}" = 1 ]; then "$P" -m pip install -q "$CPU_WHL[torchsim]"; check $? "install [torchsim]"; fi
 W=$(mktemp -d /tmp/gn-cuda-test.XXXX)
 mkdir -p "$W/python" "$W/tests"
@@ -47,20 +55,28 @@ cp -r "$ROOT/tests/fixtures" "$W/tests/"
 cd "$W"
 echo "== $(hostname -s) $(nvidia-smi -i ${CUDA_VISIBLE_DEVICES%%,*} --query-gpu=name,driver_version,compute_cap --format=csv,noheader)"
 
-"$P" - <<EOF
+env "${NOCB[@]}" "$P" - <<EOF
 import grace_runtime as g, grace_runtime._cuda as c
 print("grace-runtime", g.__version__, "abi", g.abi, "modules", c.available())
 calc = g.GRACERuntimeCalculator("$GRACE_CACHE/GRACE-2L-OMAT-medium-ft-E/kokkos.npz")
 m = c.ensure_init("cuda")
-print("auto backend:", calc.backend, " module:", m.__name__, " cuBLAS:", m.cublas())
+lib = c.cublas_library()
+print("auto backend:", calc.backend, " module:", m.__name__, " cuBLAS:", m.cublas(), lib)
+assert m.cublas() == ("$WITH_CUBLAS" != "0"), "cuBLAS in use: %s, WITH_CUBLAS=$WITH_CUBLAS" % m.cublas()
+want = {"1": "wheel", "system": "system", "0": None}["$WITH_CUBLAS"]
+if want:    # the wheel's copy in site-packages, or the host toolkit's outside it
+    assert lib.get("source") == want and ("/site-packages/" in lib["path"]) == (want == "wheel"), lib
+else:
+    assert "why" in lib, lib
 assert calc.backend.startswith("cuda:") and m.__name__.startswith("grace_runtime_cuda12.")
 EOF
 check $? "import / auto device / plug-in module"
 
 ALLOW="for .*cards|timing test|older GPU family|unsupported test model"
 [ "${WITH_TORCH:-0}" = 1 ] || ALLOW="$ALLOW|torch"
-[ "${WITH_CUBLAS:-1}" = 1 ] || ALLOW="$ALLOW|nvidia.cublas"
-GRACE_TEST_ALLOW_SKIP=${GRACE_TEST_ALLOW_SKIP-$ALLOW} "$P" -m pytest -q -p no:cacheprovider python/tests/test_gpu_*.py \
+[ "$WITH_CUBLAS" = 1 ] || ALLOW="$ALLOW|nvidia.cublas"    # the wheel's cuBLAS
+env "${NOCB[@]}" GRACE_TEST_ALLOW_SKIP="${GRACE_TEST_ALLOW_SKIP-$ALLOW}" \
+  "$P" -m pytest -q -p no:cacheprovider python/tests/test_gpu_*.py \
   python/tests/test_cuda_plugin.py python/tests/test_rocm_plugin.py python/tests/test_batch.py \
   python/tests/test_auto_device.py python/tests/test_torchsim.py 2>&1 | tail -15
 check ${PIPESTATUS[0]} "GPU tests"

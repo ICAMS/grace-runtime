@@ -3,6 +3,7 @@
 "rocm", "gpu" or "auto"), the GPU module _kk_<arch> (fused Kokkos kernels, neighbour list on the GPU)."""
 import os
 import threading
+import warnings
 import weakref
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .neighbors import NeighborList, _padded_cell, check_skin
 _KK_MODELS = {}    # path -> GPU model (weights loaded once per process)
 _KK_LOCK = threading.Lock()    # guards _KK_MODELS and grace_runtime.batch's Batch cache
 _KK_CALCS = weakref.WeakSet()    # live GPU calculators (grace_runtime.free_gpu_memory() returns their buffers)
+_STORE_WARNED = set()    # model paths whose CPU reverse pass recomputes instead of storing (warned once per model)
 
 
 def physical_cores(cpus, topology_root="/sys/devices/system/cpu"):
@@ -40,7 +42,23 @@ def _chunk_arg(chunksize) -> int:
 
 
 def _cpu_info(fallback=None) -> dict:
-    return {"device": "cpu", "platform": "cpu", "arch": None, "cc": None, "native": None, "fallback": fallback}
+    return {"device": "cpu", "platform": "cpu", "arch": None, "cc": None, "native": None, "fallback": fallback,
+            "store": None}
+
+
+def _store_info(out, model):
+    """the CPU forward store (2L / 3L) of a compute result: {"kept", "need_gb", "limit_gb"}, None without one (1L); a
+    RuntimeWarning once per model when it exceeds the limit and the reverse pass recomputes (same results, slower)"""
+    if "store" not in out:
+        return None
+    kept, need, limit = out["store"]
+    if not kept and model.path not in _STORE_WARNED:
+        _STORE_WARNED.add(model.path)
+        warnings.warn(f"{os.path.basename(os.path.dirname(model.path)) or model.path}: the CPU forward store would need "
+                      f"{need:.1f} GB > limit {limit:.1f} GB; the reverse pass recomputes it instead (same results, "
+                      "slower). Model(store_max_gb=...) sets the limit (default: half the available memory of the job)",
+                      RuntimeWarning, stacklevel=4)
+    return {"kept": bool(kept), "need_gb": float(need), "limit_gb": float(limit)}
 
 
 def _cpu_fallback(why: str):
@@ -52,14 +70,25 @@ def _cpu_fallback(why: str):
     return "cpu", None, _cpu_info(why)
 
 
+def _kk_model_key(model) -> str:
+    asi = getattr(model, "asi", None)
+    return f"{model.path}\0{asi}" if asi else model.path
+
+
+def _load_kk_model(kk, model):
+    asi = getattr(model, "asi", None)
+    return kk.Model(model.path, asi=asi) if asi else kk.Model(model.path)
+
+
 def _select_device(device: str, model):
     """(resolved device, (GPU module, its model) or None, backend info) for a CPU Model. device="auto" falls back to the
     CPU (announced by _gpu.notice; an error with GRACE_RUNTIME_STRICT=1) when a GPU is there but has no module, the
     module predates the GRACE-3L engine, the fused kernels refuse the model or the GPU fails to start / set up the model
     (e.g. its memory held by another process; not remembered); an explicit GPU device ("cuda", "rocm", "gpu") raises.
-    Backend info: {"device", "platform", "arch", "cc", "native", "fallback"} (fallback: None, "ptx" or the reason of a
-    CPU fallback)."""
+    Backend info: {"device", "platform", "arch", "cc", "native", "fallback", "store"} (fallback: None, "ptx" or the reason
+    of a CPU fallback; store: see _store_info, set by the calculator's CPU calls)."""
     path = model.path
+    mkey = _kk_model_key(model)
     auto = device == "auto"
     if auto:
         device, why = _gpu.auto_device()
@@ -73,14 +102,14 @@ def _select_device(device: str, model):
     try:
         kk = _gpu.ensure_init(device)    # ValueError for a bad device string, ImportError without a module
         with _KK_LOCK:
-            if path not in _KK_MODELS:
+            if mkey not in _KK_MODELS:
                 try:
-                    _KK_MODELS[path] = kk.Model(path)
+                    _KK_MODELS[mkey] = _load_kk_model(kk, model)
                 except ValueError as e:    # a GPU module built before the GRACE-3L engine
                     if not auto or "GRACE-3L" not in str(e):
                         raise
                     return _cpu_fallback(str(e))
-            kk_model = _KK_MODELS[path]
+            kk_model = _KK_MODELS[mkey]
         if auto:
             why = _gpu.unsupported(kk, kk_model, path, model.spline)
             if why:
@@ -91,9 +120,19 @@ def _select_device(device: str, model):
         return _cpu_fallback(f"the GPU cannot be used ({e})")
     info = dict(_gpu.info())
     info["fallback"] = None if info["native"] else "ptx"
+    info["store"] = None
     if device.startswith(("gpu", "hip")):    # aliases: the device they resolved to
         device = info["device"]
     return device, (kk, kk_model), info
+
+
+def _species_from_z(z) -> list:
+    """sorted element symbols of the atomic numbers `z` (1 <= Z < len(chemical_symbols); repeats allowed)"""
+    z = {int(k) for k in z}
+    bad = [k for k in sorted(z) if not 1 <= k < len(chemical_symbols)]
+    if bad:
+        raise ValueError(f"invalid atomic number {bad[0]} (must be 1 .. {len(chemical_symbols) - 1})")
+    return sorted(chemical_symbols[k] for k in z)
 
 
 def _type_lut(species) -> np.ndarray:
@@ -151,21 +190,25 @@ class _CpuEngine:
     def __init__(self, model, skin: float = 0.5, num_threads: int = 0, dispersion=None):
         self.model, self.skin, self.num_threads, self.dispersion = model, float(skin), num_threads, dispersion
         self.nl = self._z = self._species = self._lut = self._types = None    # set for the first species set
+        self.store = None    # the forward store of the last call (_store_info)
 
     def compute(self, at, forces: bool = True, energies: bool = False, uq: bool = False) -> dict:
         """energy; forces and stress unless forces=False (no backward pass); per-atom energies; with uq gamma,
         atomic_sigma, gmm_cluster and total_sigma (the Model must have a usable UQ head)"""
         z = np.unique(at.numbers)
         if self._z is None or not np.array_equal(z, self._z):
-            species = sorted(chemical_symbols[k] for k in z)
+            species = _species_from_z(z)
             rc = float(self.model.cutoff_matrix(species).max()) if species else 0.0    # raises for unknown elements
             self.nl = NeighborList(rc, self.skin, num_threads=self.num_threads)
             self._species, self._lut, self._z = species, _type_lut(species), z
         nl = self.nl
+        nl.num_threads = self.num_threads
         if nl.update(at):
             self._types = self._lut[at.numbers][nl.perm]
-        out = self.model.compute(self._species, self._types, nl.offset, nl.j, nl.rij(at, self.num_threads),
-                                 energies=energies, num_threads=self.num_threads, uq=uq, energy_only=not forces)
+        out = self.model.compute(self._species, self._types, nl.offset, nl.j, energies=energies,
+                                 num_threads=self.num_threads, uq=uq, energy_only=not forces,
+                                 positions=at.positions[nl.perm], image=nl.image, shifts=nl.shifts)
+        self.store = _store_info(out, self.model)
         res = _results(at, out, nl.perm)
         if self.dispersion is not None:
             res = self._add_dispersion(at, res, forces)
@@ -203,29 +246,32 @@ def default_threads() -> int:
 
 
 class GRACERuntimeCalculator(Calculator):
-    """GRACE-1L/2L/3L on CPU or GPU from a kokkos.npz.
+    """ASE calculator for GRACE-1L/2L/3L and PACE models on CPU or GPU.
 
-    model: path to a kokkos.npz, a registry name or a grace_runtime.Model (one Model can serve several calculators
-    and threads).
+    model: path to a kokkos.npz, a registry name, a PACE model (pacemaker B-basis .yaml) or a grace_runtime.Model
+        (one Model can serve several calculators and threads).
     skin: Verlet skin of the neighbour list (A); the list is rebuilt when an atom moved more than skin / 2.
     num_threads: OpenMP threads per call; default OMP_NUM_THREADS or the physical cores of the affinity mask.
     neighbor_backend: "native" (default and only value: the OpenMP cell list of grace_runtime._core).
     uq: evaluate the model's uncertainty head (uqv6 "gamma_only", as TPCalculator.enable_uq("gamma_only")): results
-        gamma, atomic_sigma, gmm_cluster (per atom, float64) and total_sigma. Off by default; see enable_uq().
+        gamma, atomic_sigma, gmm_cluster (per atom, float64) and total_sigma. PACE models: the extrapolation grade
+        gamma (per atom) of the model's active set (Model(yaml, asi=...)), as pyace's
+        PyACECalculator with set_active_set. Off by default; see enable_uq().
     device: "auto" (default), "cpu", "cuda" / "cuda:N" (NVIDIA), "rocm" / "rocm:N" (AMD; "hip" / "hip:N" too) or
         "gpu" / "gpu:N" (whichever GPU is usable: NVIDIA, then AMD): the GPU kernels (as LAMMPS
-        grace/{1l,2l,3l}/fused/kk: the network in fp32, bond vectors and lengths in fp64 (GRACE-3L also the cutoff
+        grace/runtime/kk: the network in fp32, bond vectors and lengths in fp64 (GRACE-3L also the cutoff
         envelope), sums in fp64) with the neighbour list on the GPU; one GPU per process; num_threads and
         neighbor_backend do not apply. "auto" (as TensorFlow): the GPU (NVIDIA, then AMD) when a module for it is
         installed and the fused kernels take the model, else the CPU (a RuntimeWarning says why when a GPU is there);
         the environment variable GRACE_RUNTIME_DEVICE sets the choice of "auto". An explicit GPU device raises instead
         of falling back.
     chunksize: atoms per GPU engine pass ("auto", default: chosen by the engine from the free GPU memory, as LAMMPS
-        chunksize auto - all atoms in one pass while they fit; after an allocation failure half of it, down to 1024; a
+        chunksize auto - all atoms in one pass while they fit; after an allocation failure half of it, down to 512; a
         number: fixed; 0: one pass). Larger is faster (2L: up to ~6 % for 100k atoms), smaller needs less GPU memory.
         CPU: no effect.
     energy_only: when ASE asks for no forces / stress (get_potential_energy, get_potential_energies, UQ keys), skip the
-        backward pass (as LAMMPS eflag_only); forces asked later are computed then. Default True.
+        backward pass (as LAMMPS eflag_only); forces asked later are computed then. Default False: compute and cache
+        energy, forces and stress together, so a later force or stress request needs no second evaluation.
     dispersion: a dispersion correction added to the model (default None: none): a grace_runtime.D3 object or a short
         string ("d3-pbe", "d3-r2scan"); see grace_runtime.dispersion. energy, forces, stress and energies are then the
         sums of model and correction; the correction alone is in dispersion_energy, dispersion_forces,
@@ -238,7 +284,7 @@ class GRACERuntimeCalculator(Calculator):
                               "dispersion_energy", "dispersion_forces", "dispersion_stress", "dispersion_energies"]
 
     def __init__(self, model, skin: float = 0.5, num_threads: int | None = None, neighbor_backend: str = "native",
-                 uq: bool = False, device: str = "auto", energy_only: bool = True, chunksize="auto", dispersion=None,
+                 uq: bool = False, device: str = "auto", energy_only: bool = False, chunksize="auto", dispersion=None,
                  **kwargs):
         if neighbor_backend != "native":
             raise ValueError(f"neighbour list backend {neighbor_backend!r}: only 'native' "
@@ -252,8 +298,8 @@ class GRACERuntimeCalculator(Calculator):
         self.backend = "cpu"    # where calculations run: "cpu", "cuda:N (smXY)" or "rocm:N (gfxXYZ)"
         skin = check_skin(skin)
         self.model = model if isinstance(model, Model) else Model(model)
-        # backend_info: {"device", "platform", "arch", "cc", "native", "fallback"} - check "fallback" is None before
-        # timing
+        # backend_info: {"device", "platform", "arch", "cc", "native", "fallback", "store"} - check "fallback" is None
+        # before timing; store (CPU, after a call): the 2L / 3L forward store kept or recomputed
         self.device, kk, self.backend_info = _select_device(device, self.model)
         if kk is not None:
             self._kk, self._kk_model = kk
@@ -285,13 +331,12 @@ class GRACERuntimeCalculator(Calculator):
         """Evaluate the UQ head from the next calculation on (only mode "gamma_only"); ValueError without a usable head."""
         if mode not in (None, "gamma_only"):
             raise ValueError(f"UQ mode {mode!r} is not supported by grace-runtime; only 'gamma_only'")
-        if not self.model.has_uq:
-            raise ValueError("the model has no UQ head (kokkos.npz exported without UQ artifacts)")
         self.model.validate_uq()
         self.uq_enabled = True
         self.reset()
 
     def disable_uq(self):
+        """Disable UQ evaluation and clear cached results."""
         self.uq_enabled = False
         self.reset()
 
@@ -300,7 +345,7 @@ class GRACERuntimeCalculator(Calculator):
         its own neighbour list; may raise (engine self-test, device memory)"""
         z = np.unique(atoms.numbers)
         if self._z is None or not np.array_equal(z, self._z):
-            species = sorted(chemical_symbols[k] for k in z)
+            species = _species_from_z(z)
             system = self._kk.System(self._kk_model, species, skin=self.skin, spline=self.model.spline,
                                      chunksize=self._chunk)
             if self.dispersion is not None:
@@ -314,7 +359,7 @@ class GRACERuntimeCalculator(Calculator):
     def _calculate_gpu(self, at, properties, eonly):
         """GPU path: positions, cell and pbc to the device module; it keeps the neighbour list and its skin."""
         key = (at.cell.array.tobytes(), np.asarray(at.pbc).tobytes())
-        if key != self._kk_cellkey:    # a full-rank cell for the search (zero vectors padded), fixed until cell / pbc change
+        if key != self._kk_cellkey:    # a full-rank cell for the search (padded), fixed until cell / pbc change
             self._kk_cell = np.ascontiguousarray(_padded_cell(at, self._kk_system.cutoff + self.skin)[0], dtype=np.float64)
             self._kk_cellkey = key
         types = np.ascontiguousarray(self._lut[at.numbers], dtype=np.int32)
@@ -334,7 +379,8 @@ class GRACERuntimeCalculator(Calculator):
         else:
             if self._cpu is None:
                 self._cpu = _CpuEngine(self.model, self.skin, self.num_threads, self.dispersion)
-            self._cpu.num_threads = self.num_threads    # the kernels' threads as set now (the neighbour list keeps its own)
+            self._cpu.num_threads = self.num_threads    # the kernels' and neighbour list's threads as set now
             res = self._cpu.compute(at, forces=not eonly, energies="energies" in properties, uq=self.uq_enabled)
+            self.backend_info["store"] = self._cpu.store
         res["free_energy"] = res["energy"]
         self.results.update(res)

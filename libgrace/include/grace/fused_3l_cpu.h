@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_3l_fused_cpu.h (feature/grace-runtime a73b8b17ee); contributing author: Yury
-// Lysogorskiy (ICAMS). Block operations of the GRACE-3L CPU driver. Internal: include only from src/fused_3l.cpp.
+// Contributing author: Yury Lysogorskiy (ICAMS). Block operations of the GRACE-3L CPU driver. Internal: include only
+// from src/fused_3l.cpp.
 //
 // A block holds nb <= NB atoms of one type. A block tensor of nf functions and C channels is stored
 // [f][NB][C]: row (f, a) at ((size_t) f * NB + a) * C, so the rows of one function over the block's atoms are

@@ -3,10 +3,11 @@
 // binary, 1 rank x 1 thread) on the same cells: energy, per-atom energy, forces, pressure.
 // Not bit-identical: LAMMPS gathers the bonds in its neighbour-list order and folds ghost forces back by
 // reverse comm; the CSR path sums in the bond order of the CSR directly onto the atoms.
-//   env GRACE_TEST_REF_DIR (default tests/fixtures/ref): <cell>_<1l|2l>.dump / .thermo from LAMMPS runs of grace/{1l,2l,3l}/fused
+//   env GRACE_TEST_REF_DIR (default tests/fixtures/ref): <cell>_<1l|2l>.dump / .thermo from LAMMPS runs of grace/runtime
 #include "grace/fused_1l.h"
 #include "grace/fused_2l.h"
 #include "grace/fused_3l.h"
+#include "grace/fused_cpu.h"
 #include "grace/fused_cpu_types.h"
 #include "grace_cnpy/cnpy.h"
 #include "test_util.h"
@@ -234,6 +235,29 @@ int main()
       const Cell c = load_cell(fx + "/" + cell + ".npz");
       compare((std::string(cell) + " 3L MLP").c_str(), run(d3m, c, 2, false), load_ref(rd + "/" + cell + "_3l", c.n), c);
     }
+#if defined(__linux__) || defined(__APPLE__)
+    // auto spline_mb (< 0) reads host memory on both Linux and macOS (spline_n = 100000000 -> 2.3 TB tables > budget,
+    // so use_mlp = true builds no tables and logs the auto budget; 1 rank vs 1024 ranks checks that host memory > 0)
+    std::string log1, log64;
+    auto cap = [](void *ctx, int, const char *msg) { *static_cast<std::string *>(ctx) += msg; };
+    grace::FusedSettings fs1, fs64;
+    fs1.spline_n = fs64.spline_n = 100000000;
+    fs64.ranks_per_node = 1024;
+    grace::Grace3LFused b1(m3, fs1, {cap, &log1}), b64(m3, fs64, {cap, &log64});
+    b1.setup_types(2, type2mu_for(m3->element_names));
+    b64.setup_types(2, type2mu_for(m3->element_names));
+    auto parse_budget = [](const std::string &s) {
+      const auto p = s.find("spline_mb ");
+      return p == std::string::npos ? 0L : std::strtol(s.c_str() + p + 10, nullptr, 10);
+    };
+    const long mb1 = parse_budget(log1), mb64 = parse_budget(log64);
+    std::printf("3L auto spline_mb budget: 1 rank %ld MB, 1024 ranks %ld MB\n", mb1, mb64);
+    // budget = max(2048, min(total / 4, available) / ranks): above the 2048 MB floor for one rank only with more than
+    // 8 GB (and 2 GB available), as the engine sees it (within a cgroup limit)
+    double total_mb = 0.0, avail_mb = 0.0;
+    grace::fused::host_memory_mb(total_mb, avail_mb);
+    CHECK(mb64 == 2048 && (total_mb <= 8192.0 || avail_mb <= 2560.0 || mb1 > mb64));    // avail moves between reads
+#endif
   }
   // test_3l_fc_fold: the FCs folded into the cp_l projections (the default) against the unfolded chain
   {

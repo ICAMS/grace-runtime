@@ -11,11 +11,12 @@ bundled with it, in source form in this repository or compiled into the wheels; 
 | nanobind (Wenzel Jakob) | compiled into the Python extension modules of all wheels | BSD-3-Clause | below |
 | tsl::robin_map (Thibaut Goetghebuer-Planchon), part of nanobind | compiled into the Python extension modules of all wheels | MIT | below |
 | rocPRIM, rocThrust (Advanced Micro Devices, Inc.), HIP headers | header code compiled into the `grace-runtime-rocm6` modules (Kokkos sort) | MIT (rocPRIM, HIP), Apache-2.0 (rocThrust) | https://github.com/ROCm/rocPRIM, https://github.com/ROCm/rocThrust, https://github.com/ROCm/HIP |
-| GCC runtime: libstdc++ (linked statically), libgomp (vendored by auditwheel) | all wheels | GPL-3.0 WITH GCC-exception-3.1 (GCC Runtime Library Exception) | https://www.gnu.org/licenses/gcc-exception-3.1.html |
+| GCC runtime: libstdc++ (linked statically), libgomp (vendored by auditwheel) | the Linux wheels | GPL-3.0 WITH GCC-exception-3.1 (GCC Runtime Library Exception) | https://www.gnu.org/licenses/gcc-exception-3.1.html |
+| LLVM OpenMP runtime (libomp, conda-forge `llvm-openmp`) | `grace_runtime/.dylibs/libomp.dylib` of the macOS wheels | Apache-2.0 WITH LLVM-exception | `grace_runtime/.dylibs/LICENSE-libomp` of the macOS wheels (`python/LICENSE-libomp`) |
 
-Not bundled, loaded at run time when present: the CUDA runtime and driver, cuBLAS (`nvidia-cublas-cu12`, UQ only),
-rocBLAS of the system ROCm. Not bundled and required by `grace-runtime-rocm6`: the ROCm HIP runtime
-(`libamdhip64.so.6`) of the system ROCm.
+Not bundled, loaded at run time when present: the CUDA runtime and driver, cuBLAS (`nvidia-cublas-cu12`, the dense
+GEMMs), rocBLAS of the system ROCm, Accelerate (macOS, part of the system). Not bundled and required by
+`grace-runtime-rocm6`: the ROCm HIP runtime (`libamdhip64.so.6`) of the system ROCm.
 
 ## nanobind
 

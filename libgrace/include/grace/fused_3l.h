@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE/pair_grace_3l_fused (lammps-ace, feature/grace-runtime a73b8b17ee); contributing author:
-// Yury Lysogorskiy (ICAMS).
+// Contributing author: Yury Lysogorskiy (ICAMS).
 //
 // GRACE-3L fused CPU driver (GRACE-3L-OMAT-large architecture), fp32 blocks of up to FusedSettings::block same-type
 // atoms per OpenMP thread, GEMMs through grace/cpu_gemm.h, readout in fp64. Per compute():
@@ -51,6 +50,7 @@ class Grace3LFused {
   float *message_grad(int k);
   double memory_bytes() const;
   const char *gemm_backend() const;
+  const StoreInfo &store_info() const { return store; }    // store_fwd: kept or recomputed (decided in grow)
 
   struct Net;
   struct Glob;
@@ -69,6 +69,7 @@ class Grace3LFused {
   std::vector<std::unique_ptr<Work>> work;
   int nmax = 0, nthreads = 0;
   bool uq_ready = false, uq_on = false;
+  StoreInfo store;
 
   void build_net();
   void grow(int nmax_new);

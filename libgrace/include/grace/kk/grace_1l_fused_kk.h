@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-1L fused Kokkos engine (from the LAMMPS style grace/1l/fused/kk, lammps-ace feature/grace-runtime 07b8fb50d4;
-// contributing author Yury Lysogorskiy, ICAMS): the base engine with the fused bond and dense stages; bond geometry
-// in fp64, the network and the radial tables in fp32, energies / forces / virials accumulated in fp64 (KKA).
+// GRACE-1L fused Kokkos engine (contributing author Yury Lysogorskiy, ICAMS): the base engine with the fused bond and
+// dense stages; bond geometry in fp64, the network and the radial tables in fp32, energies / forces / virials
+// accumulated in fp64 (KKA).
 #pragma once
 
 #include "grace/kk/grace_1l_kk.h"
@@ -54,18 +54,18 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   // the bonds the bond kernels read (BondList, fused_hip_bonds.h): on a GPU the run's compact list
   auto bond_list() const
   {
-    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("grace/1l/fused/kk: bond kernel without the run's bond list");
+    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("GRACE-1L/KK: bond kernel without the run's bond list");
     return GraceFusedKK::BondList<Traits, is_gpu_v<DeviceType>, decltype(this->d_neighbors), decltype(this->d_numneigh),
-                                  V2<int>, V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
+                                  decltype(d_cnb), V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
   }
 
   using FCMeta = GraceFusedKK::FCMetaT<DeviceType>;
   using ProdMeta = GraceFusedKK::ProdMetaT<DeviceType>;
   struct RedMeta {                      // rho: four sources (A, AA, AAA, AAAA), element-dependent
-    int nx = 0, gtot = 0;
+    int nx = 0, gtot = 0, nconn = 0;
     int nin[4] = {0}, nfi[4] = {0}, gbase[4] = {0};
     V4<F> W[4];                         // [type][tile][n_in][n_out pad 4]
-    V1<int> toff, tx, tfi, ttile, roff, rx, rtile;
+    V1<int> tx, tfi, ttile, roff, rx, rtile;
   };
 
   void build_fc_meta(FCMeta &, const typename GRACE1LModel::FCWeights &, const std::vector<int> &used);
@@ -90,7 +90,8 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   V3<F> d_splR;                         // [N][nradmax * (lmax+1)][4] cubic coefficients in t
   V1<int> d_lfrom;                      // l of lm
   V2<double> d_vir;                     // [inum][6]
-  V2<int> d_cnb;                        // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+  grace::kk::View64<V2<int>> d_cnb;    // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+                                       // (View64: more than 2^31 entries from 33.5M atoms x 64 neighbours)
   V1<int> d_cnum;                       //      and their number, [inum]
   bool bonds_ready = false;             // GPU: d_cnb / d_cnum built for the current run (begin_run .. end of run)
   bool a_mfma = false, bwd_wave = false;    // basis A on the matrix cores (HIP), wave-per-atom backward (this run)
@@ -101,3 +102,10 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
 
 }    // namespace kk
 }    // namespace grace
+
+// The GRACE-1L engine a consumer (LAMMPS) instantiates explicitly, naming only the device and the traits: this
+// declaration in its headers, GRACE_KK_INSTANTIATE_1L (grace/kk/grace_1l_fused_kk_impl.h) in one translation unit.
+// At global scope, as a statement: GRACE_KK_EXTERN_1L(Device, Traits);
+#define GRACE_KK_EXTERN_1L(Device, Traits)                                    \
+  extern template class grace::kk::Grace1LKK<Device, float, float, Traits>; \
+  extern template class grace::kk::Grace1LFusedKK<Device, Traits>

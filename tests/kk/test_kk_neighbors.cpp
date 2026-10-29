@@ -73,11 +73,15 @@ int check(const Case &c)
     inv[6] = (a[3] * a[7] - a[4] * a[6]) / det; inv[7] = (a[1] * a[6] - a[0] * a[7]) / det;
     inv[8] = (a[0] * a[4] - a[1] * a[3]) / det;
   }
+  // the CPU list's Cartesian shift of bond b (its row of shifts)
+  for (size_t b = 0; b < ref.j.size(); b++)
+    if (ref.image[b] < 0 || 3 * (size_t) ref.image[b] + 2 >= ref.shifts.size()) bad++;
+  const auto shift = [&](size_t b, int k) { return ref.shifts[3 * (size_t) ref.image[b] + k]; };
   if (!bad)
     for (size_t b = 0; b < ref.j.size(); b++) {
       if (j(b) != ref.j[b]) { bad++; continue; }
       for (int k = 0; k < 3; k++) {
-        const double sk = ref.shift[3 * b] * inv[k] + ref.shift[3 * b + 1] * inv[3 + k] + ref.shift[3 * b + 2] * inv[6 + k];
+        const double sk = shift(b, 0) * inv[k] + shift(b, 1) * inv[3 + k] + shift(b, 2) * inv[6 + k];
         if ((int) std::lround(sk) != S(b, k)) bad++;
       }
     }
@@ -88,8 +92,10 @@ int check(const Case &c)
     std::vector<int> ty(n, 1);
     for (int q = 0; q < n; q++)
       for (int k = 0; k < 3; k++) pos_new[3 * q + k] = c.pos[3 * ref.perm[q] + k];
-    for (size_t b = 0; b < ref.j.size(); b++)
-      for (int k = 0; k < 3; k++) rij[3 * b + k] = c.pos[3 * ref.jo[b] + k] - c.pos[3 * ref.io[b] + k] + ref.shift[3 * b + k];
+    for (int q = 0; q < n; q++)
+      for (int64_t b = ref.offset[q]; b < ref.offset[q + 1]; b++)
+        for (int k = 0; k < 3; k++)
+          rij[3 * b + k] = c.pos[3 * ref.perm[ref.j[b]] + k] - c.pos[3 * ref.perm[q] + k] + shift(b, k);
     std::vector<int> jj(ref.j.begin(), ref.j.end());
     grace::kk::CsrImagesKK<Dev, T> hi, di;
     hi.build(n, pos_new.data(), ty.data(), c.cell.data(), ref.offset.data(), jj.data(), rij.data());
@@ -99,7 +105,7 @@ int check(const Case &c)
     nimg_h = hi.nall - n;
     nimg_d = di.nall - n;
     auto resolve = [&](const grace::kk::CsrImagesKK<Dev, T> &im, std::vector<int> &owner, std::vector<double> &tr) {
-      auto nb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), im.neighbors);
+      auto nb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), im.neighbors.base());
       auto ow = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), im.owner);
       auto tc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), im.tcart);
       for (int q = 0; q < n; q++)
@@ -148,6 +154,18 @@ int check_batch(const std::vector<Case> &cases, double cutoff)
   Kokkos::deep_copy(dpos, hp);
   grace::kk::BatchNeighborListKK<Dev> bl;
   bl.build(dpos, ns, start.data(), cell.data(), reinterpret_cast<const bool *>(pbc.data()), cutoff);
+  {
+    auto v1 = bl.visitor(cutoff);
+    CHECK(bl.reach_rc.size() == 1 && bl.reach_rc[0].gen == bl.build_gen);
+    Kokkos::deep_copy(bl.reach_rc[0].r, -1);
+    auto v2 = bl.visitor(cutoff);
+    auto h2 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v2.r);
+    CHECK(h2(0, 0) == -1);
+    bl.build(dpos, ns, start.data(), cell.data(), reinterpret_cast<const bool *>(pbc.data()), cutoff);
+    auto v3 = bl.visitor(cutoff);
+    auto h3 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v3.r);
+    CHECK(h3(0, 0) >= 0 && bl.reach_rc[0].gen == bl.build_gen);
+  }
   Kokkos::View<int *, Dev> tyb("tyb", std::max(n, 1));
   Kokkos::deep_copy(tyb, 1);
   grace::kk::CsrImagesKK<Dev, T> bi;
@@ -157,7 +175,7 @@ int check_batch(const std::vector<Case> &cases, double cutoff)
   auto boff = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bl.offset);
   auto bj = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bl.j);
   auto bS = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bl.S);
-  auto bnb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bi.neighbors);
+  auto bnb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bi.neighbors.base());
   auto bow = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bi.owner);
   auto btc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bi.tcart);
   int bad = 0, nimg = 0;
@@ -180,7 +198,7 @@ int check_batch(const std::vector<Case> &cases, double cutoff)
     auto off = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), nl.offset);
     auto j = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), nl.j);
     auto S = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), nl.S);
-    auto snb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), si.neighbors);
+    auto snb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), si.neighbors.base());
     auto sow = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), si.owner);
     auto stc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), si.tcart);
     const int64_t b0 = boff(a0);

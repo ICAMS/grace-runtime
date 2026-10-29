@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // Part of grace::kk::Grace3LKK (grace_3l_kk.h), included by grace_3l_kk_impl.h:
 // cp_l products: rank projections, CG couple (coupling-path kernels) and their VJPs.
-// Moved from the LAMMPS style grace/3l/kk (lammps-ace 5f5ab57aa7, pair_grace_3l_kokkos_cpl.cpp).
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
@@ -18,8 +17,8 @@ namespace kk {
 using namespace sph_const;
 
 // ======================================================================
-// Kernel: TagCPLProject (Task 2.5) — cp_l Pass A. Projects each input onto the
-// rank axis per lm, reproducing the oracle einsum("wrn,anw->arw", U[gl], left)
+// Kernel: TagCPLProject — cp_l Pass A. Projects each input onto the
+// rank axis per lm, reproducing the reference einsum("wrn,anw->arw", U[gl], left)
 // * norm_u  (w=lm, n=feature, r=rank):
 //   lproj[a,r,w] = norm_u * Sum_n U[group_left[w], r, n] * left[a, n, w]
 //   rproj[a,r,w] = norm_v * Sum_n V[group_right[w], r, n] * right[a, n, w]
@@ -62,7 +61,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLPr
 }
 
 // ======================================================================
-// Kernel: TagCPLCouple (Task 2.5) — cp_l Pass B. Bilinear Clebsch-Gordan
+// Kernel: TagCPLCouple — cp_l Pass B. Bilinear Clebsch-Gordan
 // coupling on the rank axis + segment-sum over m_sum_ind:
 //   out[a,r,:] = 0
 //   for c: out[a,r,m_sum_ind[c]] += lproj[a,r,left_ind[c]]
@@ -98,7 +97,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLCo
 }
 
 // ======================================================================
-// Kernel: TagCPLFused (Opt 5) — fused forward cp_l. ONE TEAM per (atom a, rank r).
+// Kernel: TagCPLFused — fused forward cp_l. ONE TEAM per (atom a, rank r).
 // The two-pass Project+Couple, previously two global kernels round-tripping lproj/rproj
 // [chunk,rank,nlm] through DRAM and doing an O(n_cg) global read-modify-write into the
 // out[a,r,:] row, is fused: lproj/rproj and the out row live in TEAM SHARED memory. The
@@ -152,7 +151,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLFu
 
   // Pass B (couple): out_sh[m_sum_ind[c]] += lproj_sh[left_ind[c]]*rproj_sh[right_ind[c]]*cg[c]
   // via shared atomics (segment-sum over the CG connections, split across the team).
-  // Opt 14: the three indices come packed in one int32 (8 B/entry with cg vs 16 B).
+  // the three indices come packed in one int32 (8 B/entry with cg vs 16 B).
   Kokkos::parallel_for(Kokkos::TeamThreadRange(team, cpl_p.n_cg), [&] (const int c) {
     const int pk = cpl_p.cg_packed(c);
     const NNScalar v = lproj_sh[pk & 255] * rproj_sh[(pk >> 8) & 255] * cpl_p.cg(c);
@@ -167,7 +166,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLFu
 }
 
 // ======================================================================
-// compute_cp_l (Task 2.5, Opt 5) — generic cp_l GeneralProductFunction product.
+// compute_cp_l — generic cp_l GeneralProductFunction product.
 // Sets the per-call launch state (weights + in/out views) captured by the TagCPL*
 // functors, then launches the fused team kernel (one team per (a,r)) over the chunk.
 // Reused verbatim by every A*_* cp_l product (A1_2, A1_3, ... A3_2).
@@ -188,13 +187,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l(
   cpl_bind(p);
 
 #ifdef GRACE_KK_GEMM
-  // Opt 18 (fp32 only): un-fuse. cuBLAS U/V rank-projection into the global lproj/rproj
+  // fp32 only: un-fuse. BLAS U/V rank-projection into the global lproj/rproj
   // scratch, then the couple reads them back. The projection is ~78% of the fused cp_l
-  // cost and is the mirror of the Opt-16 backward projection GEMM (reuses p.Uw/p.Vw).
-  // fp64 + non-CUDA keep the fused shared-memory kernel below (no SGEMM benefit, and
-  // un-fusing reintroduces the lproj/rproj round-trip that Opt-5 removed).
+  // cost and is the mirror of the backward projection GEMM (reuses p.Uw/p.Vw).
+  // fp64 and builds without a BLAS handle keep the fused shared-memory kernel below (no SGEMM benefit, and
+  // un-fusing reintroduces the lproj/rproj round-trip that the fused kernel avoids).
   if (blas_handle && sizeof(NNScalar) == 4) {
-    compute_cp_l_project_cublas(p, in_left, in_right);
+    compute_cp_l_project_blas(p, in_left, in_right);
     cpl_stamp[&p - d_prod] = cpl_stamp_now();
     cpl_couple_gather(p, out);
     return;
@@ -213,16 +212,16 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l(
 }
 
 #ifdef GRACE_KK_GEMM
-// Opt 18: cuBLAS cp_l forward U/V rank-projection into the global lproj/rproj scratch.
+// BLAS cp_l forward U/V rank-projection into the global lproj/rproj scratch.
 //   lproj(a,r,w) = norm_u * Σ_n in_left(a,n,w) * U(gl(w),r,n)   (batch over w = lm)
 //   rproj(a,r,w) = norm_v * Σ_n in_right(a,n,w) * V(gr(w),r,n)
 // The LayoutLeft w-slabs in_left(:,:,w)/lproj(:,:,w) are column-major [chunk x n]/[chunk x
 // rank] (ld=extent(0), w-stride=extent(0)*extent(1)); p.Uw[w] is the pre-gathered col-major
-// [rank x n_left] weight (ldb=rank, w-stride=n_left*rank) built in Opt-16. OP_N/OP_T so
+// [rank x n_left] weight (ldb=rank, w-stride=n_left*rank) built at setup. OP_N/OP_T so
 // op(Uw)=[n_left x rank] gives C(a,r)=Σ_n in_left(a,n)*Uw(r,n). beta=0 (full overwrite).
 // True fp32 (PEDANTIC handle).
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
-void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_project_cublas(
+void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_project_blas(
     const DeviceCPL &p, const t_nn_3d &in_left, const t_nn_3d &in_right)
 {
   const int n_lm_left  = (int) p.group_left.extent(0);
@@ -333,7 +332,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLBw
 }
 
 // ======================================================================
-// Kernel: TagCPLBwdFused (Opt 5) — fused backward cp_l passes 1+2. ONE TEAM per (a,r).
+// Kernel: TagCPLBwdFused — fused backward cp_l passes 1+2. ONE TEAM per (a,r).
 // Replaces the separate CPLBwdRecomputeProject (global lproj/rproj) + CPLBwdCouple
 // (n_cg re-reads of the big adj_out[a,r,:] row + n_cg global RMW into the small adj
 // rows). Here lproj/rproj are RECOMPUTED into shared, adj_out[a,r,:] is loaded ONCE into
@@ -363,7 +362,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLBw
   NNScalar* rproj_adj_sh = sh + 3 * nlm;
   NNScalar* adj_out_sh   = sh + 4 * nlm;
 
-  // Load the cuBLAS projections when available; otherwise recompute forward
+  // Load the BLAS projections when available; otherwise recompute forward
   // Pass A into shared. The VJP below remains fused/shared in both cases.
   Kokkos::parallel_for(Kokkos::TeamThreadRange(team, nlm), [&] (const int w) {
     NNScalar sl = NNScalar(0.0);
@@ -398,7 +397,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCPLBw
   // Couple VJP: adj_p = adj_out_sh[m_sum_ind[c]]*cg[c];
   //   lproj_adj_sh[left_ind[c]] += adj_p*rproj_sh[right_ind[c]];
   //   rproj_adj_sh[right_ind[c]] += adj_p*lproj_sh[left_ind[c]]  (shared atomics).
-  // Opt 14: the three indices come packed in one int32 (8 B/entry with cg vs 16 B).
+  // the three indices come packed in one int32 (8 B/entry with cg vs 16 B).
   Kokkos::parallel_for(Kokkos::TeamThreadRange(team, cpl_p.n_cg), [&] (const int c) {
     const int pk = cpl_p.cg_packed(c);
     const int li = pk & 255;
@@ -437,14 +436,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_bwd(
   // 1+2) fused recompute-project + couple-VJP (team per (a,r); lproj/rproj + adj_out row
   //      + adj accumulators in shared) -> d_cpl_lproj_adj/d_cpl_rproj_adj.
 #ifdef GRACE_KK_GEMM
-  // Use the same true-fp32 cuBLAS projections as the forward path, but keep the
+  // Use the same true-fp32 BLAS projections as the forward path, but keep the
   // VJP fused in shared memory. This avoids the hand projection's strided
   // LayoutLeft traversal without reintroducing global scattered VJP updates.
   if (blas_handle && sizeof(NNScalar) == 4) {
     // the forward projections of this chunk and evaluation are still in the slot unless recomputation is forced
     static const bool reproject = getenv("GRACE3L_CPL_REPROJECT") != nullptr;
     if (reproject || cpl_stamp[&p - d_prod] != cpl_stamp_now()) {
-      compute_cp_l_project_cublas(p, in_left, in_right);
+      compute_cp_l_project_blas(p, in_left, in_right);
       cpl_stamp[&p - d_prod] = cpl_stamp_now();
     }
     cpl_bwd_projected = 1;
@@ -463,7 +462,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_cp_l_bwd(
   }
   // 3) project bwd -> adj_left/adj_right (accumulate; reduces over r, stays separate).
 #ifdef GRACE_KK_GEMM
-  // Opt 16: two batched col-major GEMMs (left with Uw, right with Vw), each beta=1
+  // two batched col-major GEMMs (left with Uw, right with Vw), each beta=1
   // into the shared adj buffer. The LayoutLeft slabs A=lproj_adj(:,:,w) / C=adj(:,:,w)
   // are col-major with ld=extent(0), w-stride=extent(0)*extent(1) -> no scatter needed.
   // For SELF-products cpl_adj_left aliases cpl_adj_right; the two GEMMs run sequentially
@@ -572,7 +571,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_fc_fold()
 
 #ifdef GRACE_KK_GEMM
 // lproj (or [lproj | rproj] of a self-product) = Lred UL^T + R UR^T; a non-self product projects its right input as
-// compute_cp_l_project_cublas does
+// compute_cp_l_project_blas does
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_fold_project(
     const DeviceCPL &p, const t_nn_3d &Lred, const t_nn_3d &R, const t_nn_3d &right)
@@ -832,7 +831,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cpl_couple_vjp_gathe
 }
 
 #ifdef GRACE_KK_GEMM
-// Opt 16: batched projection SGEMM for CPLBwdProject. Standard col-major batched GEMM
+// batched projection SGEMM for CPLBwdProject. Standard col-major batched GEMM
 // (NOT the row-major transpose trick): the LayoutLeft slabs A=lproj_adj(:,:,w) and
 // C=adj(:,:,w) are already col-major [M x rank] / [M x n] with leading dim = extent(0)
 // and per-batch (w) stride = extent(0)*extent(1). Bw (Uw/Vw) is packed col-major

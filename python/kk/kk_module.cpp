@@ -69,12 +69,14 @@ nb::dict compute(gk::System &s, nb::ndarray<const int32_t, nb::ndim<1>, nb::c_co
   }
   if (energies) d["energies"] = from_vec(std::move(r.energies), {(size_t) n});
   if (uq) {
-    double ts = 0.0;
-    for (double v : r.sigma) ts += v;
-    d["total_sigma"] = ts;
     d["gamma"] = from_vec(std::move(r.gamma), {(size_t) n});
-    d["atomic_sigma"] = from_vec(std::move(r.sigma), {(size_t) n});
-    d["gmm_cluster"] = from_vec(std::move(r.cluster), {(size_t) n});
+    if (!r.sigma.empty() || n == 0) {    // GRACE UQ head; PACE: the extrapolation grade only
+      double ts = 0.0;
+      for (double v : r.sigma) ts += v;
+      d["total_sigma"] = ts;
+      d["atomic_sigma"] = from_vec(std::move(r.sigma), {(size_t) n});
+      d["gmm_cluster"] = from_vec(std::move(r.cluster), {(size_t) n});
+    }
   }
   return d;
 }
@@ -112,8 +114,10 @@ nb::dict compute_batch(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, nb:
   if (energies) d["energies"] = from_vec(std::move(r.energies), {n});
   if (uq) {
     d["gamma"] = from_vec(std::move(r.gamma), {n});
-    d["atomic_sigma"] = from_vec(std::move(r.sigma), {n});
-    d["gmm_cluster"] = from_vec(std::move(r.cluster), {n});
+    if (!r.sigma.empty() || n == 0) {    // PACE: the extrapolation grade only
+      d["atomic_sigma"] = from_vec(std::move(r.sigma), {n});
+      d["gmm_cluster"] = from_vec(std::move(r.cluster), {n});
+    }
   }
   return d;
 }
@@ -182,8 +186,7 @@ void compute_batch_device(gk::Batch &b, nb::ndarray<const int32_t, nb::ndim<1>, 
   o.dispersion_forces = out2(dispersion_forces, n, 3, "dispersion_forces");
   o.dispersion_virial = out2(dispersion_virial, nsys, 6, "dispersion_virial");
   o.dispersion_energies = out1(dispersion_energies, "dispersion_energies");
-  const bool want_uq = o.gamma || o.sigma || o.cluster;
-  if (want_uq && !(o.gamma && o.sigma && o.cluster)) throw nb::value_error("uq needs gamma, atomic_sigma and gmm_cluster");
+  const bool want_uq = o.gamma || o.sigma || o.cluster;    // gamma alone for PACE (checked by the batch)
   nb::gil_scoped_release nogil;
   b.compute_device((int) nsys, natoms.data(), (int64_t) n, types.data(), pos.data(), cells.data(), pbc.data(),
                    o.energies != nullptr, want_uq, energy_only, max_nall, o);
@@ -214,12 +217,13 @@ NB_MODULE(GRACE_KK_MODULE, m)
   m.def("cublas", &gk::cublas);
   m.def("memory_info", &gk::memory_info, "(free, total) bytes of the GPU (cudaMemGetInfo / hipMemGetInfo)");
   m.def("_debug_fail_alloc", &gk::debug_fail_alloc, "label"_a, "nth"_a);
+  m.def("_debug_fail_launch", &gk::debug_fail_launch, "nth"_a);
   m.def("_debug_track_alloc", &gk::debug_track_alloc, "on"_a);
   m.def("_debug_live_alloc", &gk::debug_live_alloc);
   m.def("_debug_peak_alloc", &gk::debug_peak_alloc, "high-water mark (bytes) of the device allocations made since "
         "_debug_track_alloc(True)");
   nb::class_<gk::Model>(m, "Model")
-      .def(nb::init<const std::string &, int>(), "path"_a, "spline"_a = 1024)
+      .def(nb::init<const std::string &, int, const std::string &>(), "path"_a, "spline"_a = 1024, "asi"_a = "")
       .def_prop_ro("layers", &gk::Model::layers)
       .def_prop_ro("has_uq", &gk::Model::has_uq)
       .def_prop_ro("element_names", &gk::Model::element_names)
@@ -229,8 +233,8 @@ NB_MODULE(GRACE_KK_MODULE, m)
       .def(nb::init<const gk::Model &, const std::vector<std::string> &, double, int, int>(), "model"_a, "species"_a,
            "skin"_a = 0.5, "spline"_a = 1024, "chunksize"_a = -1, nb::call_guard<nb::gil_scoped_release>())
       .def_prop_ro("cutoff", &gk::System::cutoff)
-      .def_prop_ro("rebuilds", &gk::System::rebuilds)
-      .def_prop_ro("chunksize", &gk::System::chunksize)
+      .def_prop_ro("rebuilds", &gk::System::rebuilds, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("chunksize", &gk::System::chunksize, nb::call_guard<nb::gil_scoped_release>())
       .def("release_buffers", &gk::System::release_device_buffers, nb::call_guard<nb::gil_scoped_release>(),
            "return the system's and its engine's per-atom device buffers now (they grow again on the next compute)")
       .def("set_dispersion", &set_dispersion<gk::System>, "params"_a.none(), "atomic_numbers"_a,
@@ -242,9 +246,9 @@ NB_MODULE(GRACE_KK_MODULE, m)
       .def(nb::init<const gk::Model &, const std::vector<std::string> &, int, int>(), "model"_a, "species"_a,
            "spline"_a = 1024, "chunksize"_a = -1, nb::call_guard<nb::gil_scoped_release>())
       .def_prop_ro("cutoff", &gk::Batch::cutoff)
-      .def_prop_ro("passes", &gk::Batch::passes)
-      .def_prop_ro("last_host_seconds", &gk::Batch::host_seconds)
-      .def_prop_rw("keep_buffers", &gk::Batch::keep_buffers, &gk::Batch::set_keep_buffers)
+      .def_prop_ro("passes", &gk::Batch::passes, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("last_host_seconds", &gk::Batch::host_seconds, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_rw("keep_buffers", &gk::Batch::keep_buffers, &gk::Batch::set_keep_buffers, nb::call_guard<nb::gil_scoped_release>())
       .def("release_buffers", &gk::Batch::release_device_buffers, nb::call_guard<nb::gil_scoped_release>(),
            "return the batch's and its engine's per-atom device buffers now (they grow again on the next compute)")
       // device arrays without implicit conversion: a converted output would be a temporary copy (results lost), a
@@ -262,7 +266,7 @@ NB_MODULE(GRACE_KK_MODULE, m)
            "set_dispersion) on the module's GPU (DLPack); natoms, cells, pbc on the host")
       .def("set_dispersion", &set_dispersion<gk::Batch>, "params"_a.none(), "atomic_numbers"_a,
            "as System.set_dispersion")
-      .def_prop_ro("chunksize", &gk::Batch::chunksize)
+      .def_prop_ro("chunksize", &gk::Batch::chunksize, nb::call_guard<nb::gil_scoped_release>())
       .def("compute", &compute_batch, "natoms"_a, "types"_a, "positions"_a, "cells"_a, "pbc"_a, "energies"_a = false,
            "uq"_a = false, "energy_only"_a = false, "max_nall"_a = 2097152, "dispersion_parts"_a = false,
            "compute with host (numpy) inputs and outputs; neighbour lists and images built on the GPU");

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // Part of grace::kk::Grace3LKK (grace_3l_kk.h), included by grace_3l_kk_impl.h:
 // equivariant SPBF A2 / A3 (forward, backward) and the L1 / equivariant geometry forces.
-// Moved from the LAMMPS style grace/3l/kk (lammps-ace 5f5ab57aa7, pair_grace_3l_kokkos_spbf.cpp).
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
@@ -20,9 +19,9 @@ namespace kk {
 using namespace sph_const;
 
 // ======================================================================
-// Kernel: TagComputeA2 (Task 2.8) — Layer-2 equivariant-indicator SPBF
+// Kernel: TagComputeA2 — Layer-2 equivariant-indicator SPBF
 // assembly, per (central-atom ii, radial-channel n). Reproduces
-// numpy_forward_3l.spbf_equivariant EXACTLY for the A2 layer:
+// the reference spbf_equivariant EXACTLY for the A2 layer:
 //   a_nl[lm_y] = R1_nl[n, l_tile[lm_y]] * Y_bond[lm_y] * env       (no z_tr)
 //   bond_I[lm_ind] = indicator[ind_j][n, lm_ind]
 //                    + z_proj[mu_j][n] * chem_l0_mask[lm_ind]      (L0 chem inject)
@@ -98,7 +97,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// Kernel: TagComputeA3 (Task 2.10) — Layer-3 equivariant-indicator SPBF
+// Kernel: TagComputeA3 — Layer-3 equivariant-indicator SPBF
 // assembly. IDENTICAL to TagComputeA2 except: (1) uses the A3 SPBF weights;
 // (2) reads the indicator from the round-2 global buffer d_eq2_norm_global
 // (n_lm_ind = A3.n_lm_ind = 50, parity-doubled vs A2's 25); (3) writes d_A3.
@@ -166,7 +165,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// Kernel: TagComputeSPBFFused (Opt 6) — team+shared replacement for
+// Kernel: TagComputeSPBFFused — team+shared replacement for
 // TagComputeA2/TagComputeA3. The old kernels gave one thread the whole (ii,n)
 // row, so the [nlm_y, n_lm_ind] product slice (P=1250 for A3) lived in a
 // per-thread stack array — REG:72 STACK:6768, i.e. a massive local-memory spill
@@ -228,7 +227,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
     team.team_barrier();
   }
 
-  // Sparse CG couple (Opt 9), one output function f per thread. cg_W is ~99%
+  // Sparse CG couple, one output function f per thread. cg_W is ~99%
   // zeros, so iterate only column f's nonzeros (CSC, ascending p = the dense
   // loop's accumulation order — numerically identical). inv_avg is folded into
   // the per-f result (A[n,f] = inv_avg·Σ_p prod·cg), sparing a whole
@@ -245,7 +244,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// compute_spbf_equiv (Opt 6) — launcher for the fused equiv-SPBF (A2/A3).
+// compute_spbf_equiv — launcher for the fused equiv-SPBF (A2/A3).
 // Sets the per-call launch state captured by TagComputeSPBFFused, then launches
 // one team per (ii,n) over the chunk with the prod slice + staging buffers in
 // team shared. Replaces the TagComputeA2/TagComputeA3 launches.
@@ -274,11 +273,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_spbf_equiv(
   Kokkos::parallel_for("ComputeSPBFFused", policy, *this);
 }
 
-// ---- TagComputeAdjProd (Opt 4): compute adj_prod = inv_avg*Σ_f A_adj(ii,n,f)*cg_W(p,f)
+// ---- TagComputeAdjProd: compute adj_prod = inv_avg*Σ_f A_adj(ii,n,f)*cg_W(p,f)
 // into the shared d_adj_prod buffer, ONE thread per OUTPUT element (ii,n,p). Unlike the
 // previous per-(ii,n) computation (a register-spilling 1600-float local array in EACH of
 // A{2,3}SPBFBwd and ForceEquiv), this holds a single accumulator per thread — no spill —
-// and both consumers then just READ d_adj_prod. Opt 9: the f-reduction walks only row
+// and both consumers then just READ d_adj_prod. The f-reduction walks only row
 // p's ~3-6 nonzeros (CSR) instead of the dense nfunc range (cg_W is ~99% zeros).
 // force_spbf_idx/force_A_adj set by the launcher.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -288,7 +287,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 {
   const DeviceSPBF &sp = d_spbf[force_spbf_idx];
   const NNScalar inv_avg = (NNScalar) sp.inv_avg_n_neigh;
-  // Opt 9: iterate only row p's nonzeros (CSR, ascending f = the dense loop's
+  // iterate only row p's nonzeros (CSR, ascending f = the dense loop's
   // accumulation order — numerically identical; cg_W is ~99% zeros).
   NNScalar s = NNScalar(0.0);
   const int e1 = sp.cg_row_ptr(p + 1);
@@ -312,7 +311,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagA3SPB
 
   const int nlm_y = (lmax + 1) * (lmax + 1);
   const int n_lm_ind = sp.n_lm_ind;
-  // Opt 4: adj_prod precomputed into d_adj_prod by compute_adj_prod(idx_spbf_A3).
+  // adj_prod precomputed into d_adj_prod by compute_adj_prod(idx_spbf_A3).
 
   const int nct = d_ncount(ii);
   for (int jj = 0; jj < nct; jj++) {
@@ -349,11 +348,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_adj_prod(
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_A3_spbf_bwd()
 {
-  // Opt 10: fused team+shared version (old TagA3SPBFBwd kept for reference).
+  // fused team+shared version (old TagA3SPBFBwd kept for reference).
   compute_spbf_bwd_fused(idx_spbf_A3, d_eq2_norm_adj);
 }
 
-// ---- TagA2SPBFBwd (Task 3.2): VJP of TagComputeA2 down to the L2 indicator
+// ---- TagA2SPBFBwd: VJP of TagComputeA2 down to the L2 indicator
 // eq1_norm. IDENTICAL structure to TagA3SPBFBwd except: reads d_A2_adj, uses the
 // A2 SPBF weights (idx_spbf_A2, n_lm_ind=25), and scatters into d_grad_I_global
 // [nall, I_n_funcs=64, I_n_out=25] (the round-1 reverse buffer = d_eq1_norm_adj,
@@ -369,7 +368,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagA2SPB
 
   const int nlm_y = (lmax + 1) * (lmax + 1);
   const int n_lm_ind = sp.n_lm_ind;
-  // Opt 4: adj_prod precomputed into d_adj_prod by compute_adj_prod(idx_spbf_A2).
+  // adj_prod precomputed into d_adj_prod by compute_adj_prod(idx_spbf_A2).
 
   const int nct = d_ncount(ii);
   for (int jj = 0; jj < nct; jj++) {
@@ -392,11 +391,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagA2SPB
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_A2_spbf_bwd()
 {
-  // Opt 10: fused team+shared version (old TagA2SPBFBwd kept for reference).
+  // fused team+shared version (old TagA2SPBFBwd kept for reference).
   compute_spbf_bwd_fused(idx_spbf_A2, d_grad_I_global);
 }
 
-// ---- TagSPBFBwdFused (Opt 10): team+shared equiv-SPBF backward, shared by A2
+// ---- TagSPBFBwdFused: team+shared equiv-SPBF backward, shared by A2
 // (target d_grad_I_global) and A3 (target d_eq2_norm_adj). The old per-(ii,n)
 // THREAD kernels re-read the full d_adj_prod row (P = nlm_y*n_lm_ind, 5 KB for
 // A3) from global once PER NEIGHBOUR (~nct times) and walked the jj/lr/ly loops
@@ -744,7 +743,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagForce
 
   const int nlm_y = (lmax + 1) * (lmax + 1);
   const int n_lm_ind = force_n_lm_ind;
-  // Opt 4: adj_prod precomputed into d_adj_prod by compute_adj_prod(force_spbf_idx).
+  // adj_prod precomputed into d_adj_prod by compute_adj_prod(force_spbf_idx).
 
   const int nct = d_ncount(ii);
   for (int jj = 0; jj < nct; jj++) {
@@ -777,7 +776,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagForce
   }
 }
 
-// ---- TagForceEquivFused (Opt 11): team-per-(ii,n) version of TagForceEquiv.
+// ---- TagForceEquivFused: team-per-(ii,n) version of TagForceEquiv.
 // The old kernel gave one THREAD the whole (ii,n) row and re-read the full
 // d_adj_prod row (P = nlm_y*n_lm_ind, 5 KB for A3) from global once per
 // neighbour (~nct times). Here ONE TEAM owns one (ii,n): the adj_prod row is
@@ -875,7 +874,7 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::spbf_rm_ok(int si, i
   if (off || !spbf_fast_ok(si) || !blas_handle || ridx < 0 || ridx >= n_reduces) return false;
   const ReduceHost &hr = h_reduce[ridx];
   const DeviceSPBF &sp = d_spbf[si];
-  if (!hr.cublas_ok || !hr.grouped || hr.n_in != sp.n_rad_max || hr.n_conn != sp.nfunc) return false;
+  if (!hr.gemm_form_ok || !hr.grouped || hr.n_in != sp.n_rad_max || hr.n_conn != sp.nfunc) return false;
   for (size_t f = 0; f < hr.gn.size(); f++)
     if (hr.gn[f] > 0 && hr.gstart[f] + hr.gn[f] > sp.nfunc) return false;
   return (int) d_spbf_T.extent(1) >= sp.n_rad_max * sp.nfunc && (int) d_spbf_T.extent(0) >= chunk_size;
@@ -952,7 +951,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_A1_tables()
 // the 64-lane kernel (force_L1_fast_t<64>; CDNA builds, default on); one line on stderr per process says which
 inline bool g3l_force_l1_wave()
 {
-  static const KernelChoice c = wave64_switch("GRACE3L_FORCE_L1_WAVE", env_switch("GRACE3L_FORCE_L1_WAVE"));
+  static const KernelChoice c = wave64_switch("GRACE3L_FORCE_L1_WAVE");
   static std::once_flag logged;
   std::call_once(logged, [&] {
     std::fprintf(stderr, "grace kk: GRACE-3L layer-1 forces on the %s kernel (%s)\n",
@@ -2035,7 +2034,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_force_equiv(
   force_ind_stage = ind_stage;
   force_n_lm_ind = n_lm_ind;
   const int nradmax = d_spbf[spbf_idx].n_rad_max;
-  // Opt 11: team-per-(ii,n) with the adj_prod row staged in team shared (old
+  // team-per-(ii,n) with the adj_prod row staged in team shared (old
   // per-thread TagForceEquiv kept for reference). team_size 64: the per-bond
   // body is register-heavy (bond_I[64] + w[25] + fp64 Plm/dPlm recurrence).
   const int nlm_y = (lmax + 1) * (lmax + 1);

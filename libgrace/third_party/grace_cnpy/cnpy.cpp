@@ -253,6 +253,11 @@ cnpy::NpyArray load_the_npy_file(FILE* fp) {
 //    return array;
 //}
 
+// the lagging ".npy" of a zip member name (a shorter or other name stays as it is)
+static void strip_npy(std::string &name) {
+    if(name.size() >= 4 && name.compare(name.size() - 4, 4, ".npy") == 0) name.erase(name.size() - 4);
+}
+
 cnpy::npz_t cnpy::npz_load(std::string fname) {
     FILE* fp = fopen(fname.c_str(),"rb");
 
@@ -281,7 +286,7 @@ cnpy::npz_t cnpy::npz_load(std::string fname) {
             throw std::runtime_error("npz_load: failed fread");
 
         //erase the lagging .npy        
-        varname.erase(varname.end()-4,varname.end());
+        strip_npy(varname);
 
         //read in the extra field
         uint16_t extra_field_len = *(uint16_t*) &local_header[28];
@@ -311,6 +316,7 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
     FILE* fp = fopen(fname.c_str(),"rb");
 
     if(!fp) throw std::runtime_error("npz_load: Unable to open file "+fname);
+    std::unique_ptr<FILE, int (*)(FILE *)> fp_guard(fp, fclose);
 
     while(1) {
         std::vector<char> local_header(30);
@@ -327,7 +333,7 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
         size_t vname_res = fread(&vname[0],sizeof(char),name_len,fp);      
         if(vname_res != name_len)
             throw std::runtime_error("npz_load: failed fread");
-        vname.erase(vname.end()-4,vname.end()); //erase the lagging .npy
+        strip_npy(vname); //erase the lagging .npy
 
         //read in the extra field
         uint16_t extra_field_len = *(uint16_t*) &local_header[28];
@@ -339,13 +345,11 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
 
         if(vname == varname) {
             if(compr_method != 0) {
-                fclose(fp);
                 throw std::runtime_error("npz_load: '" + varname + "' in " + fname +
                                          " is compressed (np.savez_compressed); save the file with np.savez");
             }
 //            NpyArray array  = (compr_method == 0) ? load_the_npy_file(fp) : load_the_npz_array(fp,compr_bytes,uncompr_bytes);
             NpyArray array  =  load_the_npy_file(fp);
-            fclose(fp);
             return array;
         }
         else {
@@ -354,8 +358,6 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
             fseek(fp,size,SEEK_CUR);
         }
     }
-
-    fclose(fp);
 
     //if we get here, we haven't found the variable in the file
     throw std::runtime_error("npz_load: Variable name "+varname+" not found in "+fname);
@@ -366,10 +368,10 @@ cnpy::NpyArray cnpy::npy_load(std::string fname) {
     FILE* fp = fopen(fname.c_str(), "rb");
 
     if(!fp) throw std::runtime_error("npy_load: Unable to open file "+fname);
+    std::unique_ptr<FILE, int (*)(FILE *)> fp_guard(fp, fclose);
 
     NpyArray arr = load_the_npy_file(fp);
 
-    fclose(fp);
     return arr;
 }
 

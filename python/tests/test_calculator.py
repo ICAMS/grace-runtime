@@ -277,6 +277,38 @@ def test_skin_validation(models):
         assert abs(e - out[0][0]) < 1e-9 and np.allclose(f, out[0][1], atol=1e-9)
 
 
+@pytest.mark.parametrize("arch", ["2l", "3l"])
+def test_store_limit(models, monkeypatch, arch):
+    """CPU 2L / 3L: the reverse pass keeps per-atom forward tensors up to Model(store_max_gb) (default None: half the
+    available memory) and recomputes them above it, with the same results; backend_info["store"] tells which, and a
+    RuntimeWarning says it once per model"""
+    import warnings
+    from grace_runtime import calculator
+    monkeypatch.setattr(calculator, "_STORE_WARNED", set())
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="store_max_gb"):
+            Model(models[arch], store_max_gb=bad)
+    out = {}
+    for limit in (None, 0.0):
+        m = Model(models[arch], store_max_gb=limit)
+        assert m.store_max_gb == limit
+        at = bulk("W", "bcc", a=3.1, cubic=True) * (2, 2, 2)
+        at.rattle(0.05, seed=1)
+        calc = GRACERuntimeCalculator(m, device="cpu", num_threads=1, energy_only=False)
+        at.calc = calc
+        assert calc.backend_info["store"] is None
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            out[limit] = at.get_potential_energy(), at.get_forces()
+            at.positions[0, 0] += 0.01    # a second call: no second warning
+            at.get_potential_energy()
+        st = calc.backend_info["store"]
+        assert st["kept"] == (limit is None) and st["need_gb"] > 0, st
+        assert st["limit_gb"] >= st["need_gb"] if limit is None else st["limit_gb"] == 0.0, st
+        assert len([x for x in w if "forward store" in str(x.message)]) == (0 if limit is None else 1)
+    assert out[None][0] == out[0.0][0] and np.array_equal(out[None][1], out[0.0][1])
+
+
 def test_strict_mode_without_a_gpu(models):
     """GRACE_RUNTIME_STRICT=1: device="auto" without a usable GPU is an error (a native GPU or nothing); an explicit
     device="cpu" or GRACE_RUNTIME_DEVICE=cpu still runs on the CPU."""
@@ -292,3 +324,29 @@ def test_strict_mode_without_a_gpu(models):
         r = subprocess.run([sys.executable, "-c", code.format(extra), models["1l"]], capture_output=True, text=True,
                            env=e)
         assert r.returncode == 0, r.stderr[-2000:]
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5, 119, 200])
+def test_invalid_atomic_numbers_rejected(mdl, bad):
+    """Atomic numbers < 1 or >= len(chemical_symbols) raise a clear ValueError instead of wrapping around (e.g. -1 -> Og)."""
+    from grace_runtime import compute_batch
+    at = bulk("W", "bcc", a=3.165, cubic=True)
+    at.numbers[0] = bad
+    at.calc = GRACERuntimeCalculator(mdl["1l"], num_threads=1)
+    with pytest.raises(ValueError, match="atomic number"):
+        at.get_potential_energy()
+    with pytest.raises(ValueError, match="atomic number"):
+        compute_batch(mdl["1l"], [at], device="cpu", num_threads=1)
+
+
+def test_mutating_num_threads_updates_neighbor_list(mdl):
+    """Mutating calc.num_threads updates both the CPU engine and its NeighborList."""
+    at = bulk("W", "bcc", a=3.165, cubic=True).repeat(2)
+    calc = GRACERuntimeCalculator(mdl["1l"], num_threads=1)
+    at.calc = calc
+    at.get_potential_energy()
+    assert calc._cpu.num_threads == 1 and calc._cpu.nl.num_threads == 1
+    calc.num_threads = 3
+    at.positions[0, 0] += 0.5
+    at.get_potential_energy()
+    assert calc._cpu.num_threads == 3 and calc._cpu.nl.num_threads == 3

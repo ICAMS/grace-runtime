@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/KOKKOS/grace_fused_kokkos_dense.h (07b8fb50d4); contributing author Yury Lysogorskiy (ICAMS)
 
 
 /* ----------------------------------------------------------------------
    Contributing author: Yury Lysogorskiy (ICAMS)
-   Dense-chain kernels shared by grace/1l/fused/kk and grace/2l/fused/kk: direct FC with liveness pruning
+   Dense-chain kernels shared by Grace1LFusedKK and Grace2LFusedKK: direct FC with liveness pruning
    (forward, reverse, reverse right part from transposed weights) and CG products, plus their metadata.
    Tensors are [chunk atom][channel][function] views; cs = atoms in the chunk.
 ------------------------------------------------------------------------- */

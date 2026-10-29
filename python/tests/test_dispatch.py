@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-"""ISA dispatch: _core_x86_64_v3 / _core_x86_64_v4 (/ _core_native) chosen at import; GRACE_RUNTIME_CPU forces one."""
+"""ISA dispatch: _core_x86_64_v3 / _core_x86_64_v4 / _core_aarch64 (/ _core_native) chosen at import;
+GRACE_RUNTIME_CPU forces one."""
 import json
 import os
 import subprocess
@@ -41,6 +42,26 @@ def test_no_usable_module():
         _dispatch.select({"sse2"}, None, {"x86_64_v3", "x86_64_v4"})
 
 
+A64 = {"fp", "asimd", "atomics", "asimdrdm", "crc32"}    # Linux "Features" of an ARMv8.2-A CPU (Neoverse N1)
+
+
+def test_cpu_flags_reads_arm_features(tmp_path):
+    p = tmp_path / "cpuinfo"
+    p.write_text("processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd atomics asimdrdm\nCPU part\t: 0xd0c\n")
+    assert _dispatch.cpu_flags(str(p)) == {"fp", "asimd", "atomics", "asimdrdm"}
+
+
+def test_select_aarch64():
+    assert _dispatch.select(A64, None, {"aarch64"}) == "aarch64"
+    assert _dispatch.select(set(), None, {"aarch64"}) == "aarch64"      # macOS: no /proc/cpuinfo
+    assert _dispatch.select(A64, "aarch64", {"aarch64"}) == "aarch64"
+
+
+def test_aarch64_on_an_armv8_0_cpu():
+    with pytest.raises(ImportError, match="ARMv8.2-A.*lacks atomics.*--no-binary"):
+        _dispatch.select({"fp", "asimd", "crc32"}, None, {"aarch64"})    # Cortex-A72 (Raspberry Pi 4)
+
+
 def test_no_extension_at_all():
     with pytest.raises(ImportError, match="no compiled extension"):
         _dispatch.select(V3 | V4 | {"abm"}, None, set())
@@ -75,6 +96,8 @@ def _run(cpu, models):
 
 
 @pytest.mark.skipif(not V4 <= _dispatch.cpu_flags(), reason="needs AVX-512 for the v4 module")
+@pytest.mark.skipif(not {"x86_64_v3", "x86_64_v4"} <= _dispatch.available(),
+                    reason="needs both ISA modules (a dual-ISA install)")
 def test_v3_and_v4_agree(models):
     v3, v4 = _run("v3", models), _run("v4", models)
     assert (v3["module"], v4["module"]) == ("x86_64_v3", "x86_64_v4")

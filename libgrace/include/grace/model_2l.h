@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE (lammps-ace, feature/grace-fused); contributing author: Yury Lysogorskiy (ICAMS)
+// Contributing author: Yury Lysogorskiy (ICAMS)
 #ifndef GRACE_MODEL_2L_H
 #define GRACE_MODEL_2L_H
 

@@ -17,21 +17,22 @@ with ``positions.requires_grad`` are refused.
 import numpy as np
 import torch
 from ase import Atoms
-from ase.data import atomic_numbers, chemical_symbols
+from ase.data import atomic_numbers
 from ase.stress import voigt_6_to_full_3x3_stress
 from torch_sim.models.interface import ModelInterface
 
 from ._core import Model
 from .batch import _chunks, _cpu_iter, _gpu_batch, _gpu_compute
-from .calculator import _chunk_arg, _select_device, default_threads
+from .calculator import _chunk_arg, _select_device, _species_from_z, default_threads
 from .dispersion import resolve as _resolve_dispersion
 
 _UQ_ATOM = ("gamma", "atomic_sigma", "gmm_cluster")
 
 
 class GRACERuntimeModel(ModelInterface):
-    """A GRACE model (kokkos.npz path, registry name or ``grace_runtime.Model``) as a TorchSim model.
+    """A GRACE or PACE model as a TorchSim model.
 
+    model: path to a kokkos.npz, a registry name, a PACE .yaml or a ``grace_runtime.Model``.
     device: torch device or string; None: "cuda" when torch sees a GPU and grace-runtime can use it (as
         ``device="auto"`` of ``GRACERuntimeCalculator``), else "cpu". "cuda:N" runs the kernels on GPU N. On a ROCm
         build of torch (``torch.version.hip`` set) torch's "cuda" is the AMD GPU, and grace-runtime runs on "rocm:N".
@@ -40,15 +41,15 @@ class GRACERuntimeModel(ModelInterface):
         cells with zero vectors); without both only energies are computed (no backward pass).
     energies: also per-atom energies "energies" [n_atoms].
     uq: the UQ head (uqv6 "gamma_only"): "gamma", "atomic_sigma", "gmm_cluster" [n_atoms] and "total_sigma"
-        [n_systems].
-    chunksize, max_nall, max_atoms: as ``compute_batch`` (GPU memory per engine pass; atoms per call into the GPU
-        module, host path only). num_threads: threads of the CPU kernels.
+        [n_systems]; for PACE models with an active set, "gamma" [n_atoms] only.
+    chunksize, max_nall, max_atoms, num_threads: as ``compute_batch`` (GPU memory per engine pass; atoms per call into
+        the GPU module, host path only; threads of the CPU kernels).
     device_path: states on the model's GPU stay there (neighbour lists built on the GPU, inputs and outputs as
         device tensors); False, or cells with zero vectors (molecules), or a state on another device: the host path
         (copies to the host and back).
-    dispersion: a dispersion correction added to the model (a ``grace_runtime.D3`` or "d3-pbe", "d3-r2scan"; see
-        ``grace_runtime.dispersion``): included in energy, forces, stress, energies; its energy also as
-        "dispersion_energy" [n_systems], with dispersion_parts also "dispersion_forces", "dispersion_stress",
+    dispersion, dispersion_parts: a dispersion correction added to the model (a ``grace_runtime.D3`` or "d3-pbe",
+        "d3-r2scan"; see ``grace_runtime.dispersion``): included in energy, forces, stress, energies; its energy also
+        as "dispersion_energy" [n_systems], with dispersion_parts also "dispersion_forces", "dispersion_stress",
         "dispersion_energies".
 
     Autobatching: ``memory_scales_with`` is "n_atoms"; ``max_memory_scaler(state)`` estimates the atoms per call that
@@ -78,8 +79,6 @@ class GRACERuntimeModel(ModelInterface):
         else:
             self._device = torch.device("cpu")
         if uq:
-            if not m.has_uq:
-                raise ValueError("the model has no UQ head (kokkos.npz exported without UQ artifacts)")
             m.validate_uq()
         self._model, self._kk = m, (kkm[0] if kkm is not None else None)
         self._dtype = dtype
@@ -133,7 +132,7 @@ class GRACERuntimeModel(ModelInterface):
         still run (the engine splits them into passes): the estimate sets the batch size, not a hard limit. CPU:
         max_atoms. Memory held by torch's caching allocator is not free for this model (torch.cuda.empty_cache())."""
         import torch_sim as ts
-        if self._kk is None:
+        if self._kk is None or state.n_atoms == 0:
             return float(self._max_atoms)
         probe = ts.concatenate_states([state] * max(1, -(-2048 // state.n_atoms)))
         self.forward(probe)    # model, engine and tables set up outside the measured call
@@ -157,7 +156,7 @@ class GRACERuntimeModel(ModelInterface):
         natoms = torch.bincount(state.system_idx, minlength=nsys).cpu().numpy().astype(np.int32)
         z = state.atomic_numbers.detach()
         zs = torch.unique(z).cpu().numpy()
-        species = sorted(chemical_symbols[k] for k in zs)
+        species = _species_from_z(zs)
         b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True, dispersion=self._disp)
         key = tuple(species)
         if self._lut_key != key:    # atomic number -> type 1..len(species), on the device
@@ -221,7 +220,7 @@ class GRACERuntimeModel(ModelInterface):
 
     def _gpu(self, natoms, numbers, pos, cells, pbc, eonly):
         """calls into the GPU module, at most max_atoms atoms each (a larger system alone), outputs concatenated"""
-        species = sorted(chemical_symbols[k] for k in np.unique(numbers))
+        species = _species_from_z(np.unique(numbers))
         b = _gpu_batch(self._kk, self._model, species, self._chunk, keep=True,    # buffers kept across steps
                        dispersion=self._disp)
         starts = np.concatenate([[0], np.cumsum(natoms)])

@@ -63,7 +63,7 @@ template<class T> GRACE_HD T count(T rcov, T r, T &dfdr)
 // reference weights w[a] and dw[a]/dCN of an atom with coordination number cn (entries nref..kMaxRef-1 set to 0); a
 // non-finite weight becomes 1 for the reference with the largest CNref and 0 otherwise, a non-finite derivative 0
 // (as simple-dftd3 for CN far from all references). dw is written as w (2 kWF dc - dnorm / norm), which does not
-// underflow when norm is tiny (CN ~10 from every reference)
+// underflow when norm is tiny (CN ~10 from every reference). dw may be nullptr (energy only: weights alone)
 GRACE_HD void weights(double cn, const double *cnref, int nref, double *w, double *dw)
 {
   double g[kMaxRef], norm = 0.0, dnorm = 0.0, cmax = -1.0;
@@ -77,15 +77,18 @@ GRACE_HD void weights(double cn, const double *cnref, int nref, double *w, doubl
   const double ninv = 1.0 / norm;
   for (int a = 0; a < kMaxRef; a++) {
     if (a >= nref) {
-      w[a] = dw[a] = 0.0;
+      w[a] = 0.0;
+      if (dw) dw[a] = 0.0;
       continue;
     }
     double wa = g[a] * ninv;
     if (!finite(wa)) wa = cnref[a] == cmax ? 1.0 : 0.0;
-    double da = wa * (2.0 * kWF * (cnref[a] - cn) - dnorm * ninv);
-    if (!finite(da)) da = 0.0;
     w[a] = wa;
-    dw[a] = da;
+    if (dw) {
+      double da = wa * (2.0 * kWF * (cnref[a] - cn) - dnorm * ninv);
+      if (!finite(da)) da = 0.0;
+      dw[a] = da;
+    }
   }
 }
 
@@ -203,7 +206,8 @@ template<class T> GRACE_HD AtmSide<T> atm_side(T u, T rc, T ron)
 // three-body term per unit sqrt|C6 C6 C6| / sqrt(Hartree) of a triangle with sides s0, s1, s2:
 //   atm = (3/8 prod_p (S - 2 u_p) / P^(5/2) + 1 / P^(3/2)) fd sw(r_0) sw(r_1) sw(r_2),  S = sum u, P = prod u
 //   (= (3 cos a cos b cos c + 1) / (r_0 r_1 r_2)^3), fd = 1 / (1 + c P^(-8/3)) with c = 6 prod_pairs (4/3 R0)^(16/3)
-//   (= 1 / (1 + 6 (R0 / r)^(16/3)), R0 and r the products over the sides); dg[p] = d atm / du_p
+//   (= 1 / (1 + 6 (R0 / r)^(16/3)), R0 and r the products over the sides); dg[p] = d atm / du_p (dg may be nullptr:
+//   energy only)
 template<class T>
 GRACE_HD T atm(const AtmSide<T> &s0, const AtmSide<T> &s1, const AtmSide<T> &s2, T c, T *dg)
 {
@@ -216,6 +220,7 @@ GRACE_HD T atm(const AtmSide<T> &s0, const AtmSide<T> &s1, const AtmSide<T> &s2,
   const T q = s0.q * s1.q * s2.q, q2 = q * q, q4 = q2 * q2, t = c * q4 * q4;    // c P^(-8/3)
   const T fd = T(1) / (T(1) + t);
   const T s3 = s0.sw * s1.sw * s2.sw, af = a * fd;
+  if (!dg) return af * s3;
   const T msum = m0 + m1 + m2, mm[3] = {m0, m1, m2};
   const T so[3] = {s1.sw * s2.sw, s0.sw * s2.sw, s0.sw * s1.sw};
   for (int p = 0; p < 3; p++) {
@@ -337,7 +342,7 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
   // rows of the neighbours), else one atom's rows per thread
   std::vector<int> ty(n);
   for (int64_t q = 0; q < n; q++) ty[q] = type[cl.perm(q)];
-  std::vector<double> w((size_t) n * R), dw((size_t) n * R), dedcn(n);
+  std::vector<double> w((size_t) n * R), dw(energy_only ? 0 : (size_t) n * R), dedcn(energy_only ? 0 : (size_t) n);
   const size_t nrow = atm3 ? (size_t) n * ns * R : 0;
   std::vector<double> row(nrow), drow(energy_only ? 0 : nrow);
   // per thread, allocated here (an exception must not leave the parallel region; the arrays are zeroed, so first
@@ -350,15 +355,17 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
     CellList::Hits h;
     double e = 0.0, v[6] = {0, 0, 0, 0, 0, 0};    // the thread's energy and virial
   };
-  enum { C6N, RQN, RAN, AEN, ADN, AXN, AYN, AZN, NNB };    // nb fields, [field][neighbour]
+  enum { C6N, AEN, RQN, RAN, ADN, AXN, AYN, AZN, NNB };    // nb fields, [field][neighbour]
   std::vector<Work> work(nth);
   const int64_t hmax = cl.max_gather(std::max(rc, rcn)), h3 = atm3 ? cl.max_gather(rc3) : 0;
   const size_t psize = energy_only ? (size_t) n : 5 * (size_t) n;
+  const size_t rsize = (energy_only ? 1 : 2) * (size_t) ns * R;
+  const size_t nnb = (energy_only ? 2 : (size_t) NNB) * (size_t) h3;
   for (auto &wk : work) {
     wk.part.reserve(psize);
     wk.h.reserve(std::max(hmax, h3));
-    wk.rows.reserve(2 * (size_t) ns * R);
-    wk.nb.reserve(NNB * (size_t) h3);
+    wk.rows.reserve(rsize);
+    wk.nb.reserve(nnb);
     wk.side.reserve(h3);
   }
   // schedule(static, 32) throughout and the thread sums added in thread order: the same atoms on the same thread in
@@ -379,8 +386,8 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
     };
     wk.part.assign(psize, 0.0);    // within the capacity: no allocation
     wk.h.grow(std::max(hmax, h3));
-    wk.rows.resize(2 * (size_t) ns * R);
-    wk.nb.resize(NNB * (size_t) h3);
+    wk.rows.resize(rsize);
+    wk.nb.resize(nnb);
     wk.side.resize(h3);
     CellList::Hits &h = wk.h;
     double *ce = wk.part.data(), *cd = energy_only ? nullptr : ce + n, *cf = energy_only ? nullptr : ce + 2 * n;
@@ -400,15 +407,18 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
     // the C6 rows of slot q into r and dr ([ns][R]; dr nullable)
     auto rows_of = [&](int64_t q, double *r, double *dr) {
       const int si = ty[q];
-      const double *wi = &w[(size_t) q * R], *dwi = &dw[(size_t) q * R];
+      const double *wi = &w[(size_t) q * R], *dwi = dr ? &dw[(size_t) q * R] : nullptr;
       for (int s = 0; s < ns; s++)
         for (int b = 0; b < R; b++) {
           const double *blk = &t.c6ref[((size_t) si * ns + s) * R * R + b];
           double cr = 0.0, dd = 0.0;
-          for (int a = 0; a < R; a++) {
-            cr += wi[a] * blk[a * R];
-            dd += dwi[a] * blk[a * R];
-          }
+          if (dr)    // the branch outside the reference loop (energy only: cr alone)
+            for (int a = 0; a < R; a++) {
+              cr += wi[a] * blk[a * R];
+              dd += dwi[a] * blk[a * R];
+            }
+          else
+            for (int a = 0; a < R; a++) cr += wi[a] * blk[a * R];
           r[s * R + b] = cr;
           if (dr) dr[s * R + b] = dd;
         }
@@ -416,7 +426,8 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
 #pragma omp for schedule(static)
     for (int64_t q = 0; q < n; q++) {
       const int si = ty[q];
-      weights(summed(q), &t.cnref[(size_t) si * R], t.nref[si], &w[(size_t) q * R], &dw[(size_t) q * R]);
+      weights(summed(q), &t.cnref[(size_t) si * R], t.nref[si], &w[(size_t) q * R],
+              energy_only ? nullptr : &dw[(size_t) q * R]);
     }
     if (atm3) {
 #pragma omp for schedule(static)
@@ -428,7 +439,7 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
 #pragma omp for schedule(static, 32)
     for (int64_t q = 0; q < n; q++) {
       const int si = ty[q];
-      const double *rq = wk.rows.data(), *drq = rq + ns * R;
+      const double *rq = wk.rows.data(), *drq = energy_only ? nullptr : rq + ns * R;
       if (atm3) {
         rq = &row[(size_t) q * ns * R];
         drq = energy_only ? nullptr : &drow[(size_t) q * ns * R];
@@ -441,7 +452,7 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
         const int64_t j = h.p[k];
         const int sj = ty[j];
         const size_t st = (size_t) si * ns + sj;
-        const double *wj = &w[(size_t) j * R], *dwj = &dw[(size_t) j * R], *ri = &rq[(size_t) sj * R];
+        const double *wj = &w[(size_t) j * R], *ri = &rq[(size_t) sj * R];
         double c = 0.0, dgdr;
         for (int b = 0; b < R; b++) c += ri[b] * wj[b];
         const double r = std::sqrt(h.r2[k]);
@@ -449,7 +460,7 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
         ei += 0.5 * c * g;
         ce[j] += 0.5 * c * g;
         if (energy_only) continue;
-        const double *dri = &drq[(size_t) sj * R];
+        const double *dwj = &dw[(size_t) j * R], *dri = &drq[(size_t) sj * R];
         double dci = 0.0, dcj = 0.0;
         for (int b = 0; b < R; b++) {
           dci += dri[b] * wj[b];
@@ -470,8 +481,10 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
       // triangle's virial to q. The shares of the neighbours summed per neighbour, added after q's triangles
       const double rc32 = rc3 * rc3;
       const size_t H = (size_t) h3;
-      double *c6n = &wk.nb[C6N * H], *rqn = &wk.nb[RQN * H], *ran = &wk.nb[RAN * H], *ae = &wk.nb[AEN * H],
-             *ad = &wk.nb[ADN * H], *axn = &wk.nb[AXN * H], *ayn = &wk.nb[AYN * H], *azn = &wk.nb[AZN * H];
+      double *c6n = &wk.nb[C6N * H], *ae = &wk.nb[AEN * H],
+             *rqn = energy_only ? nullptr : &wk.nb[RQN * H], *ran = energy_only ? nullptr : &wk.nb[RAN * H],
+             *ad = energy_only ? nullptr : &wk.nb[ADN * H], *axn = energy_only ? nullptr : &wk.nb[AXN * H],
+             *ayn = energy_only ? nullptr : &wk.nb[AYN * H], *azn = energy_only ? nullptr : &wk.nb[AZN * H];
       AtmSide<double> *side = wk.side.data();
 #pragma omp for schedule(static, 32)
       for (int64_t q = 0; q < n; q++) {
@@ -481,18 +494,22 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
         for (int64_t a = 0; a < m; a++) {    // C6 of q with each neighbour and the ratios dC6/dCN / C6 at both ends
           const int64_t j = h.p[a];
           const int sj = ty[j];
-          const double *wj = &w[(size_t) j * R], *dwj = &dw[(size_t) j * R], *ri = &rq[(size_t) sj * R];
-          double c = 0.0, dq = 0.0, da = 0.0;
+          const double *wj = &w[(size_t) j * R], *ri = &rq[(size_t) sj * R];
+          double c = 0.0;
           for (int b = 0; b < R; b++) c += ri[b] * wj[b];
-          if (!energy_only)
+          c6n[a] = c;
+          ae[a] = 0.0;
+          if (!energy_only) {
+            const double *dwj = &dw[(size_t) j * R];
+            double dq = 0.0, da = 0.0;
             for (int b = 0; b < R; b++) {
               dq += drq[(size_t) sj * R + b] * wj[b];
               da += ri[b] * dwj[b];
             }
-          c6n[a] = c;
-          rqn[a] = dq / c;
-          ran[a] = da / c;
-          ae[a] = ad[a] = axn[a] = ayn[a] = azn[a] = 0.0;
+            rqn[a] = dq / c;
+            ran[a] = da / c;
+            ad[a] = axn[a] = ayn[a] = azn[a] = 0.0;
+          }
           side[a] = atm_side(h.r2[a], rc3, ron3);
         }
         double ei = 0.0, dei = 0.0, fq[3] = {0, 0, 0}, vq[6] = {0, 0, 0, 0, 0, 0};
@@ -516,7 +533,8 @@ inline void compute_cpu(const Tables &t, const int *type, int64_t n, const CellL
             const double cd3 = 6.0 * rij * t.rvdw16[(size_t) si * ns + sk] * t.rvdw16[(size_t) sj * ns + sk];
             double dg[3];
             const double k9 = s9u * std::sqrt(c9);
-            const double e = k9 * atm(side[a], side[b], atm_side(ujk, rc3, ron3), cd3, dg), e3 = e / 3.0;
+            const double e = k9 * atm(side[a], side[b], atm_side(ujk, rc3, ron3), cd3, energy_only ? nullptr : dg),
+                         e3 = e / 3.0;
             ei += e3;
             ae[a] += e3;
             ae[b] += e3;

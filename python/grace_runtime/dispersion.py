@@ -21,15 +21,15 @@ _KIND_D3BJ = 1
 class D3:
     """DFT-D3(BJ) dispersion: two-body, optionally with the three-body (ATM) term.
 
-    functional: ``"pbe"`` or ``"r2scan"`` (published damping parameters); or None with ``a1``, ``a2`` (Bohr, as
-        published) and ``s8`` (``s6`` defaults to 1).
-    cutoff: pair cutoff (Angstrom). The pair terms are switched off smoothly over the last ``switch_width`` Angstrom
-        below it (``switch_width=0``: hard cutoff).
+    functional, a1, a2, s8, s6: ``"pbe"`` or ``"r2scan"`` (published damping parameters); or None with ``a1``, ``a2``
+        (Bohr, as published) and ``s8`` (``s6`` defaults to 1).
+    cutoff, switch_width: pair cutoff (Angstrom). The pair terms are switched off smoothly over the last
+        ``switch_width`` Angstrom below it (``switch_width=0``: hard cutoff).
     cn_cutoff: cutoff of the coordination numbers (Angstrom).
-    atm: add the Axilrod-Teller-Muto three-body term (s9 = 1, the C6 of the two-body term, zero damping with the D3
-        van der Waals radii, as simple-dftd3). Off by default: the published D3(BJ) parameters were fitted without it.
-    atm_cutoff: largest side of a triangle (Angstrom); each side is switched off smoothly over the last
-        ``atm_switch_width`` Angstrom below it.
+    atm, atm_cutoff, atm_switch_width: add the Axilrod-Teller-Muto three-body term (s9 = 1, the C6 of the two-body
+        term, zero damping with the D3 van der Waals radii, as simple-dftd3). Off by default: the published D3(BJ)
+        parameters were fitted without it. ``atm_cutoff`` is the largest side of a triangle (Angstrom); each side is
+        switched off smoothly over the last ``atm_switch_width`` Angstrom below it.
 
     The defaults 15 / 3 / 10 Angstrom miss ~1 meV/atom of the dispersion energy in graphite and ~8 meV/atom in copper
     against simple-dftd3 at its 32 / 21 Angstrom (measured; differences between similar structures largely cancel);

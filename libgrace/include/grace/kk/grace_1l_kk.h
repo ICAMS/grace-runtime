@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-1L Kokkos engine (from the LAMMPS style grace/1l/kk, lammps-ace feature/grace-runtime 07b8fb50d4;
-// contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies positions, types, a
-// full neighbour list and the output views through RunInput, and the Kokkos view types through Traits
-// (grace/kk/traits.h). Implementation: grace/kk/grace_1l_kk_impl.h, included by one translation unit per consumer.
+// GRACE-1L Kokkos engine (contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies
+// positions, types, a full neighbour list and the output views through RunInput, and the Kokkos view types through
+// Traits (grace/kk/traits.h). Implementation: grace/kk/grace_1l_kk_impl.h, included by one translation unit per
+// consumer.
 #pragma once
 
 #include "grace/coupling.h"
@@ -49,7 +49,7 @@ class Grace1LKK {
   struct TagUQFinish{};  // normalize proj + density + GMM from cuBLAS projection
 #endif
 
-  // Force computation tags (Stage 2)
+  // Force computation tags
   template<int NEIGHFLAG, int EVFLAG>
   struct TagComputeForce{};
 
@@ -80,7 +80,7 @@ class Grace1LKK {
   struct RunInput {
     typename Traits::t_kkfloat_1d_3_lr_randomread x;
     typename Traits::t_kkacc_1d_3 f;
-    typename Traits::t_int_1d_randomread type, ilist, numneigh;
+    typename Traits::t_int_1d_randomread type, ilist, numneigh;    // ilist: mapped types only (grace/type_map.h)
     typename Traits::t_neighbors_2d neighbors;
     int inum = 0, nlocal = 0, ntypes = 0;
     int eflag_global = 0, eflag_atom = 0, vflag_global = 0, vflag_atom = 0, cvflag_atom = 0;
@@ -118,6 +118,9 @@ class Grace1LKK {
   typename Traits::t_int_1d_randomread d_mask;
   Kokkos::View<double, DeviceType> d_dedl;
   bool couple_supported = false;
+  // engines with their own rho reduce (Grace1LFusedKK) take any reduce layout; else copy_weights_to_device checks
+  // the one the generic reduce kernels need
+  bool general_reduce_supported = false;
   double memory_usage();
 
   // Kernel operators (to be implemented)
@@ -153,10 +156,10 @@ class Grace1LKK {
   void operator() (TagMLPAssemble, const int b) const;
 
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPActDeriv, const int idx) const;
+  void operator() (TagMLPActDeriv, const int64_t idx) const;
 
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPScatterR, const int idx) const;
+  void operator() (TagMLPScatterR, const int64_t idx) const;
 #endif
 
   template<int NEIGHFLAG, int EVFLAG>
@@ -321,10 +324,10 @@ class Grace1LKK {
   t_nn_2d d_rho;               // [chunk_size, rho_n_out]
   Kokkos::View<KKA*, DeviceType> d_e_atom;    // [chunk_size], fp64 (KKA) as the energy sum
 
-  // Per-bond force (for Stage 2)
+  // Per-bond force
   t_geom_3d3 d_f_ij;           // [chunk_size, maxneigh, 3]
 
-  // Adjoint views for backward pass (Stage 2: Forces)
+  // Adjoint views for the backward pass (forces)
   t_nn_2d d_rho_adj;            // [chunk_size, rho_n_out]
   t_nn_3d d_AAAA_adj;           // [chunk_size, fc_n_out, n_funcs_AAAA]
   t_nn_3d d_AA2_adj;            // [chunk_size, fc_n_out, n_funcs_AA]
@@ -441,7 +444,7 @@ class Grace1LKK {
   void compute_mlp_radial();
 
  public:    // (public: nvcc rejects extended lambdas in non-public member functions)
-  // compute stages, moved verbatim from compute(); virtual so that grace/1l/fused/kk can replace them
+  // compute stages of compute(); virtual so that Grace1LFusedKK can replace them
   virtual void stage_bond_fwd(int team_size, int vector_length);   // neighbours, radial basis + MLP, A
   virtual void stage_dense_fwd();                                   // FC A1 .. product AAAA
   virtual void stage_reduce();                                      // rho
@@ -496,7 +499,7 @@ class Grace1LKK {
   // the exact (view,n,collect) walk of ComputeUQ so R-row order matches uq_rp_matrix.
   Kokkos::View<double*, DeviceType> d_uq_Bmat;    // [D_basis * subN]
   Kokkos::View<double*, DeviceType> d_uq_proj;    // [rp_dim * subN]
-  // fp32 projection GEMM for the fp32 / mixed styles (uq_sgemm), as grace/2l/kk
+  // fp32 projection GEMM for the fp32 / mixed engines (uq_sgemm), as Grace2LKK
   Kokkos::View<float*, DeviceType> d_uq_Bmat_f, d_uq_proj_f;
   Kokkos::View<double*, DeviceType> d_uq_n2;      // [subN]
   t_int_1d d_uq_map_view;          // [D_basis] source view id 0..3 (A/AA/AAA/AAAA)
@@ -532,7 +535,7 @@ class Grace1LKK {
   int mlp_act_n = 0;
   NNScalar mlp_act_norm = 1;
 
-  // ---- cuBLAS true-fp32 block-sparse FC forward (mirror of 2l Opt-2L-17) ----
+  // ---- cuBLAS true-fp32 block-sparse FC forward (as in Grace2LKK) ----
   // Each FC output is out(ii,k,func) [=|+=] norm*nof(func) * Σ_n W(k,n,tile(func))
   // * in(ii,n,src(func)): a contraction over n with a per-function TILE-selected
   // weight. Reformulated as gather in-columns grouped by tile -> one true-fp32
@@ -541,10 +544,10 @@ class Grace1LKK {
   // (no atomics) so only the Σ_n order changes vs the hand kernel. Active only for
   // the CUDA device instantiation with NNScalar=float (fp32 & Mixed styles); the
   // fp64 device style and all host backends keep the FC hand kernels (handle stays
-  // null). FCCublasOp is public because it appears in the signature of the public
-  // fc_forward_cublas (nvcc's extended-lambda registration needs the type visible).
+  // null). FCBlasOp is public because it appears in the signature of the public
+  // fc_forward_blas (nvcc's extended-lambda registration needs the type visible).
  public:
-  struct FCCublasOp {
+  struct FCBlasOp {
     int n_out = 0, n_in_l = 0, n_in_r = 0, N_l = 0, N_r = 0, ntiles = 0;
     NNScalar nl = 1, nr = 1;
     t_nn_1d Wl_packed, Wr_packed;   // [ntiles * n_out * n_in] col-major per tile
@@ -554,30 +557,30 @@ class Grace1LKK {
     std::vector<int> L_pstart, L_count, R_pstart, R_count;  // host, [ntiles]
     bool active = false;
   };
-  void build_fc_cublas_op(FCCublasOp &op, const GRACE1LModel::FCWeights &fc);
+  void build_fc_blas_op(FCBlasOp &op, const GRACE1LModel::FCWeights &fc);
   // run one forward FC (left assign + right accumulate) via gather -> per-tile
   // true-fp32 SGEMM -> scatter, into out (float only). Public for the same reason
   // as the struct (contains extended device lambdas).
-  void fc_forward_cublas(FCCublasOp &op, const t_nn_3d &in_left,
+  void fc_forward_blas(FCBlasOp &op, const t_nn_3d &in_left,
       const t_nn_3d &in_right, const t_nn_3d &out);
   // hard gate: verify a tiny SGEMM (transpose/leading-dim convention + true-fp32
   // path) reproduces a host reference before use.
-  void fc_cublas_selftest();
+  void fc_blas_selftest();
   void mlp_sgemm(const NNScalar* Wg, const NNScalar* In, NNScalar* C,
       int n_out, int M, int n_in, int ldW, int ldIn, int ldC, NNScalar alpha);
-  void mlp_cublas_selftest();
+  void mlp_blas_selftest();
   // cuBLAS DGEMM UQ projection: build gather map (once), then per sub-block
   // gather Bmat -> cublasDgemm proj = R·Bmat -> GMM finish. Runs on the current
   // chunk (chunk_size/chunk_offset). Falls back to nothing if blas_handle null.
-  void compute_uq_cublas();
+  void compute_uq_blas();
  protected:
   blas::handle_t blas_handle = nullptr;
   // owner of blas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
   // copy it too): the last copy destroys the handle
   std::shared_ptr<std::remove_pointer_t<blas::handle_t>> blas_owner;
-  FCCublasOp fc_op_AA1, fc_op_AA2;
+  FCBlasOp fc_op_AA1, fc_op_AA2;
   t_nn_1d d_fc_G, d_fc_C;         // shared gather / GEMM-output scratch (float)
-  int fc_cublas_max_nin = 0, fc_cublas_max_nout = 0, fc_cublas_max_N = 0;
+  int fc_blas_max_nin = 0, fc_blas_max_nout = 0, fc_blas_max_N = 0;
 #endif
 
   // Host-side model data

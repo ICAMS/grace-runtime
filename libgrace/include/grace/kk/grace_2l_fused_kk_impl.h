@@ -108,25 +108,25 @@ using namespace g2lf_detail;
 template<class DeviceType, class Traits>
 void Grace2LFusedKK<DeviceType, Traits>::setup()
 {
-  if (spline_n < 16) GRACE_KK_ERROR("grace/2l/fused/kk: spline N must be >= 16 (got {})", spline_n);
+  if (spline_n < 16) GRACE_KK_ERROR("GRACE-2L/KK: spline N must be >= 16 (got {})", spline_n);
   this->couple_supported = true;    // two-group coupling in the bond kernels
   Base::setup();     // sets the model dimensions and device weights
   if (this->lmax > G2LF_MAX_LMAX)
-    GRACE_KK_ERROR("grace/2l/fused/kk: lmax {} > {} not supported", this->lmax, G2LF_MAX_LMAX);
+    GRACE_KK_ERROR("GRACE-2L/KK: lmax {} > {} not supported", this->lmax, G2LF_MAX_LMAX);
   if (this->L1_nradmax * (this->lmax + 1) * (this->lmax + 1) > G2LF_TEAM * G2LF_MAX_ACC)
-    GRACE_KK_ERROR("grace/2l/fused/kk: A basis too large for the bond kernel");
+    GRACE_KK_ERROR("GRACE-2L/KK: A basis too large for the bond kernel");
   const int nlm = (this->lmax + 1) * (this->lmax + 1);
   if (G2LF_TEAM % this->L2_nradmax != 0 || this->I_n_out != this->L2_nradmax ||
       this->L1_nradmax > G2LF_TEAM || this->I_n_funcs > G2LF_MAX_I ||
       nlm > (G2LF_TEAM / this->L2_nradmax) * G2LF_MAX_B)
-    GRACE_KK_ERROR("grace/2l/fused/kk: model shape outside the compiled kernel limits");
+    GRACE_KK_ERROR("GRACE-2L/KK: model shape outside the compiled kernel limits");
   const GRACE2LModel &mm = *this->grace_model;
   for (const GRACE2LModel::FCWeights *w : {&mm.fc_A1, &mm.fc_AA1, &mm.fc_AA2})
     if (w->n_out != G2LF_NO1 || (int) (w->w_left.size() / ((size_t) w->n_out * w->w_shape_left)) != G2LF_NO1)
-      GRACE_KK_ERROR("grace/2l/fused/kk: layer-1 FC width must be {}", G2LF_NO1);
+      GRACE_KK_ERROR("GRACE-2L/KK: layer-1 FC width must be {}", G2LF_NO1);
   for (const GRACE2LModel::FCWeights *w : {&mm.fc_B1, &mm.fc_BB1, &mm.fc_BB2})
     if (w->n_out != G2LF_NO2 || (int) (w->w_left.size() / ((size_t) w->n_out * w->w_shape_left)) != G2LF_NO2)
-      GRACE_KK_ERROR("grace/2l/fused/kk: layer-2 FC width must be {}", G2LF_NO2);
+      GRACE_KK_ERROR("GRACE-2L/KK: layer-2 FC width must be {}", G2LF_NO2);
   // FC outputs that no CG product reads are not computed (forward) and have zero adjoint (reverse)
   auto live = [](const GRACE2LModel::CGProduct &p, bool left, bool right) {
     std::vector<int> v;
@@ -140,13 +140,13 @@ void Grace2LFusedKK<DeviceType, Traits>::setup()
   build_fc_meta(fcm_B1, mm.fc_B1, live(mm.prod_BB, true, true));
   build_fc_meta(fcm_BB1, mm.fc_BB1, live(mm.prod_BBB, true, false));
   build_fc_meta(fcm_BB2, mm.fc_BB2, live(mm.prod_BBBB, true, true));
-  this->log.info(fmt("grace/2l/fused/kk: live FC outputs A1 {}/{} AA1 {}/{} AA2 {}/{} B1 {}/{} BB1 {}/{} BB2 {}/{}\n",
+  this->log.info(fmt("[GRACE-2L/KK] live FC outputs A1 {}/{} AA1 {}/{} AA2 {}/{} B1 {}/{} BB1 {}/{} BB2 {}/{}\n",
                    fcm_A1.nlive, fcm_A1.nf, fcm_AA1.nlive, fcm_AA1.nf, fcm_AA2.nlive, fcm_AA2.nf,
                    fcm_B1.nlive, fcm_B1.nf, fcm_BB1.nlive, fcm_BB1.nf, fcm_BB2.nlive, fcm_BB2.nf));
   if (this->I1_n_out != 12 || this->B_n_out != G2LF_NO2 || this->L2_nradmax > 32 || this->L1_nradmax != G2LF_NO1)
-    GRACE_KK_ERROR("grace/2l/fused/kk: ReduceN widths outside the compiled kernels (I1 12, B 64)");
-  if (this->rho_n_out != 17) GRACE_KK_ERROR("grace/2l/fused/kk: rho width must be 17");
-  if (this->I2_n_out != 17) GRACE_KK_ERROR("grace/2l/fused/kk: I2 width must be 17");
+    GRACE_KK_ERROR("GRACE-2L/KK: ReduceN widths outside the compiled kernels (I1 12, B 64)");
+  if (this->rho_n_out != 17) GRACE_KK_ERROR("GRACE-2L/KK: rho width must be 17");
+  if (this->I2_n_out != 17) GRACE_KK_ERROR("GRACE-2L/KK: I2 width must be 17");
   build_type_metas();
   {
     std::vector<RedSpec> sp = {{&mm.B_reduce_YI, 0, -1, this->B_n_out}, {&mm.B_reduce_B0, 1, -1, this->B_n_out}};
@@ -181,7 +181,7 @@ void Grace2LFusedKK<DeviceType, Traits>::setup()
     };
     ng_AA = ngen(mm.prod_AA, true); ng_AAA = ngen(mm.prod_AAA, false); ng_AAAA = ngen(mm.prod_AAAA, true);
     ng_BB = ngen(mm.prod_BB, true); ng_BBB = ngen(mm.prod_BBB, false); ng_BBBB = ngen(mm.prod_BBBB, true);
-    this->log.info(fmt("grace/2l/fused/kk: CG products {}\n",
+    this->log.info(fmt("[GRACE-2L/KK] CG products {}\n",
                      shape_id == 1 ? "specialised: medium shape (GRACE-2L-(SMAX-)OMAT-medium)" :
                      shape_id == 2 ? "specialised: large shape (GRACE-2L-(SMAX-)OMAT-large)" :
                      "generic (model tables differ from the compiled shapes)"));
@@ -199,7 +199,7 @@ void Grace2LFusedKK<DeviceType, Traits>::setup()
       for (int p = 0; p < P; p++) if (hy(p) == I && hl(p) == l) hp(q++) = p;
     }
     ho(NG) = q;
-    if (q != P) GRACE_KK_ERROR("grace/2l/fused/kk: YI pair grouping incomplete");
+    if (q != P) GRACE_KK_ERROR("GRACE-2L/KK: YI pair grouping incomplete");
     Kokkos::deep_copy(d_yi_gperm, hp); Kokkos::deep_copy(d_yi_goff, ho);
   }
 #if GRACE_KK_GEMM_MFMA    // read only by the matrix-core layer-2 forward (fused_layer2_fwd_m, CDNA builds)
@@ -288,7 +288,7 @@ void Grace2LFusedKK<DeviceType, Traits>::build_spline_tables()
   build(m.L2_mlp_rad_layers, d_splR1, "R1");
   if ((int) d_splR.extent(1) != this->L1_nradmax * (this->lmax + 1) ||
       (int) d_splR1.extent(1) != this->L2_nradmax * (this->lmax + 1))
-    GRACE_KK_ERROR("grace/2l/fused/kk: radial MLP output width mismatch");
+    GRACE_KK_ERROR("GRACE-2L/KK: radial MLP output width mismatch");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -462,12 +462,13 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer1_A_c()
 template<class DeviceType, class Traits>
 void Grace2LFusedKK<DeviceType, Traits>::begin_L1_chunk(bool backward)
 {
-  if (!l1_store_on()) return;
   const int cl = this->chunk_cap();
   if (this->inum <= cl) return;                       // one chunk: nothing is recomputed anyway
   const int c = this->chunk_offset / cl, nch = (this->inum + cl - 1) / cl;
+  if (this->chunksize >= 0 && !backward && c == 0 && nch != l1_nofit_nch) l1_fits = true;    // decided again below
+  if (!l1_store_on()) return;
   if (!backward && c == 0) {
-    auto same = [](const auto &a, const auto &b) {    // lammps-ace 6e8e4cd0e7: every extent of every stored tensor
+    auto same = [](const auto &a, const auto &b) {    // every extent of every stored tensor
       for (int r = 0; r < (int) a.rank(); r++)
         if (a.extent(r) != b.extent(r)) return false;
       return true;
@@ -477,6 +478,23 @@ void Grace2LFusedKK<DeviceType, Traits>::begin_L1_chunk(bool backward)
                        !same(st_AA2[0], this->d_AA2) || !same(st_rho[0], this->d_rho);
     if (fresh) {
       st_A.clear(); st_A1.clear(); st_AA1.clear(); st_AA2.clear(); st_rho.clear();
+      // a fixed chunk (also the smaller chunks after an allocation failure of chunksize auto): the store only when it
+      // fits 70 % of the free memory (as GRACE-3L store_fwd auto), else layer 1 is recomputed in the backward
+      // (same results) instead of failing at allocation
+      if (this->chunksize >= 0) {
+        using M = grace::kk::MemKK;
+        const double bytes = (double) nch * (M::memory_usage(this->d_A) + M::memory_usage(this->d_A1) +
+                                             M::memory_usage(this->d_AA1) + M::memory_usage(this->d_AA2) +
+                                             M::memory_usage(this->d_rho));
+        size_t fr = 0, tot = 0;
+        if (grace::kk::device_mem_info(fr, tot) && bytes > 0.7 * (double) fr / std::max(1, this->ranks_per_device)) {
+          l1_fits = false;
+          l1_nofit_nch = nch;
+          this->log.info(grace::kk::fmt("[GRACE-2L/KK] {} chunks: layer 1 recomputed in the backward (store would need "
+                                        "{:.0f} MB, free {:.0f} MB)\n", nch, bytes / 1048576.0, fr / 1048576.0));
+          return;
+        }
+      }
       for (int k = 0; k < nch; k++) {
         auto mk3 = [&](const t_nn3 &v, const char *nm) {
           return t_nn3(std::string("g2lf:st_") + nm, v.extent(0), v.extent(1), v.extent(2));
@@ -649,7 +667,7 @@ int Grace2LFusedKK<DeviceType, Traits>::l2_channel_block(bool bwd, int *rounds) 
     }
   }
   if (CB == 0)
-    GRACE_KK_ERROR("grace/2l/fused/kk: layer-2 {} kernel: no channel block of {} fits the team scratch memory",
+    GRACE_KK_ERROR("GRACE-2L/KK: layer-2 {} kernel: no channel block of {} fits the team scratch memory",
                    bwd ? "backward" : "forward", NR2);
   if (rounds) *rounds = r;
   return CB;
@@ -1147,8 +1165,15 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer2_bwd_t()
 
   auto B0a = this->d_B0_adj; auto YIa = this->d_YI_adj;
   const bool rows = l2_rows();    // HIP: dE/dYI, dE/dB0 as per-atom rows in the buffers of YI, B0 (rows_transpose)
-  static const int shf_env = env_switch("GRACE_L2_BWD_SHFL");
-  const bool shf = hip && shf_env != 0 && CB <= 32;    // HIP: channel sums of the forces by shuffles
+  static const KernelChoice shf_sw = wave64_switch("GRACE_L2_BWD_SHFL");
+  const bool shf = hip && shf_sw.on && CB <= 32;    // HIP CDNA (64-lane wavefronts): channel sums of the forces by shuffles
+  if (hip) {    // one line per process, as the other kernel choices
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+      std::fprintf(stderr, "grace kk: GRACE-2L layer-2 backward channel sums by %s (%s)\n",
+                   shf_sw.on ? "wavefront shuffles" : "shared memory", shf_sw.why.c_str());
+    });
+  }
   const F *YT = this->d_YI.data(), *BT = this->d_B0.data();
   const int NYo = this->n_yi_out_funcs, RS = NR2 * NYo;
   auto IT = d_IT; auto gIT = d_gIT;
@@ -1932,11 +1957,11 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer1_bwd_c()
    the reverse right half a CSR by source (no atomics).
 ------------------------------------------------------------------------- */
 
-// dense-chain kernels and metadata: shared with grace/1l/fused/kk in grace_fused_kokkos_dense.h
+// dense-chain kernels and metadata: shared with Grace1LFusedKK in grace/kk/fused_dense.h
 template<class DeviceType, class Traits>
 void Grace2LFusedKK<DeviceType, Traits>::build_fc_meta(FCMeta &m, const GRACE2LModel::FCWeights &fc, const std::vector<int> &used)
 {
-  GraceFusedKK::build_fc_meta(m, fc, used, "grace/2l/fused/kk");
+  GraceFusedKK::build_fc_meta(m, fc, used, "GRACE-2L/KK");
 }
 
 template<class DeviceType, class Traits>
@@ -2098,7 +2123,7 @@ void Grace2LFusedKK<DeviceType, Traits>::build_red_meta(RedMeta &m, const std::v
     for (int c = 0; c < rw.n_connections; c++) {
       const int fo = specs[w].fo >= 0 ? specs[w].fo : rw.total_sum_ind[c];
       const int fi = rw.collect_ind[c];
-      if (fo >= nfo || fi >= m.nfi[x]) GRACE_KK_ERROR("grace/2l/fused/kk: reduce index out of range");
+      if (fo >= nfo || fi >= m.nfi[x]) GRACE_KK_ERROR("GRACE-2L/KK: reduce index out of range");
       by_fo[fo].push_back({w, fi, rw.w_l_tile[c]});
       by_g[m.gbase[x] + fi].push_back({fo, rw.w_l_tile[c], w});
     }
@@ -2206,10 +2231,10 @@ void Grace2LFusedKK<DeviceType, Traits>::red_fwd(const RedMeta &m, const t_nn3 &
   if (BLK) {    // the partials: YI_adj's buffer or d_redP (begin_run)
     P = m.nprow <= red_partials_in_yi_adj() ? this->d_YI_adj.data() : d_redP.data();
     if (m.nprow > red_partials_in_yi_adj() && (size_t) d_redP.extent(0) < (size_t) m.nprow * cs)
-      GRACE_KK_ERROR("grace/2l/fused/kk: blocked reducer partials without their buffer");
+      GRACE_KK_ERROR("GRACE-2L/KK: blocked reducer partials without their buffer");
   }
   // the blocks (BLK) or output functions run: q0 .. q0 + nq - 1
-  if (rho_only && MODE != 1) GRACE_KK_ERROR("grace/2l/fused/kk: rho_only reduction outside the I1 / rho reduction");
+  if (rho_only && MODE != 1) GRACE_KK_ERROR("GRACE-2L/KK: rho_only reduction outside the I1 / rho reduction");
   const int q0 = rho_only ? (BLK ? m.brho : nfo1) : 0, nq = (BLK ? m.nb : nfo) - q0;
   Kokkos::parallel_for("g2lf:Reduce", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nq), KOKKOS_LAMBDA(const int q) {
     const int bq = q / cs, ii = q - bq * cs, b = q0 + bq;
@@ -2277,7 +2302,7 @@ void Grace2LFusedKK<DeviceType, Traits>::red_bwd(const RedMeta &m, const t_nn3 &
   if (ASSIGN)
     for (int x = 0; x < nx; x++) {
       const int e = (int) ((x == 0) ? dX0 : (x == 1) ? dX1 : (x == 2) ? dX2 : dX3).extent(1);
-      if (e > NIN) GRACE_KK_ERROR("grace/2l/fused/kk: reduce input width exceeds NIN");
+      if (e > NIN) GRACE_KK_ERROR("GRACE-2L/KK: reduce input width exceeds NIN");
     }
   auto type = this->type; auto ilist = this->d_ilist;
   // GPU: the weight / output views of a thread selected as raw pointers and strides (selecting the view objects by
@@ -2425,3 +2450,8 @@ template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>
 
 }    // namespace kk
 }    // namespace grace
+
+// the explicit instantiation of GRACE_KK_EXTERN_2L (grace/kk/grace_2l_fused_kk.h), in one translation unit
+#define GRACE_KK_INSTANTIATE_2L(Device, Traits)                        \
+  template class grace::kk::Grace2LKK<Device, float, float, Traits>; \
+  template class grace::kk::Grace2LFusedKK<Device, Traits>

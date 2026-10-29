@@ -2,6 +2,11 @@
 // Atom type -> model element maps (type2mu) shared by the CPU drivers and the Kokkos engines.
 // type2mu[t], t = 1..ntypes: model element of atom type t, -1 unmapped (pair_style hybrid NULL: no bonds to or from
 // that type).
+// The central atoms (ilist) must all be mapped: the Kokkos engines read the tables of a central atom's element (energy
+// shift, weights, radial tables, UQ head) without a check, and the CPU drivers throw at compute(). The caller ensures
+// it: LAMMPS lists only mapped types (pair_style hybrid gives a sub-style a skip list without its NULL types, and a
+// plain pair_style with NULL stops at init), the Python modules refuse species the model lacks and types outside
+// 1 .. len(species). Unmapped neighbours are fine: their pair cutoff is 0, so the bond filters drop them.
 #pragma once
 #include "grace/error.h"
 

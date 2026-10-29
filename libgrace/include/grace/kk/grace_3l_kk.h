@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-3L Kokkos engine (from the LAMMPS style grace/3l/kk, lammps-ace feature/grace-runtime 5f5ab57aa7;
-// contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies positions, types, a
-// full neighbour list, the output views and the exchange of the two layers' messages with ghost atoms through
-// RunInput3 (layer 0: eq1_norm, layer 1: eq2_norm), and the Kokkos view types through Traits (grace/kk/traits.h).
-// Implementation: grace/kk/grace_3l_kk_impl.h (setup, buffers, exchange, run) with the kernel parts
-// grace_3l_kk_{radial,spbf,cpl,dense}.h, included by one translation unit per consumer.
+// GRACE-3L Kokkos engine (contributing author Yury Lysogorskiy, ICAMS). Independent of LAMMPS: the consumer supplies
+// positions, types, a full neighbour list, the output views and the exchange of the two layers' messages with ghost
+// atoms through RunInput3 (layer 0: eq1_norm, layer 1: eq2_norm), and the Kokkos view types through Traits
+// (grace/kk/traits.h). Implementation: grace/kk/grace_3l_kk_impl.h (setup, buffers, exchange, run) with the kernel
+// parts grace_3l_kk_{radial,spbf,cpl,dense}.h, included by one translation unit per consumer.
 #pragma once
 
 #include "grace/coupling.h"
@@ -24,7 +23,7 @@
 #include <type_traits>
 #include <vector>
 
-// the GEMM paths (Opt 15 radial MLP: CUDA only; Opt 16 / 17 / 18 and the FC GEMM: CUDA and HIP); defines GRACE_KK_GEMM
+// GEMM paths (radial MLP: CUDA only; cp_l projections, ReduceN, FC GEMM: CUDA and HIP); defines GRACE_KK_GEMM
 #include "grace/kk/blas.h"
 
 namespace grace {
@@ -113,7 +112,7 @@ KOKKOS_INLINE_FUNCTION void g3l_syncwarp()
 // Grace3LKK: Kokkos engine for GRACE-3L
 //
 // Compile-time capacity constants. These MUST agree with the exporter's
-// authoritative CAPS_3L table (kokkos_export_3l.py). Named GRACE3L_<CAPS-key>
+// authoritative CAPS_3L table (the tensorpotential kokkos.npz export). Named GRACE3L_<CAPS-key>
 // so the mapping to that table is one-to-one.
 // ============================================================================
 static constexpr int GRACE3L_MAX_NRADMAX       = 64;     // SPBF.n_rad_max (A1/A2/A3)
@@ -134,7 +133,7 @@ static constexpr int GRACE3L_MAX_REDUCE_NFUNCS = 64;     // largest reduce coupl
 static constexpr int GRACE3L_MAX_REDUCE_WSHAPE = 336;    // A2_3_red reducing-weight w_shape
 static constexpr int GRACE3L_MAX_FC_NOUT       = 160;    // FC n_out / feature width
 static constexpr int GRACE3L_MAX_FC_TILE       = 16;     // FC w_right tile dim (A2/A3 FCs)
-static constexpr int GRACE3L_MAX_FC_NFUNCS     = 64;     // FC n_funcs_left/right accumulator cap (Task 2.6)
+static constexpr int GRACE3L_MAX_FC_NFUNCS     = 64;     // FC n_funcs_left/right accumulator cap
 static constexpr int GRACE3L_MAX_RHO_NOUT      = 40;     // rho*_norm / rho* density width
 static constexpr int GRACE3L_MAX_ENERGY_MLP_DIM = 80;    // readout MLP hidden
 static constexpr int GRACE3L_MAX_ATOM_TYPES    = 112;    // n_elements / elem-dependent reduce dim
@@ -151,7 +150,7 @@ static constexpr int GRACE3L_MAX_EQNORMS     = 4;   // EquivariantRMSNorm (2 use
 static constexpr int GRACE3L_MAX_RMSNORMS    = 4;   // InvariantLayerRMSNorm (3 used)
 static constexpr int GRACE3L_MAX_REDUCE_INSTR = 6;  // collectors per reduce (4 used)
 static constexpr int GRACE3L_SPBF_ELL_MAX     = 6;   // max CG row length for the fast SPBF backward
-static constexpr int GRACE3L_MAX_REDUCE_ROUNDS = 64; // Opt 17: max cuBLAS fwd rounds (=max connections sharing one output f; 34 observed)
+static constexpr int GRACE3L_MAX_REDUCE_ROUNDS = 64; // max BLAS fwd rounds (=max connections sharing one output f; 34 observed)
 static constexpr int GRACE3L_UQ_MAX_RP_DIM = 136;    // bounds the FULL UQ feature dim D = rp_dim + n_density (z/f/delta stack arrays); 136 = 128 rp_dim + up to 4 density channels + slack; a larger model fails the D > MAX guard at load
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
@@ -168,21 +167,21 @@ class Grace3LKK {
   struct TagComputeA1{};             // Layer-1 scalar-indicator SPBF basis -> d_A1
   struct TagComputeA2{};             // Layer-2 equivariant-indicator SPBF basis -> d_A2
   struct TagComputeA3{};             // Layer-3 equivariant-indicator SPBF basis -> d_A3
-  struct TagComputeSPBFFused{};      // Opt 6: fused equiv-SPBF (A2/A3) — one team per (ii,n); prod slice + CG couple in team shared
+  struct TagComputeSPBFFused{};      // fused equiv-SPBF (A2/A3) — one team per (ii,n); prod slice + CG couple in team shared
   struct TagCPLProject{};            // cp_l Pass A: per-lm U/V projection to rank axis
   struct TagCPLCouple{};             // cp_l Pass B: bilinear CG on rank axis + segment-sum
-  struct TagCPLFused{};              // Opt 5: fused fwd cp_l (team/(a,r): project+couple in shared, out via shared atomics)
-  struct TagCPLBwdFused{};           // Opt 5: fused bwd cp_l (team/(a,r): recompute-project + bwd-couple in shared)
-  struct TagReduceN{};                // Task 2.6: generic FunctionReduceN (multi-instr, elem-dep)
-  struct TagFCRight2Left{};           // Task 2.6: generic FCRight2Left (right->left scatter)
-  struct TagEqNorm{};                 // Task 2.7: generic EquivariantRMSNorm (eq1_norm, eq2_norm)
-  struct TagRMSNorm{};                // Task 2.7: generic InvariantLayerRMSNorm (rho*_norm)
-  struct TagComputeMLPEnergy{};       // Task 2.11: 3-density readout (rho1/2/3_norm) -> per-atom energy
+  struct TagCPLFused{};              // fused fwd cp_l (team/(a,r): project+couple in shared, out via shared atomics)
+  struct TagCPLBwdFused{};           // fused bwd cp_l (team/(a,r): recompute-project + bwd-couple in shared)
+  struct TagReduceN{};                // generic FunctionReduceN (multi-instr, elem-dep)
+  struct TagFCRight2Left{};           // generic FCRight2Left (right->left scatter)
+  struct TagEqNorm{};                 // generic EquivariantRMSNorm (eq1_norm, eq2_norm)
+  struct TagRMSNorm{};                // generic InvariantLayerRMSNorm (rho*_norm)
+  struct TagComputeMLPEnergy{};       // 3-density readout (rho1/2/3_norm) -> per-atom energy
   struct TagComputeUQ_rho1{};         // basis-RP: rho1 (L1) block -> raw proj z (Phase 1; d_A1.. current) — forward only
   struct TagComputeUQ_rho2{};         // basis-RP: rho2 (L2) block += into z (Phase 2; d_A2_red.. current) — forward only
   struct TagComputeUQ{};              // basis-RP: rho3 (L3) block += z, normalize + density + GMM (gamma/sigma/gmm_cluster) in Phase 3 — forward only
 
-  // ---- Task 3.1: backward (reverse-mode adjoint) tags ----
+  // ---- backward (reverse-mode adjoint) tags ----
   struct TagReadoutBwd{};             // readout backward -> d_rho{1,2,3}_norm_adj (all equal)
   struct TagRMSNormBwd{};             // generic InvariantLayerRMSNorm backward (adj_out -> adj_in)
   struct TagReduceNBwd{};             // generic FunctionReduceN backward (per-instruction, accumulate)
@@ -190,25 +189,25 @@ class Grace3LKK {
   struct TagFCBwdRight{};             // generic FCRight2Left backward, right path -> adj_right (atomic)
   struct TagCPLBwdCouple{};           // generic cp_l backward Pass B (couple) -> adj_lproj/adj_rproj
   struct TagCPLBwdProject{};          // generic cp_l backward Pass A (project) -> adj_left/adj_right
-  struct TagComputeAdjProd{};         // Opt 4: adj_prod = inv_avg*A_adj@cg_W^T -> d_adj_prod (output-parallel, shared by SPBF-bwd + ForceEquiv)
+  struct TagComputeAdjProd{};         // adj_prod = inv_avg*A_adj@cg_W^T -> d_adj_prod (output-parallel, shared by SPBF-bwd + ForceEquiv)
   struct TagA3SPBFBwd{};              // L3 equiv-SPBF backward: d_A3_adj -> d_eq2_norm_adj (message adj)
-  struct TagEqNormBwd{};              // Task 3.2: generic EquivariantRMSNorm VJP (adj_out -> adj_in)
-  struct TagA2SPBFBwd{};              // Task 3.2: L2 equiv-SPBF backward: d_A2_adj -> d_grad_I_global (eq1_norm message adj)
-  struct TagSPBFBwdFused{};           // Opt 10: team+shared equiv-SPBF backward (A2/A3) — adj_prod row staged in shared once
-  // ---- Task 3.3: radial r-derivative + per-bond force (geometry backward) tags ----
+  struct TagEqNormBwd{};              // generic EquivariantRMSNorm VJP (adj_out -> adj_in)
+  struct TagA2SPBFBwd{};              // L2 equiv-SPBF backward: d_A2_adj -> d_grad_I_global (eq1_norm message adj)
+  struct TagSPBFBwdFused{};           // team+shared equiv-SPBF backward (A2/A3) — adj_prod row staged in shared once
+  // ---- radial r-derivative + per-bond force (geometry backward) tags ----
   struct TagComputeMLPRadialDeriv{}; // radial MLP forward + dR/dr -> d_R1_nl, d_DR1_nl (per layer)
 #ifdef KOKKOS_ENABLE_CUDA
-  struct TagMLPAssembleVal{};        // Opt 15: build cuBLAS input X[M x n_in0] (value path), zero padding rows
-  struct TagMLPAssembleDeriv{};      // Opt 15b: build X[M x n_in0] + dX[M x nradbase] (deriv path)
-  struct TagMLPActVal{};             // Opt 15: silu activation between GEMMs (value only)
-  struct TagMLPActDeriv{};           // Opt 15b: silu (value) + silu'(s)*ds (deriv) between GEMMs
-  struct TagMLPScatterR{};           // Opt 15: scatter LayoutRight R/DR[M x d3] -> LayoutLeft d_R1_nl/d_DR1_nl
+  struct TagMLPAssembleVal{};        // build cuBLAS input X[M x n_in0] (value path), zero padding rows
+  struct TagMLPAssembleDeriv{};      // build X[M x n_in0] + dX[M x nradbase] (deriv path)
+  struct TagMLPActVal{};             // silu activation between GEMMs (value only)
+  struct TagMLPActDeriv{};           // silu (value) + silu'(s)*ds (deriv) between GEMMs
+  struct TagMLPScatterR{};           // scatter LayoutRight R/DR[M x d3] -> LayoutLeft d_R1_nl/d_DR1_nl
   struct TagMLPLayer0Val{};          // radial MLP layer 0 from the Chebyshev basis + per-element embedding terms, silu
   struct TagMLPLayer0Deriv{};        // same + the r-derivative (silu' * ds)
 #endif
   struct TagForceL1{};               // L1 scalar-SPBF geometry backward -> d_f_ij
   struct TagForceEquiv{};            // L2/L3 equiv-SPBF geometry backward -> d_f_ij
-  struct TagForceEquivFused{};       // Opt 11: team-per-(ii,n) ForceEquiv — adj_prod row staged in shared, one bond per thread
+  struct TagForceEquivFused{};       // team-per-(ii,n) ForceEquiv — adj_prod row staged in shared, one bond per thread
 
   typedef DeviceType device_type;
   using EV = typename Traits::ev_type;        // energy / virial reduction type (LAMMPS: EV_FLOAT)
@@ -231,13 +230,14 @@ class Grace3LKK {
   // The model's reduce inputs are grouped by output once (GRACE3LModel::reduce_inputs_grouped; a function-preserving
   // permutation of producer columns, see group_reduce_inputs in grace_3l_kk_impl.h), so engines may share a model.
   void set_model(std::shared_ptr<GRACE3LModel> model, const std::vector<int> &type2mu);
-  void setup();                           // scalars, harmonics, device weights, radial tables, cuBLAS (LAMMPS: init_style)
+  void setup();                           // scalars, harmonics, device weights, radial tables, BLAS (LAMMPS: init_style)
   // another species set on a set-up engine: type tables (atom type -> model element, pair cutoffs) and the radial
   // tables of the new species pairs are rebuilt; weights stay
   void set_types(const std::vector<int> &type2mu);
   // the type tables of the current species set (views shared, not copied: the radial spline tables of its species
-  // pairs too): a caller keeps them and hands them back with use_type_tables() to switch to that species set again
-  // without rebuilding (set_types builds new ones)
+  // pairs too, with the shape they were built with): a caller keeps them and hands them back with use_type_tables() to
+  // switch to that species set again without rebuilding (set_types builds new ones), also after a setup() of the same
+  // model with other table settings (spline_n, spline_n_layer, spline_mb)
   struct TypeTables {
     std::vector<int> type2model;
     typename Traits::t_int_1d map;
@@ -245,6 +245,8 @@ class Grace3LKK {
     int spline_on = 0, n_sp = 0;
     Kokkos::View<int *, DeviceType> sp_of_mu;
     Kokkos::View<float *, DeviceType> splR;
+    int spl_N[3] = {0, 0, 0}, spl_off[3] = {0, 0, 0}, spl_Ntot = 0, spl_ld = 0;    // the shape splR was built with
+    std::vector<int> spl_mus;
   };
   TypeTables type_tables() const;
   // the per-atom buffers (chunk work buffers, the per-image rows, kept state) shrunk to one atom; weights and type
@@ -264,7 +266,7 @@ class Grace3LKK {
   struct RunInput3 {
     typename Traits::t_kkfloat_1d_3_lr_randomread x;    // [nall] positions, local atoms then ghosts
     typename Traits::t_kkacc_1d_3 f;
-    typename Traits::t_int_1d_randomread type, ilist, numneigh;
+    typename Traits::t_int_1d_randomread type, ilist, numneigh;    // ilist: mapped types only (grace/type_map.h)
     typename Traits::t_neighbors_2d neighbors;
     int inum = 0, nlocal = 0, nall = 0, ntypes = 0;
     int eflag_global = 0, eflag_atom = 0, vflag_global = 0, vflag_atom = 0, cvflag_atom = 0;
@@ -306,7 +308,8 @@ class Grace3LKK {
   bool couple_supported = false;
   double memory_usage();
 
-  // ---- message rows for an Exchange3: comm_width(layer) doubles per atom (layer 0: eq1_norm, 1: eq2_norm) ----
+  // ---- message rows for an Exchange3: comm_width(layer) doubles per atom (layer 0: eq1_norm, 1: eq2_norm; valid
+  // from set_model() on) ----
   int comm_width(int layer) const { return layer == 0 ? I_n_funcs * I_n_out : I2_n_funcs * I2_n_out; }
   // device buffers (LAMMPS pack_forward_comm_kokkos ...); return the number of doubles packed
   int pack_forward(int layer, int n, const typename Traits::t_int_1d &sendlist, const typename Traits::t_double_1d &buf);
@@ -332,15 +335,15 @@ class Grace3LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagUnpackReverseComm, const int&) const;
 
-  // Kernel operators (Task 2.3: neighbor + Chebyshev radial + Y_lm precompute)
+  // Kernel operators (neighbor + Chebyshev radial + Y_lm precompute)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeNeigh, const typename Kokkos::TeamPolicy<DeviceType, TagComputeNeigh>::member_type& team) const;
 
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeRadialBasis, const typename Kokkos::TeamPolicy<DeviceType, TagComputeRadialBasis>::member_type& team) const;
 
-  // Kernel operators (Task 2.4: L1 scalar-indicator SPBF basis A1)
-  // Generic radial MLP: serves A1 (Task 2.4) and A2 (Task 2.8), spbf-indexed by
+  // Kernel operators (L1 scalar-indicator SPBF basis A1)
+  // Generic radial MLP: serves A1 and A2, spbf-indexed by
   // the member radial_mlp_spbf set before launch.
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeMLPRadial, const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPRadial>::member_type& team) const;
@@ -348,19 +351,19 @@ class Grace3LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeA1, const int) const;
 
-  // Kernel operator (Task 2.8: L2 equivariant-indicator SPBF basis A2)
+  // Kernel operator (L2 equivariant-indicator SPBF basis A2)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeA2, const typename Kokkos::TeamPolicy<DeviceType, TagComputeA2>::member_type& team) const;
 
-  // Kernel operator (Task 2.10: L3 equivariant-indicator SPBF basis A3)
+  // Kernel operator (L3 equivariant-indicator SPBF basis A3)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeA3, const typename Kokkos::TeamPolicy<DeviceType, TagComputeA3>::member_type& team) const;
 
-  // Kernel operator (Opt 6: fused equiv-SPBF for A2/A3 — team per (ii,n), prod slice + CG couple in shared)
+  // Kernel operator (fused equiv-SPBF for A2/A3 — team per (ii,n), prod slice + CG couple in shared)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeSPBFFused, const typename Kokkos::TeamPolicy<DeviceType, TagComputeSPBFFused>::member_type& team) const;
 
-  // Kernel operators (Task 2.5: generic cp_l GeneralProductFunction product)
+  // Kernel operators (generic cp_l GeneralProductFunction product)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagCPLProject, const int&) const;
   KOKKOS_INLINE_FUNCTION
@@ -372,19 +375,19 @@ class Grace3LKK {
   void operator() (TagCPLBwdFused,
       const typename Kokkos::TeamPolicy<DeviceType, TagCPLBwdFused>::member_type& team) const;
 
-  // Kernel operators (Task 2.6: generic FunctionReduceN + FCRight2Left)
+  // Kernel operators (generic FunctionReduceN + FCRight2Left)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagReduceN, const int&) const;
   KOKKOS_INLINE_FUNCTION
   void operator() (TagFCRight2Left, const int&) const;
 
-  // Kernel operators (Task 2.7: generic EquivariantRMSNorm + InvariantLayerRMSNorm)
+  // Kernel operators (generic EquivariantRMSNorm + InvariantLayerRMSNorm)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagEqNorm, const int&) const;
   KOKKOS_INLINE_FUNCTION
   void operator() (TagRMSNorm, const int&) const;
 
-  // Kernel operator (Task 2.11: 3-density readout -> per-atom energy)
+  // Kernel operator (3-density readout -> per-atom energy)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeMLPEnergy, const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPEnergy>::member_type& team) const;
   KOKKOS_INLINE_FUNCTION
@@ -394,7 +397,7 @@ class Grace3LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeUQ, const typename Kokkos::TeamPolicy<DeviceType, TagComputeUQ>::member_type& team) const;
 
-  // Kernel operators (Task 3.1: readout + L3 backward / generic bwd routines)
+  // Kernel operators (readout + L3 backward / generic bwd routines)
   KOKKOS_INLINE_FUNCTION
   void operator() (TagReadoutBwd, const int&) const;
   KOKKOS_INLINE_FUNCTION
@@ -420,7 +423,7 @@ class Grace3LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagSPBFBwdFused, const typename Kokkos::TeamPolicy<DeviceType, TagSPBFBwdFused>::member_type& team) const;
 
-  // ---- Task 3.3 force kernels ----
+  // ---- force kernels ----
   KOKKOS_INLINE_FUNCTION
   void operator() (TagComputeMLPRadialDeriv, const typename Kokkos::TeamPolicy<DeviceType, TagComputeMLPRadialDeriv>::member_type& team) const;
 #ifdef KOKKOS_ENABLE_CUDA
@@ -429,15 +432,15 @@ class Grace3LKK {
   KOKKOS_INLINE_FUNCTION
   void operator() (TagMLPAssembleDeriv, const int) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPActVal, const int) const;
+  void operator() (TagMLPActVal, const int64_t) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPActDeriv, const int) const;
+  void operator() (TagMLPActDeriv, const int64_t) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPScatterR, const int) const;
+  void operator() (TagMLPScatterR, const int64_t) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPLayer0Val, const int) const;
+  void operator() (TagMLPLayer0Val, const int64_t) const;
   KOKKOS_INLINE_FUNCTION
-  void operator() (TagMLPLayer0Deriv, const int) const;
+  void operator() (TagMLPLayer0Deriv, const int64_t) const;
 #endif
   KOKKOS_INLINE_FUNCTION
   void operator() (TagForceL1, const typename Kokkos::TeamPolicy<DeviceType, TagForceL1>::member_type& team) const;
@@ -485,16 +488,14 @@ class Grace3LKK {
   // Layer-specific radial dimensions
   int L1_nradmax, L2_nradmax, L3_nradmax;
 
-  // I feature dims (drive comm buffer sizing). Zero-initialized; the task that
-  // wires up real message comm must set these AND comm_forward/comm_reverse
-  // (mirroring pair_grace_2l_kokkos) before any forward/reverse_comm call.
+  // I feature dims (drive comm buffer sizing): set by set_model() from eq1_norm.
   int I_n_out = 0, I_n_funcs = 0;
-  // Round-2 (L3) indicator dims (Task 2.10). The Layer-3 indicator is eq2_norm,
+  // Round-2 (L3) indicator dims. The Layer-3 indicator is eq2_norm,
   // which is PARITY-DOUBLED vs eq1_norm: I2_n_out = eq2_norm.M (=50) is twice
   // I_n_out (=25), so round 2 needs its own buffer d_eq2_norm_global (below) —
   // d_I_global [nall,64,25] cannot hold a [nall,64,50] payload.
   int I2_n_out = 0, I2_n_funcs = 0;
-  // Forward-comm stage selector (Task 2.10): 1 = round 1 (eq1_norm -> d_I_global,
+  // Forward-comm stage selector: 1 = round 1 (eq1_norm -> d_I_global,
   // I_n_funcs*I_n_out/atom); 2 = round 2 (eq2_norm -> d_eq2_norm_global,
   // I2_n_funcs*I2_n_out/atom). Set on host immediately before each
   // comm->forward_comm; captured by value into the pack/unpack tag-functors.
@@ -535,7 +536,7 @@ class Grace3LKK {
   typedef Kokkos::View<NNScalar**, DeviceType> t_nn_2d;
   typedef Kokkos::View<NNScalar***, DeviceType> t_nn_3d;
   typedef Kokkos::View<NNScalar***, Kokkos::LayoutRight, DeviceType> t_nn_3d_r; // row-major 3D
-  // the arrays with a row per atom of nall (local + ghost): 64-bit offsets (grace::kk::View64, issue #1)
+  // the arrays with a row per atom of nall (local + ghost): 64-bit offsets (grace::kk::View64)
   typedef grace::kk::View64<t_nn_3d_r> t_nn_3d_rg;
   typedef grace::kk::View64<t_nn_3d> t_nn_3d_g;
   typedef grace::kk::View64<typename t_nn_3d_r::host_mirror_type> t_nn_3d_rg_host;
@@ -543,7 +544,7 @@ class Grace3LKK {
   typedef Kokkos::View<NNScalar****, DeviceType> t_nn_4d;
   typedef Kokkos::View<NNScalar****, Kokkos::LayoutRight, DeviceType> t_nn_4d_r; // row-major 4D
 
-  // ---------- Per-chunk geometry arrays (Task 2.3: neighbor + Chebyshev
+  // ---------- Per-chunk geometry arrays (neighbor + Chebyshev
   // radial + Y_lm precompute). GeomScalar (fp32 or fp64); bond vectors, envelope and Chebyshev basis fp64. ----------
   t_int_1d d_ncount;              // [chunk_size]
   t_int_2d d_nearest;             // [chunk_size, maxneigh] local/ghost neighbor index
@@ -565,16 +566,16 @@ class Grace3LKK {
   // the force of a bond weight w_lm on (R env)(r) Y_lm is w_lm (d(R env)/dr Y_lm rhat + (R env) DY_lm / r).
   Kokkos::View<GeomScalar****, Kokkos::LayoutRight, DeviceType> d_dY_bond; // [chunk_size, maxneigh, (lmax+1)^2, 3]
 
-  // ---------- Layer-1 NN intermediates (Task 2.4: scalar-indicator SPBF A1).
+  // ---------- Layer-1 NN intermediates (scalar-indicator SPBF A1).
   // NNScalar (fp32 in the Mixed default); geometry feeding these kernels
   // (d_radial_basis, d_Y_bond, d_env) is cast down from GeomScalar. ----------
   t_nn_4d_r d_R1_nl;              // [chunk_size, maxneigh, L1_nradmax, lmax+1] (pre-l_tile-gather); row-major so
                                   // the radial-MLP output GEMM writes it directly (row = bond)
   t_nn_3d d_A1;                   // [chunk_size, L1_nradmax, (lmax+1)^2]
-  t_nn_3d d_A1_2;                 // [chunk_size, rank, nfunc] — first cp_l product (Task 2.5)
-  t_nn_3d d_A1_2_red;             // [chunk_size, n_out, n_funcs] — FunctionReduceN(A1_2) (Task 2.6)
-  t_nn_3d d_A1_2a;                // [chunk_size, n_out, n_lm] — FCRight2Left(A1_2_red, A1) (Task 2.6)
-  // ---- Remaining L1 chain (Task 2.7) ----
+  t_nn_3d d_A1_2;                 // [chunk_size, rank, nfunc] — first cp_l product
+  t_nn_3d d_A1_2_red;             // [chunk_size, n_out, n_funcs] — FunctionReduceN(A1_2)
+  t_nn_3d d_A1_2a;                // [chunk_size, n_out, n_lm] — FCRight2Left(A1_2_red, A1)
+  // ---- Remaining L1 chain ----
   t_nn_3d d_A1_3;                 // [chunk_size, rank, nfunc] — cp_l(A1_2a, A1)
   t_nn_3d d_A1_3_red;             // [chunk_size, n_out, n_funcs] — FunctionReduceN(A1_3)
   t_nn_3d d_A1_2b;                // [chunk_size, n_out, n_lm] — FCRight2Left(A1_2_red, A1)
@@ -585,14 +586,14 @@ class Grace3LKK {
   t_nn_3d d_rho1;                 // [chunk_size, 32, 1] — multi-instr elem-dep only_invar ReduceN (same 4 inputs as eq1)
   t_nn_3d d_rho1_norm;            // [chunk_size, 32, 1] — InvariantLayerRMSNorm(rho1, only_nonlin)
 
-  // ---------- Layer-2 NN intermediates (Task 2.8: equiv-indicator SPBF A2) ----------
+  // ---------- Layer-2 NN intermediates (equiv-indicator SPBF A2) ----------
   t_nn_3d d_A2;                   // [chunk_size, A2_n_rad_max=64, A2_nfunc=375] — L2 equiv-ind SPBF basis
   // Which SPBF layer the generic radial-MLP kernel (TagComputeMLPRadial) uses.
   // Set on host before each launch (0 = A1, idx_spbf_A2 = A2); captured by value
   // when *this is copied into the parallel_for functor.
   int radial_mlp_spbf = 0;
 
-  // ---- Remaining L2 chain (Task 2.9). Mirrors the L1 chain exactly EXCEPT
+  // ---- Remaining L2 chain. Mirrors the L1 chain exactly EXCEPT
   // every downstream product/FC/reduce here is built on A2_red (a reduced
   // A2), not on the raw SPBF output A2 itself (L1 used raw A1 directly). ----
   t_nn_3d d_A2_red;               // [chunk_size, n_out, n_funcs] — FunctionReduceN({A2})
@@ -609,7 +610,7 @@ class Grace3LKK {
   t_nn_3d d_rho2;                 // [chunk_size, n_out, n_lm] — multi-instr elem-dep ReduceN (same 4 inputs as eq2)
   t_nn_3d d_rho2_norm;            // [chunk_size, n_out, n_lm] — InvariantLayerRMSNorm(rho2, FULL branch)
 
-  // ---------- Layer-3 NN intermediates (Task 2.10: equiv-indicator SPBF A3;
+  // ---------- Layer-3 NN intermediates (equiv-indicator SPBF A3;
   // indicator = eq2_norm). TERMINAL layer: produces rho3/rho3_norm ONLY — there
   // is NO eq3/eq3_norm. The A3_red..rho3 chain is structurally identical to L2's
   // A2_red..rho2 chain (built on A3_red, a reduce of the raw SPBF output A3).
@@ -628,13 +629,13 @@ class Grace3LKK {
   t_nn_3d d_rho3;               // [chunk_size, 32, 1] — multi-instr elem-dep only_invar ReduceN({A3_red,A3_2_red,A3_3_red,A3_4_red})
   t_nn_3d d_rho3_norm;          // [chunk_size, 32, 1] — InvariantLayerRMSNorm(rho3, FULL branch)
 
-  // ---------- Backward (Task 3.1) adjoint buffers (dE/dX). NNScalar to match
-  // the golden fp32-autodiff adjoints (tol 1e-4). Chunk-local (single-chunk
-  // regime, chunk_offset=0), mirroring each forward tensor's shape; d_eq2_norm_adj
-  // is the ONLY global (nall) one (message adjoint scattered to owned+ghost). ----
+  // ---------- Backward adjoint buffers (dE/dX), NNScalar. Mostly chunk-local,
+  // each mirroring its forward tensor's shape. Exceptions: the [nall] readout
+  // seeds d_rho{1,2}_norm_adj and the message adjoint d_eq2_norm_adj (scattered
+  // to owned+ghost); the shared scratch d_adj_prod and d_cpl_{l,r}proj_adj. ----
   t_nn_3d_g d_rho1_norm_adj, d_rho2_norm_adj;    // readout bwd (all 3 equal; rho1 / rho2 [nall], see below)
   t_nn_3d d_rho3_norm_adj;
-  // Task 3.5b: d_rho1_norm_adj/d_rho2_norm_adj are PROMOTED to natom ([nall],
+  // d_rho1_norm_adj/d_rho2_norm_adj are PROMOTED to natom ([nall],
   // allocated in grow_global) so TagReadoutBwd (run over ALL P3 chunks) can seed
   // every owned atom's rho1/rho2 readout adjoint at (ii+chunk_offset), surviving
   // until P5/P4. The shared TagRMSNormBwd reads adj_out chunk-local, so P5/P4
@@ -644,8 +645,8 @@ class Grace3LKK {
   t_nn_3d d_rho1_adj, d_rho2_adj, d_rho3_adj;                 // invariant-RMSNorm bwd
   t_nn_3d d_A3_red_adj, d_A3_2_adj, d_A3_2_red_adj, d_A3_2a_adj;
   t_nn_3d d_A3_3_adj, d_A3_3_red_adj, d_A3_2b_adj, d_A3_4_adj, d_A3_4_red_adj;
-  t_nn_3d d_A3_adj;             // [chunk_size, A3_n_rad_max, A3_nfunc] — GATE 2
-  // Opt 4: shared adj_prod buffer [chunk_size, MAX_NRADMAX, nlm_y*MAX_NLMIND].
+  t_nn_3d d_A3_adj;             // [chunk_size, A3_n_rad_max, A3_nfunc]
+  // shared adj_prod buffer [chunk_size, MAX_NRADMAX, nlm_y*MAX_NLMIND].
   // adj_prod[ii,n,p] = inv_avg*Σ_f A_adj(ii,n,f)*cg_W(p,f) (p = ly*n_lm_ind+lr),
   // computed ONCE per layer by TagComputeAdjProd (output-parallel — no per-thread
   // local array) and read by BOTH the SPBF-bwd (A2/A3) AND ForceEquiv consumers,
@@ -653,30 +654,30 @@ class Grace3LKK {
   t_nn_3d d_adj_prod;
   t_nn_3d_rg d_eq2_norm_adj;      // [nall, I2_n_funcs, I2_n_out] — message adjoint (owned PARTIAL, pre-reverse-comm)
   t_nn_3d_s d_cpl_lproj_adj, d_cpl_rproj_adj;  // cp_l bwd rank-projection scratch (same layout as d_cpl_lproj/rproj)
-  // ---- Task 3.2: Layer-2 backward adjoint buffers (mirror the L3 d_A3_* set) ----
+  // ---- Layer-2 backward adjoint buffers (mirror the L3 d_A3_* set) ----
   t_nn_3d d_A2_red_adj, d_A2_2_adj, d_A2_2_red_adj, d_A2_2a_adj;
   t_nn_3d d_A2_3_adj, d_A2_3_red_adj, d_A2_2b_adj, d_A2_4_adj, d_A2_4_red_adj;
-  t_nn_3d d_A2_adj;             // [chunk_size, A2_n_rad_max, A2_nfunc] — GATE 2 (L2)
+  t_nn_3d d_A2_adj;             // [chunk_size, A2_n_rad_max, A2_nfunc]
   t_nn_3d d_eq2_adj;            // [chunk_size, eq2.n_out, eq2.M] — EquivariantRMSNorm bwd input adj
   // Chunk-local gather of the reverse-comm-completed d_eq2_norm_adj (owned rows,
-  // gathered by d_ilist so the generic equiv bwd stays chunk-local). GATE 1 dump src.
+  // gathered by d_ilist so the generic equiv bwd stays chunk-local).
   t_nn_3d d_eq2_norm_adj_local; // [chunk_size, I2_n_funcs, I2_n_out]
   // d_eq1_norm_adj (round-1 message adjoint, owned partial) REUSES d_grad_I_global
-  // [nall, I_n_funcs, I_n_out] — the round-1 reverse buffer; Task 3.3 reverse-comms it.
+  // [nall, I_n_funcs, I_n_out] — the round-1 reverse buffer, reverse-comm'd in PHASE 4.5.
 
-  // ---- Task 3.3: Layer-1 backward adjoint buffers. UNLIKE L2/L3, the L1 chain
+  // ---- Layer-1 backward adjoint buffers. UNLIKE L2/L3, the L1 chain
   // consumes the RAW SPBF basis A1 directly (there is no A1_red), so d_A1_adj is
   // the DIRECT fan-out target (accumulates from eq1[0]+rho1[0] + cp_l A1_2 (both)
   // + fc A1_2a/2b (right) + cp_l A1_3 (right)). ----
   t_nn_3d d_A1_2_adj, d_A1_2_red_adj, d_A1_2a_adj, d_A1_3_adj, d_A1_3_red_adj;
   t_nn_3d d_A1_2b_adj, d_A1_4_adj, d_A1_4_red_adj;
-  t_nn_3d d_A1_adj;             // [chunk_size, L1_nradmax, (lmax+1)^2] — GATE 2 (L1)
+  t_nn_3d d_A1_adj;             // [chunk_size, L1_nradmax, (lmax+1)^2]
   t_nn_3d d_eq1_adj;            // d_rho1_adj already declared with the rho{1,2,3}_adj set above
   // Chunk-local gather of the reverse-comm-completed round-1 message adjoint
-  // (d_grad_I_global owned rows). GATE 1 dump src for eq1_norm.
+  // (d_grad_I_global owned rows).
   t_nn_3d d_eq1_norm_adj_local; // [chunk_size, I_n_funcs, I_n_out]
 
-  // ---- Task 3.3: per-bond forces + radial r-derivative (geometry backward) ----
+  // ---- per-bond forces + radial r-derivative (geometry backward) ----
   t_geom_3d3 d_f_ij;            // [chunk_size, maxneigh, 3] per-bond force (F_i += f_ij, F_j -= f_ij)
   t_nn_4d_r d_DR1_nl;           // [chunk_size, maxneigh, L1_nradmax, lmax+1] dR/dr (shared scratch, per layer)
   t_geom_2d d_denv;             // [chunk_size, maxneigh] denv/dr (layer-independent; TagComputeRadialBasis)
@@ -687,11 +688,11 @@ class Grace3LKK {
   t_nn_3d force_A_adj;          // d_A2_adj or d_A3_adj (the basis adjoint being backpropped)
 
 #ifdef GRACE_KK_GEMM
-  // ---- Opt 15: cuBLAS true-fp32 radial-MLP scratch + launch state ----
+  // ---- BLAS handle (every GEMM path); true-fp32 radial-MLP scratch + launch state ----
   blas::handle_t blas_handle = nullptr;
   // owner of blas_handle, shared by every copy of the engine (Kokkos copies it as the kernel functor; a caller may
-  // copy it too): the last copy destroys the handle. No handle (Python wheels without cuBLAS, GRACE_RUNTIME_NO_CUBLAS):
-  // the hand-written kernels.
+  // copy it too): the last copy destroys the handle. No handle (CUDA: Python wheels without cuBLAS,
+  // GRACE_RUNTIME_NO_CUBLAS; HIP: GRACE_RUNTIME_NO_ROCBLAS and GRACE_RUNTIME_NO_KKGEMM): the hand-written kernels.
   std::shared_ptr<std::remove_pointer_t<blas::handle_t>> blas_owner;
   typedef Kokkos::View<NNScalar**, Kokkos::LayoutRight, DeviceType> t_nn_2d_r; // row-major [M x dim]
   // Per-(spbf,layer) weights repacked TIGHTLY row-major [n_in x n_out] at load
@@ -721,10 +722,10 @@ class Grace3LKK {
   t_nn_2d_r d_mlp_E[GRACE3L_N_SPBF];    // [n_elements x 2 d1]
   int mlp_split[GRACE3L_N_SPBF] = {0, 0, 0};
   t_nn_2d_r d_mlp_W0c_cur, d_mlp_E_cur;  // the current layer's tables (launch state for TagMLPLayer0*)
-  // Opt 17: device pointer-array buffer for cublasSgemmBatched (ReduceN). One packed
+  // device pointer-array buffer for blas::sgemm_batched (ReduceN). One packed
   // buffer holds [A ptrs | B ptrs | C ptrs], each block sized reduceN_max_conn, filled
   // on host + deep_copied per call (base pointers change only on grow, but rebuilding
-  // is cheap vs the GEMMs). uintptr_t storage reinterpreted as float** for cuBLAS.
+  // is cheap vs the GEMMs). uintptr_t storage reinterpreted as float** for the batched GEMM.
   Kokkos::View<uintptr_t*, DeviceType> d_redptr;
   Kokkos::View<uintptr_t*, Kokkos::HostSpace> h_redptr;   // explicit HostSpace (portable;
                                                           // ::HostMirror alias trips some nvcc)
@@ -745,16 +746,16 @@ class Grace3LKK {
   t_nn_3d fc_adj_out, fc_adj_left, fc_adj_right;           // TagFCBwd{Left,Right}
   t_nn_3d cpl_adj_out, cpl_adj_left, cpl_adj_right;        // TagCPLBwd{Couple,Project}
   int cpl_bwd_nmax = 0;                                    // max(n_left,n_right) stride for TagCPLBwdProject
-  int cpl_bwd_projected = 0;                               // lproj/rproj supplied by cuBLAS
+  int cpl_bwd_projected = 0;                               // lproj/rproj supplied by BLAS
 
   // ---------- Global arrays used by the comm subsystem (size = nall) ----------
   t_nn_3d_rg d_I_global;         // [nall, I_n_funcs, I_n_out] — I features (round-1 indicator eq1_norm) for forward comm
   t_nn_3d_rg d_grad_I_global;    // [nall, I_n_funcs, I_n_out] — grad_I for reverse comm
-  // Round-2 (L3) indicator: eq2_norm forward-comm'd to ghosts (Task 2.10). Sized
+  // Round-2 (L3) indicator: eq2_norm forward-comm'd to ghosts. Sized
   // [nall, I2_n_funcs, I2_n_out] — parity-doubled lm axis, distinct from d_I_global.
   t_nn_3d_rg d_eq2_norm_global;  // [nall, I2_n_funcs, I2_n_out] — round-2 indicator (eq2_norm)
 
-  // ---- Task 3.5a: natom promotions of d_rho1_norm/d_rho2_norm so the P3
+  // ---- natom promotions of d_rho1_norm/d_rho2_norm so the P3
   // readout can read atoms from EARLIER chunks after P1/P2's chunk-scratch
   // d_rho{1,2}_norm has been overwritten by later chunks (multi-chunk forward
   // correctness). UNLIKE d_I_global/d_eq2_norm_global above, these are PURELY
@@ -770,7 +771,7 @@ class Grace3LKK {
   t_nn_3d_rg_host h_I_global;
   t_nn_3d_rg_host h_grad_I_global;
   t_nn_3d_rg_host h_eq2_norm_global;
-  t_nn_3d_rg_host h_eq2_norm_adj;   // Task 3.2 reverse-comm host fallback
+  t_nn_3d_rg_host h_eq2_norm_adj;   // reverse-comm host fallback
 
   // ==========================================================================
   // Constant device weight storage (populated by copy_weights_to_device).
@@ -808,7 +809,7 @@ class Grace3LKK {
     t_nn_2d z_proj;                     // [n_elements, n_rad_max]
     t_nn_1d chem_l0_mask;              // [n_lm_ind]
     t_nn_2d cg_W;                      // [(lmax+1)^2 * n_lm_ind, nfunc]
-    // Opt 9: sparse forms of cg_W. The CG-coupling matrix is ~99% zeros
+    // sparse forms of cg_W. The CG-coupling matrix is ~99% zeros
     // (mean ~3-6 nnz per row/column), so the dense couple loops streamed
     // mostly zeros. Ascending index order within each column/row preserves
     // the dense loops' accumulation order exactly.
@@ -838,15 +839,15 @@ class Grace3LKK {
     t_nn_3d V;                          // [n_groups_right, rank, n_right]
     t_int_1d group_left, group_right;   // [n_lm_left], [n_lm_right]
     t_int_1d left_ind, right_ind, m_sum_ind;   // [n_cg]
-    // Opt 14: the three couple indices packed into ONE int32 per entry
+    // the three couple indices packed into ONE int32 per entry
     // (m_sum_ind<<16 | right_ind<<8 | left_ind) so the fused couple loops
     // stream 8 B/entry (packed+cg) instead of 16 B. Bounds checked at load.
     t_int_1d cg_packed;                 // [n_cg]
     t_nn_1d cg;                         // [n_cg]
     t_int_1d out_l;                     // [nfunc]
-    // Opt 16: cuBLAS CPLBwdProject scratch. Per-lm-slab (w) group-gathered +
+    // BLAS CPLBwdProject scratch. Per-lm-slab (w) group-gathered +
     // transposed U/V, tightly packed so each w-slab is a col-major [rank x n]
-    // matrix (ldb=rank, w-stride = n*rank) for cublasSgemmStridedBatched.
+    // matrix (ldb=rank, w-stride = n*rank) for blas::sgemm_strided_batched.
     // Uw(w,n,r) = U(group_left(w), r, n); Vw(w,n,r) = V(group_right(w), r, n).
     t_nn_3d_r Uw;                       // [n_lm_left,  n_left,  rank]
     t_nn_3d_r Vw;                       // [n_lm_right, n_right, rank]
@@ -871,7 +872,7 @@ class Grace3LKK {
   DeviceCPL d_prod[GRACE3L_MAX_PRODS];
   int n_prods = 0;
 
-  // ---- cp_l generic-product scratch + per-call launch state (Task 2.5) ----
+  // ---- cp_l generic-product scratch + per-call launch state ----
   // Rank-axis projections written by TagCPLProject, read by TagCPLCouple. Sized
   // once to the max rank / max n_lm over ALL products so the same two views
   // serve every compute_cp_l call (A1_2, A1_3, ... A3_2). Per-(atom,rank)
@@ -898,12 +899,12 @@ class Grace3LKK {
   t_nn_3d cpl_in_left, cpl_in_right, cpl_out;
   int cpl_nlm = 0;                     // max(n_lm_left, n_lm_right) for current product
 
-  // --- Opt 6: fused equiv-SPBF (A2/A3) launch state (captured by TagComputeSPBFFused) ---
+  // --- fused equiv-SPBF (A2/A3) launch state (captured by TagComputeSPBFFused) ---
   int spbf_fused_idx = -1;             // idx_spbf for the current fused equiv-SPBF launch
   t_nn_3d_rg spbf_fused_indicator;       // per-neighbor indicator source: d_I_global (A2) or d_eq2_norm_global (A3)
   t_nn_3d spbf_fused_out;              // output basis: d_A2 or d_A3
 
-  // --- Opt 10: fused equiv-SPBF backward launch state (captured by TagSPBFBwdFused) ---
+  // --- fused equiv-SPBF backward launch state (captured by TagSPBFBwdFused) ---
   int spbf_bwd_idx = -1;               // idx_spbf_A2 or idx_spbf_A3
   t_nn_3d_rg spbf_bwd_target;            // message-adjoint scatter target: d_grad_I_global (A2) or d_eq2_norm_adj (A3)
   enum { SPBF_BWD_TILE = 32 };         // neighbours staged per shared a_nl tile
@@ -924,13 +925,13 @@ class Grace3LKK {
     t_int_1d total_sum_ind[GRACE3L_MAX_REDUCE_INSTR]; // [n_conn]
     t_nn_1d norm_map;                   // [n_funcs] (or [1] for only_invar)
     int has_norm_map = 0;
-    // Opt 17: cuBLAS batched-GEMM scratch for elem-indep, non-only_invar reduces
+    // BLAS batched-GEMM scratch for elem-indep, non-only_invar reduces
     // (n_instr==1). Wsc[c] = norm*norm_map(tsi(c)) * W(0,:,:,wlt(c)), stored as a
     // col-major [n_out x n_in] block per connection (c-stride n_out*n_in, ld n_out).
     // Serves BOTH forward (rounds; alpha=1,OP_N/OP_T) and backward (single batch;
     // alpha=1,OP_N/OP_N,beta=1) — the norm folding is identical for both.
     t_nn_1d Wsc;                        // [n_conn * n_out * n_in]  (instr 0 only)
-    // Blocked hand path (reduces without the cuBLAS form): norm-folded weights with n_out fastest,
+    // Blocked hand path (reduces without the BLAS form): norm-folded weights with n_out fastest,
     // Wb[wb_off[ins] + ((e * w_shape + t) * n_in + n) * n_out + k], and the connections of all
     // instructions grouped by output f (CSR: roff[f] .. roff[f+1] -> (rins, rci, rtile)).
     int blk_ok = 0;
@@ -941,11 +942,11 @@ class Grace3LKK {
   };
   DeviceReduce d_reduce[GRACE3L_MAX_REDUCES];
   int n_reduces = 0;
-  // Opt 17: host-side per-reduce metadata for the cuBLAS batched path (index-parallel
+  // host-side per-reduce metadata for the BLAS batched path (index-parallel
   // to d_reduce). Holds the host copies of the connection indices + the forward round
   // schedule used to build the batched-GEMM device pointer arrays each call.
   struct ReduceHost {
-    bool cublas_ok = false;            // elem_dep==0 && only_invar==0 && n_instr==1
+    bool gemm_form_ok = false;         // elem_dep==0 && only_invar==0 && n_instr==1
     int n_conn = 0, n_out = 0, n_in = 0;
     std::vector<int> ci, tsi;          // [n_conn] collect_ind / total_sum_ind (host)
     std::vector<int> fwd_order;        // [n_conn] connections grouped by round
@@ -981,7 +982,7 @@ class Grace3LKK {
   int n_fcs = 0;
  protected:
 
-  // ---- FunctionReduceN generic-kernel scratch + per-call launch state (Task 2.6).
+  // ---- FunctionReduceN generic-kernel scratch + per-call launch state.
   // Mirrors the cp_l pattern (DeviceCPL/cpl_p above): caller supplies the
   // per-instruction input views by name-matching grace_model->reduce[i].instr[j]
   // .name at the call site; the device kernel itself never does string lookup. ----
@@ -989,7 +990,7 @@ class Grace3LKK {
   t_nn_3d reduceN_inputs[GRACE3L_MAX_REDUCE_INSTR];
   t_nn_3d reduceN_out;
 
-  // ---- FCRight2Left per-call launch state (Task 2.6) ----
+  // ---- FCRight2Left per-call launch state ----
   DeviceFC fc_p;
   t_nn_3d fc_in_left, fc_in_right, fc_out;
 
@@ -1013,13 +1014,13 @@ class Grace3LKK {
   DeviceRMSNorm d_rmsnorm[GRACE3L_MAX_RMSNORMS];
   int n_rmsnorms = 0;
 
-  // ---- EquivariantRMSNorm per-call launch state (Task 2.7; same pattern as
+  // ---- EquivariantRMSNorm per-call launch state (same pattern as
   // reduceN_r/fc_p above: caller stashes metadata + in/out views, kernel is
   // pure tag-functor code with no string lookups). ----
   DeviceEqNorm eqnorm_p;
   t_nn_3d eqnorm_in, eqnorm_out;
 
-  // ---- InvariantLayerRMSNorm per-call launch state (Task 2.7) ----
+  // ---- InvariantLayerRMSNorm per-call launch state ----
   DeviceRMSNorm rmsnorm_p;
   t_nn_3d rmsnorm_in, rmsnorm_out;
 
@@ -1036,7 +1037,7 @@ class Grace3LKK {
   int energy_max_dim = 0;
   int energy_activation = 0;            // 0=silu, 1=tanh
 
-  // Per-atom energy (Task 2.11). Deliberately KKA (fp64 by default),
+  // Per-atom energy. Deliberately KKA (fp64 by default),
   // NOT NNScalar/GeomScalar: the MLP math runs in NNScalar (matching TF's fp32
   // readout), but the accumulated per-atom result — and the eng_vdwl reduction
   // over it — must stay fp64 regardless of which Grace3LKK<> NNScalar/
@@ -1055,21 +1056,21 @@ class Grace3LKK {
   // ---------- Helper functions ----------
   void grow(int natom, int maxneigh);
   bool realloc_all = true;    // set by set_model(): grow() and grow_global() resize every buffer to the new model
-  // Allocate the global (nall-sized) inter-layer comm arrays (Task 2.8). Sized
-  // to I_n_funcs/I_n_out (set in setup()); mirrors GRACE-2L's grow_global.
+  // Allocate the global (nall-sized) inter-layer comm arrays. Sized
+  // to I_n_funcs/I_n_out (set in set_model()); mirrors GRACE-2L's grow_global.
   void grow_global(int nall);
-  // Generic cp_l GeneralProductFunction product (Task 2.5): out[a,r,f] from
+  // Generic cp_l GeneralProductFunction product: out[a,r,f] from
   // left/right [a,n,lm] for product p over the current chunk. Reused for every
   // A*_* cp_l product; caller supplies the per-product weights + in/out views.
   void compute_cp_l(const DeviceCPL &p, const t_nn_3d &in_left,
                     const t_nn_3d &in_right, const t_nn_3d &out);
-  // Opt 6: fused equiv-SPBF (A2/A3) launcher — one team per (ii,n); the prod
+  // fused equiv-SPBF (A2/A3) launcher — one team per (ii,n); the prod
   // slice + dense CG couple live in team shared (replaces the register-spilling
   // TagComputeA2/TagComputeA3). idx picks the SPBF weights; indicator is the
   // per-neighbor message source (d_I_global for A2, d_eq2_norm_global for A3);
   // out is the basis output (d_A2 or d_A3).
   void compute_spbf_equiv(int idx, const t_nn_3d_rg &indicator, const t_nn_3d &out);
-  // Generic FunctionReduceN (Task 2.6): out[a,k,f] from per-instruction gathered
+  // Generic FunctionReduceN: out[a,k,f] from per-instruction gathered
   // inputs for reduce r over the current chunk. Handles multi-instruction sums,
   // elem_dep W indexing (W stored uniformly 4D [n_types,n_out,n_in,w_shape],
   // n_types=1 if !elem_dep, so the kernel always indexes e=elem_dep?mu_i:0 with
@@ -1079,31 +1080,31 @@ class Grace3LKK {
   // (A*_*_red, eq*, rho*, ...); caller supplies inputs[j] matching instr[j].name.
   void compute_reduceN(const DeviceReduce &r, const t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR],
                        const t_nn_3d &out);
-  // Generic FCRight2Left (Task 2.6): out[a,k,lm] = left_t[lm,a,k] with right's
+  // Generic FCRight2Left: out[a,k,lm] = left_t[lm,a,k] with right's
   // per-connection contribution scattered in via collect_from/collect_to.
   // Handles left_coefs=True (left projected via w_left/w_tile_left, like the
   // right branch) and left_coefs=False (left already at this FC's n_out, just
   // transposed) generically; always applies norm_out_factor (the loader
-  // requires it unconditionally, matching the oracle's `if W.has(...)` being
+  // requires it unconditionally, matching the reference's `if W.has(...)` being
   // always-true for this exporter). Reused for every FC (A*_2a/2b, ...);
   // caller supplies the left/right input views.
   // compute_fc: public (extended device lambdas), declared next to compute_Y_bond_chunk.
-  // Generic EquivariantRMSNorm (Task 2.7): x=[atoms,n_feat=n_out,n_lm=M].
+  // Generic EquivariantRMSNorm: x=[atoms,n_feat=n_out,n_lm=M].
   // center_l0 (per-(atom,lm) cross-feature mean, masked to l==0 slots) ->
   // ONE degree-balanced RMS scalar per atom (mean over feat of sum over lm of
   // dw[lm]*x^2) -> per-(feat,lm) affine scale = affine_weight[expand_index[lm], feat].
   // Reused for eq1_norm/eq2_norm.
   void compute_equiv_rms_norm(const DeviceEqNorm &e, const t_nn_3d &in, const t_nn_3d &out);
-  // Generic InvariantLayerRMSNorm (Task 2.7): x=[atoms,n_out,n_lm]. Branches
-  // on scale_len vs n_out exactly like the oracle: full (scale_len==n_out) ->
+  // Generic InvariantLayerRMSNorm: x=[atoms,n_out,n_lm]. Branches
+  // on scale_len vs n_out exactly like the reference: full (scale_len==n_out) ->
   // every channel scaled by rsqrt(mean_over_channel(x^2)+eps); only_nonlin
   // (scale_len==n_out-1) -> channel 0 passthrough, channels 1..n_out-1 scaled
   // by rsqrt(mean_over_the_nonlin_channels(x^2)+eps). eps=1e-10 fixed (not
-  // loaded from the npz — matches the oracle's hardcoded F32(1e-10)). Reused
+  // loaded from the npz — matches the reference's hardcoded F32(1e-10)). Reused
   // for rho1_norm/rho2_norm/rho3_norm.
   void compute_invariant_rms_norm(const DeviceRMSNorm &r, const t_nn_3d &in, const t_nn_3d &out);
 
-  // ---- Task 3.1: backward (reverse-mode adjoint) routines ----
+  // ---- backward (reverse-mode adjoint) routines ----
   // Readout backward: seeds d_rho{1,2,3}_norm_adj = dE/d(rho_k_norm) (all equal,
   // since the 3 densities enter the readout symmetrically). ch0=output_scale
   // (linear skip), ch1..31 from the MLP backward; every lm>0 slot = 0.
@@ -1138,48 +1139,48 @@ class Grace3LKK {
   // message adjoint) over every (owned atom i, radial n, neighbor j). j may be
   // owned OR ghost -> d_eq2_norm_adj is nall-sized, atomic-add scatter. The
   // species-injection (z_proj/chem_l0_mask) term is constant and contributes
-  // nothing to the indicator adjoint. NOT reverse-comm'd here (Task 3.2).
+  // nothing to the indicator adjoint. NOT reverse-comm'd here.
   void compute_A3_spbf_bwd();
-  // Opt 4: fill d_adj_prod for the given layer (spbf_idx = idx_spbf_A2 or _A3,
+  // fill d_adj_prod for the given layer (spbf_idx = idx_spbf_A2 or _A3,
   // A_adj = d_A2_adj or d_A3_adj) BEFORE its SPBF-bwd + ForceEquiv consumers.
   void compute_adj_prod(int spbf_idx, const t_nn_3d &A_adj);
-  // Task 3.2: Generic EquivariantRMSNorm VJP (mirrors compute_equiv_rms_norm).
+  // Generic EquivariantRMSNorm VJP (mirrors compute_equiv_rms_norm).
   // Given the forward input `in` and adj_out, ASSIGNS adj_in (single consumer:
   // eq2 feeds only eq2_norm). Recomputes center_l0 mean + degree-balanced rms
-  // from `in` (the forward caches neither). Reused for eq1_norm in Task 3.3.
+  // from `in` (the forward caches neither). Reused for eq1_norm in the L1 backward.
   void compute_equiv_rms_norm_bwd(const DeviceEqNorm &e, const t_nn_3d &in,
       const t_nn_3d &adj_out, const t_nn_3d &adj_in);
-  // Task 3.2: L2 equivariant-SPBF backward: scatters d_A2_adj into d_grad_I_global
+  // L2 equivariant-SPBF backward: scatters d_A2_adj into d_grad_I_global
   // (the round-1 message adjoint d_eq1_norm_adj, owned partial) over (owned atom i,
   // radial n, neighbor j; j owned OR ghost -> atomic scatter). The z_proj/
   // chem_l0_mask species-injection term is constant -> no indicator adj. NOT
-  // reverse-comm'd here (Task 3.3). Requires d_R1_nl to hold A2's radial (caller
+  // reverse-comm'd here. Requires d_R1_nl to hold A2's radial (caller
   // recomputes it — A3's forward overwrote the shared d_R1_nl scratch).
   void compute_A2_spbf_bwd();
-  // Opt 10: shared launcher for the fused team+shared equiv-SPBF backward
+  // shared launcher for the fused team+shared equiv-SPBF backward
   // (TagSPBFBwdFused). idx = idx_spbf_A2 or idx_spbf_A3; adj_target = the
   // nall-sized message-adjoint buffer the kernel atomic-add scatters into
   // (d_grad_I_global for A2, d_eq2_norm_adj for A3).
   void compute_spbf_bwd_fused(int idx, const t_nn_3d_rg &adj_target);
-  // Task 3.3: radial MLP forward + its r-derivative for the layer selected by
+  // radial MLP forward + its r-derivative for the layer selected by
   // radial_mlp_spbf. Writes d_R1_nl (R, matching the forward) and d_DR1_nl (dR/dr).
   // Bit-identical R to TagComputeMLPRadial.
   void compute_mlp_radial_deriv();
-  // Opt 15: value-only radial MLP forward for layer `radial_mlp_spbf`, writing
+  // value-only radial MLP forward for layer `radial_mlp_spbf`, writing
   // d_R1_nl. Dispatches to cuBLAS SGEMM (CUDA) or the hand kernel (fallback).
   // Replaces the inline TagComputeMLPRadial launches in l{1,2}_forward_chunk.
   void compute_mlp_radial();
 #ifdef GRACE_KK_GEMM
-  // Opt 15 helper: C[M x n_out] = alpha * In[M x n_in] * Wg (true-fp32 SGEMM,
+  // helper: C[M x n_out] = alpha * In[M x n_in] * Wg (true-fp32 SGEMM,
   // CUBLAS_PEDANTIC_MATH). Row-major operands; ld* are the physical row strides
   // (allocated widths): ldW=n_out for the tight Wg, ldIn=In's alloc width,
   // ldC=C's alloc width (e.g. L1_nradmax*(lmax+1) when C aliases d_R1_nl).
   void mlp_sgemm(const NNScalar* Wg, const NNScalar* In, NNScalar* C,
       int n_out, int M, int n_in, int ldW, int ldIn, int ldC, NNScalar alpha);
-  // Opt 15: one-time layer-0 transpose/leading-dim self-test vs a host reference
-  // (aborts on mismatch). Called from setup() before the cuBLAS path is used.
-  void mlp_cublas_selftest();
-  // Opt 16 helper: batched projection SGEMM for TagCPLBwdProject. For each lm-slab
+  // one-time layer-0 transpose/leading-dim self-test vs a host reference
+  // (aborts on mismatch). Called from setup() before the BLAS path is used.
+  void mlp_blas_selftest();
+  // helper: batched projection SGEMM for TagCPLBwdProject. For each lm-slab
   // w in [0,batch): C(:,:,w)[M x n] += alpha * A(:,:,w)[M x rank] * Bw[w][rank x n].
   // A/C are LayoutLeft slabs (col-major, ld = extent(0), w-stride = extent(0)*extent(1));
   // Bw is the tightly-packed Uw/Vw (col-major [rank x n], ldb=rank, w-stride=n*rank).
@@ -1187,21 +1188,22 @@ class Grace3LKK {
   void cpl_project_sgemm_batched(const NNScalar* A, long strideA, int ldA,
       const NNScalar* Bw, int n, int rank, NNScalar* C, long strideC, int ldC,
       int M, int batch, NNScalar alpha);
-  // Opt 17: cuBLAS batched-GEMM ReduceN forward/backward (elem-indep, non-only_invar).
-  // Return true if handled via cuBLAS; false -> caller runs the hand-kernel fallback.
-  bool compute_reduceN_cublas(const DeviceReduce &r, int idx,
+  // BLAS batched-GEMM ReduceN forward/backward (elem-indep, non-only_invar).
+  // Return true if handled via BLAS; false -> caller runs the hand-kernel fallback.
+  bool compute_reduceN_blas(const DeviceReduce &r, int idx,
       const t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR], const t_nn_3d &out);
-  bool compute_reduceN_bwd_cublas(const DeviceReduce &r, int idx,
+  bool compute_reduceN_bwd_blas(const DeviceReduce &r, int idx,
       const t_nn_3d &adj_out, const t_nn_3d &adj_in);
-  // Opt 18 (fp32 only): cuBLAS U/V rank-projection for cp_l forward. Writes the global
+  // fp32 only: BLAS U/V rank-projection for cp_l forward. Writes the global
   // lproj/rproj scratch (d_cpl_lproj/d_cpl_rproj) via two strided-batched GEMMs (reusing
-  // the Opt-16 Uw/Vw weights), replacing the shared-memory projection in TagCPLFused;
-  // the couple then reads lproj/rproj back (TagCPLCouple). fp64 + non-CUDA keep the fused
-  // kernel (no SGEMM benefit, and un-fusing reintroduces the round-trip Opt-5 removed).
-  void compute_cp_l_project_cublas(const DeviceCPL &p,
+  // the Uw/Vw weights of the backward projection), replacing the shared-memory projection in
+  // TagCPLFused; the couple then reads lproj/rproj back (cpl_couple_gather). fp64 and builds without
+  // a BLAS handle keep the fused kernel (no SGEMM benefit, and un-fusing reintroduces the round-trip
+  // the fused kernel avoids).
+  void compute_cp_l_project_blas(const DeviceCPL &p,
       const t_nn_3d &in_left, const t_nn_3d &in_right);
 #endif
-  // Task 3.3: per-bond geometry-force kernels. Each ACCUMULATES (atomic +=) into
+  // per-bond geometry-force kernels. Each ACCUMULATES (atomic +=) into
   // d_f_ij; caller zeros d_f_ij once before invoking all three layers.
   void compute_force_L1();
   void compute_force_equiv(int spbf_idx, const t_nn_3d &A_adj, int ind_stage, int n_lm_ind);
@@ -1215,9 +1217,9 @@ class Grace3LKK {
   // chunk_size, maxneigh). Must be (re)called whenever d_rhats for the
   // current chunk changes before any kernel reads d_Y_bond.
   void compute_Y_bond_chunk();
-  // Task 3.5b: forward-chunk recompute helpers (the L1/L2 per-chunk forward
+  // forward-chunk recompute helpers (the L1/L2 per-chunk forward
   // bodies extracted from the P1/P2 loops, WITHOUT the global eq-scatter) and
-  // the per-chunk force scatter (extracted from the old single-shot P6b).
+  // the per-chunk force scatter.
   // P1 calls l1_forward_chunk() then the eq1_norm scatter; P5 (L1 backward)
   // re-runs l1_forward_chunk() to repopulate the chunk-scratch forward
   // intermediates. Likewise l2_forward_chunk() for P2/P4. scatter_forces_chunk()
@@ -1243,7 +1245,7 @@ class Grace3LKK {
   int spbf_ltile_std[GRACE3L_N_SPBF] = {0, 0, 0};   // l_tile(y) == l(y)
   void spbf_transpose(const t_nn_3d &A, int NR, int nfunc, bool to_rowmajor);
   // A2 / A3 straight from d_spbf_T into their grouped reduce (no transposes): fast SPBF, single-input grouped
-  // cuBLAS reduce with n_in = n_rad_max whose blocks cover every SPBF function.
+  // BLAS reduce with n_in = n_rad_max whose blocks cover every SPBF function.
   bool spbf_rm_ok(int si, int ridx) const;
   bool eqnorm_team_ok(int M) const;
   // EquivariantRMSNorm forward (bwd = false: Y = norm(X)) / VJP (bwd = true: DX from G = dE/dY), team per 8 atoms
@@ -1299,7 +1301,6 @@ class Grace3LKK {
   t_nn_3d st_none;                      // store slot unused with fc_fold (A*_2b)
   std::vector<t_nn_3d> st_fwd[12];
   std::vector<int> spl_mus;              // species of the last radial tables (spline_mb auto keeps them on a re-setup)
-  int spl_n_built[3] = {0, 0, 0};
   int spl_N[3] = {0, 0, 0}, spl_off[3] = {0, 0, 0}, spl_Ntot = 0;    // tables: intervals and node offset per layer
   t_nn_3d st_base[12];
   t_nn_3d *st_ptr(int i);
@@ -1342,7 +1343,7 @@ class Grace3LKK {
 
 
 
-  // Activation functions (used by the NN kernels added in later tasks)
+  // Activation functions (used by the NN kernels)
   KOKKOS_INLINE_FUNCTION
   static NNScalar silu(NNScalar x) {
     return x / (NNScalar(1.0) + Kokkos::exp(-x));
@@ -1364,14 +1365,14 @@ class Grace3LKK {
   std::shared_ptr<GRACE3LModel> grace_model;
   std::vector<int> h_type2model;
 
-  // Task 2.6: reduce/FC array indices resolved by name-match at setup()
+  // reduce/FC array indices resolved by name-match at setup()
   // time (index-parallel with d_reduce/d_fc — see copy_weights_to_device,
   // which fills d_reduce[i]/d_fc[i] in the same order as grace_model->reduce
   // /fc). Set to -1 until resolved; setup() errors out if not found.
   int idx_reduce_A1_2_red = -1;
   int idx_fc_A1_2a = -1;
 
-  // Task 2.7: remaining L1 prod/reduce/FC/eqnorm/rmsnorm indices, resolved by
+  // remaining L1 prod/reduce/FC/eqnorm/rmsnorm indices, resolved by
   // NAME-match at setup() time (same convention as idx_reduce_A1_2_red).
   int idx_prod_A1_3 = -1;
   int idx_prod_A1_4 = -1;
@@ -1380,9 +1381,9 @@ class Grace3LKK {
   int idx_reduce_A1_4_red = -1;
   int idx_reduce_eq1 = -1;
   int idx_reduce_rho1 = -1;
-  int idx_eqnorm_eq1_norm = -1;
+  int idx_eqnorm_eq1_norm = -1;    // resolved in set_model() (comm_width() before setup())
   int idx_rmsnorm_rho1_norm = -1;
-  // Task 2.8: SPBF layer index of "A2" (equivariant), resolved by name in
+  // SPBF layer index of "A2" (equivariant), resolved by name in
   // setup() (spbf order is [A1,A2,A3]; index 1, but resolved defensively).
   int idx_spbf_A2 = -1;
   // eq1/rho1 both collect the same 4 named L1 tensors {A1, A1_2_red,
@@ -1393,8 +1394,8 @@ class Grace3LKK {
   int eq1_input_role[GRACE3L_MAX_REDUCE_INSTR];
   int rho1_input_role[GRACE3L_MAX_REDUCE_INSTR];
 
-  // Task 2.9: remaining L2 prod/reduce/FC/eqnorm/rmsnorm indices, resolved by
-  // NAME-match at setup() time (same convention as the Task 2.7 L1 idx_*
+  // remaining L2 prod/reduce/FC/eqnorm/rmsnorm indices, resolved by
+  // NAME-match at setup() time (same convention as the L1 idx_*
   // members above). idx_reduce_A2_red is the extra reduce L2 has that L1
   // does not (L1's products consume raw A1; L2's consume A2_red).
   int idx_reduce_A2_red = -1;
@@ -1408,7 +1409,7 @@ class Grace3LKK {
   int idx_reduce_A2_4_red = -1;
   int idx_reduce_eq2 = -1;
   int idx_reduce_rho2 = -1;
-  int idx_eqnorm_eq2_norm = -1;
+  int idx_eqnorm_eq2_norm = -1;    // resolved in set_model() (comm_width() before setup())
   int idx_rmsnorm_rho2_norm = -1;
   // eq2/rho2 both collect the same 4 named L2 tensors {A2_red, A2_2_red,
   // A2_3_red, A2_4_red}; role[j] tells compute() which of those 4 views to
@@ -1418,8 +1419,8 @@ class Grace3LKK {
   int eq2_input_role[GRACE3L_MAX_REDUCE_INSTR];
   int rho2_input_role[GRACE3L_MAX_REDUCE_INSTR];
 
-  // Task 2.10: L3 SPBF + remaining L3 prod/reduce/FC/rmsnorm indices, resolved
-  // by NAME-match at setup() (same convention as the Task 2.9 L2 idx_*
+  // L3 SPBF + remaining L3 prod/reduce/FC/rmsnorm indices, resolved
+  // by NAME-match at setup() (same convention as the L2 idx_*
   // members). L3 is TERMINAL: it has A3_red (like A2_red) and the same
   // cp_l/reduce/fc chain, but produces ONLY rho3/rho3_norm — there is NO eq3.
   int idx_spbf_A3 = -1;
@@ -1476,3 +1477,9 @@ class Grace3LKK {
 
 }    // namespace kk
 }    // namespace grace
+
+// The GRACE-3L engine a consumer (LAMMPS) instantiates explicitly, naming only the device and the traits: this
+// declaration in its headers, GRACE_KK_INSTANTIATE_3L (grace/kk/grace_3l_kk_impl.h) in one translation unit. Only the
+// base: the members of Grace3LFusedKK are inline (a member defined out of line must be added here). At global scope,
+// as a statement: GRACE_KK_EXTERN_3L(Device, Traits);
+#define GRACE_KK_EXTERN_3L(Device, Traits) extern template class grace::kk::Grace3LKK<Device, float, float, Traits>

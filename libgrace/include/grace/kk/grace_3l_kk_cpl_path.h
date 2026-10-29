@@ -1,6 +1,5 @@
 /* ----------------------------------------------------------------------
    SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-   Moved from lammps-ace src/KOKKOS/grace_3l_cpl_path.h (5f5ab57aa7), used by grace::kk::Grace3LKK.
    GRACE-3L cp_l couple by coupling path, operands in registers.
 
    The couple out[f] = sum_t cg_t L[l_t] R[r_t] of a cp_l product splits into coupling paths (l1,l2)L: an output
@@ -9,7 +8,7 @@
    order, m < 0 sine-like) satisfy
      |M| in {|m1| + |m2|, ||m1| - |m2||}   and   sine-like(M) = sine-like(m1) ^ sine-like(m2) ^ (l1 + l2 + L odd),
    so the term pattern is known at compile time for every (l1, l2, L) with l <= 4; only the cg values (one per
-   candidate, 0 where the model has none) and the path lists come from the model. The style checks every term
+   candidate, 0 where the model has none) and the path lists come from the model. The engine checks every term
    against this rule at load time and uses the table kernels otherwise.
 
    Loop structure (thread per (atom, rank); MODE 0 forward, 1 left adjoint, 2 right adjoint, 3 both adjoints with the

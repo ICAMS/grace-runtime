@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_uq.h (GraceUQHead, feature/grace-runtime a73b8b17ee): the uqv6 UQ head of
-// a model (GRACE-3L). Filled by the loader (load_uq_head in src/npz3.h).
+// UqHead: the uqv6 UQ head of a model (GRACE-3L). Filled by the loader (load_uq_head in src/npz3.h).
 #ifndef GRACE_UQ_HEAD_H
 #define GRACE_UQ_HEAD_H
 

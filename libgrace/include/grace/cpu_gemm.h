@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_cpu_gemm.h (feature/grace-runtime a73b8b17ee); contributing author: Yury
-// Lysogorskiy (ICAMS). Single-precision row-major GEMM of the CPU GRACE-3L driver: C = alpha A B + beta C.
-// With GRACE_BLAS it calls cblas_sgemm (LP64 interface); the built-in kernel is a register-blocked loop (4 rows x 64
-// columns of accumulators; 8 rows for 32- and 16-column bands). GRACE_GEMM=builtin (or G3LF_GEMM=builtin) forces it.
-// Both are called from inside OpenMP parallel regions, one thread per call: MKL and OpenMP-built OpenBLAS run
-// single-threaded there.
+// Contributing author: Yury Lysogorskiy (ICAMS). Single-precision row-major GEMM of the CPU GRACE-3L driver: C = alpha
+// A B + beta C. With GRACE_BLAS it calls cblas_sgemm (LP64 interface); the built-in kernel is a register-blocked loop
+// (4 rows x 64 columns of accumulators; 8 rows for 32- and 16-column bands). GRACE_GEMM=builtin (or G3LF_GEMM=builtin)
+// forces it. Both are called from inside OpenMP parallel regions, one thread per call: MKL and OpenMP-built OpenBLAS
+// run single-threaded there.
 #ifndef GRACE_CPU_GEMM_H
 #define GRACE_CPU_GEMM_H
 
@@ -14,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <atomic>
 #include <tuple>
 #ifdef _OPENMP
 #include <omp.h>
@@ -26,8 +27,14 @@ extern "C" void cblas_sgemm(int layout, int transa, int transb, int M, int N, in
                             int lda, const float *B, int ldb, float beta, float *C, int ldc);
 #endif
 
+// the linked BLAS's openblas_get_parallel / MKL_Get_Version_String if present: weak symbols on ELF (also found in a
+// static BLAS), a run-time lookup on Mach-O (weak undefined symbols need -undefined dynamic_lookup there)
+#if defined(__ELF__)
 extern "C" int openblas_get_parallel(void) __attribute__((weak));
 extern "C" void MKL_Get_Version_String(char *, int) __attribute__((weak));
+#elif defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 namespace grace {
 namespace gemm {
@@ -101,9 +108,9 @@ inline void gemm_builtin(int M, int N, int K, float alpha, const float *A, int l
 
 // use the built-in kernel: G3LF_GEMM=builtin, or set when the linked BLAS cannot be called from OpenMP threads
 // (pthreads OpenBLAS)
-inline bool &force_builtin()
+inline std::atomic<bool> &force_builtin()    // atomic: engines on several host threads set and read it
 {
-  static bool f = [] {
+  static std::atomic<bool> f = [] {
     const char *e = getenv("GRACE_GEMM") ? getenv("GRACE_GEMM") : getenv("G3LF_GEMM");
     return e != nullptr && std::strcmp(e, "builtin") == 0;
   }();
@@ -113,6 +120,7 @@ inline bool &force_builtin()
 // G3LF_GEMMSTAT: time per (M, N, K) on OpenMP thread 0 (diagnostics)
 struct GemmStat {
   bool on = getenv("G3LF_GEMMSTAT") != nullptr;
+  std::mutex mu;
   std::map<std::tuple<int, int, int>, std::pair<double, long>> t;
   ~GemmStat()
   {
@@ -162,8 +170,10 @@ inline void gemm(int M, int N, int K, float alpha, const float *A, int lda, cons
   if (st.on && omp_get_thread_num() == 0) {
     const double t0 = omp_get_wtime();
     gemm_impl(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    const double dt = omp_get_wtime() - t0;
+    std::lock_guard<std::mutex> lk(st.mu);
     auto &e = st.t[std::make_tuple(M, N, K)];
-    e.first += omp_get_wtime() - t0;
+    e.first += dt;
     e.second++;
     return;
   }
@@ -172,12 +182,26 @@ inline void gemm(int M, int N, int K, float alpha, const float *A, int lda, cons
 }
 
 // description of the compiled path, and a warning when the BLAS cannot be called from OpenMP threads
+// address of a symbol of the linked BLAS, nullptr without it
+inline void *blas_symbol(const char *name)
+{
+#if defined(__ELF__)
+  if (!std::strcmp(name, "openblas_get_parallel")) return reinterpret_cast<void *>(openblas_get_parallel);
+  if (!std::strcmp(name, "MKL_Get_Version_String")) return reinterpret_cast<void *>(MKL_Get_Version_String);
+  return nullptr;
+#elif defined(__APPLE__)
+  return dlsym(RTLD_DEFAULT, name);
+#else
+  (void) name;
+  return nullptr;
+#endif
+}
 inline const char *backend()
 {
 #ifdef GRACE_BLAS
   if (force_builtin()) return "built-in (linked BLAS not usable from OpenMP threads)";
-  if (MKL_Get_Version_String) return "cblas (MKL)";
-  if (openblas_get_parallel) return "cblas (OpenBLAS)";
+  if (blas_symbol("MKL_Get_Version_String")) return "cblas (MKL)";
+  if (blas_symbol("openblas_get_parallel")) return "cblas (OpenBLAS)";
   return "cblas";
 #else
   return "built-in";
@@ -186,7 +210,8 @@ inline const char *backend()
 inline bool blas_thread_unsafe()
 {
 #ifdef GRACE_BLAS
-  return openblas_get_parallel && openblas_get_parallel() == 1;    // pthreads OpenBLAS
+  const auto get_parallel = reinterpret_cast<int (*)()>(blas_symbol("openblas_get_parallel"));
+  return get_parallel && get_parallel() == 1;    // pthreads OpenBLAS
 #else
   return false;
 #endif

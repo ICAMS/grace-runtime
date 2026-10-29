@@ -15,7 +15,7 @@ import re
 import sys
 import warnings
 
-ABI = 5    # the C++ interface of the GPU modules (kk_api.h); a plug-in must carry the same
+ABI = 6    # the C++ interface of the GPU modules (kk_api.h); a plug-in must carry the same
 # the GPU module in use: platform "cuda" | "rocm", device index, module arch, ptx (CUDA only), cc (CUDA: "8.6"; ROCm:
 # the gfx target), driver (CUDA driver version, set by _cuda.compute_capability)
 _state = {"module": None, "platform": None, "device": None, "arch": None, "ptx": False, "cc": None, "driver": None}

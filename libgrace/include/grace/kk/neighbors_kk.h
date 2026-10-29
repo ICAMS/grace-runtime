@@ -150,7 +150,7 @@ template<class DeviceType> struct NeighborListKK {
     {
       const double *a = cell;
       det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
-      if (!(std::abs(det) > 0.0)) throw Error("neighbour search needs a full-rank cell");
+      if (!full_rank_cell(a, det)) throw Error("neighbour search needs a full-rank cell");
       const double d = 1.0 / det;
       inv.a[0] = (a[4] * a[8] - a[5] * a[7]) * d; inv.a[1] = (a[2] * a[7] - a[1] * a[8]) * d;
       inv.a[2] = (a[1] * a[5] - a[2] * a[4]) * d; inv.a[3] = (a[5] * a[6] - a[3] * a[8]) * d;
@@ -245,11 +245,21 @@ template<class DeviceType> struct NeighborListKK {
     const int64_t r0 = reach[0], r1 = reach[1], r2 = reach[2];
     const NeighborVisitor<DeviceType> visit{pm, bb, bs, x, H, {nb0, nb1, nb2}, {p0, p1, p2}, {r0, r1, r2}, rc2};
     auto cnt = nn;
-    Kokkos::parallel_for("nl:count", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(const int q) {
+    int zero = 0;    // pairs at distance 0 (two atoms, or an atom and an image, at the same position): an error
+    Kokkos::parallel_reduce("nl:count", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(const int q, int &z) {
       int64_t c = 0;
-      visit(q, [&](int, int, int, int) { c++; });
+      visit(q, [&](int p, int s0, int s1, int s2) {
+        c++;
+        double d2 = 0.0;
+        for (int k = 0; k < 3; k++) {
+          const double d = x(p, k) + s0 * H.a[k] + s1 * H.a[3 + k] + s2 * H.a[6 + k] - x(q, k);
+          d2 += d * d;
+        }
+        if (d2 == 0.0) z++;
+      });
       cnt(q) = c;
-    });
+    }, zero);
+    if (zero) throw Error("neighbour search: two atoms at the same position (a bond of length 0): not a physical structure");
     auto off = offset;
     int64_t total = 0;
     Kokkos::parallel_scan("nl:offset", Kokkos::RangePolicy<DeviceType>(0, n),
@@ -375,26 +385,35 @@ template<class DeviceType> struct BatchNeighborListKK {
   std::vector<int64_t> grid_nbin;     // [nsys][3]
   std::vector<int> grid_pbc;          // [nsys][3]
 
-  mutable std::vector<std::pair<double, V3l>> reach_rc;    // reach views of visitor(), kept per radius
+  struct ReachEntry {
+    double rc = 0.0;
+    uint64_t gen = 0;
+    V3l r;
+  };
+  uint64_t build_gen = 0;
+  mutable std::vector<ReachEntry> reach_rc;    // reach views of visitor(), kept per radius
 
   // every neighbour within any radius rc of the positions of the last build (as NeighborListKK::visitor), with its
   // own reach per structure; n > 0
   BatchNeighborVisitor<DeviceType> visitor(double rc) const
   {
-    auto it = std::find_if(reach_rc.begin(), reach_rc.end(), [&](const auto &e) { return e.first == rc; });
-    if (it == reach_rc.end() || (int) it->second.extent(0) < nsys) {
+    auto it = std::find_if(reach_rc.begin(), reach_rc.end(), [&](const auto &e) { return e.rc == rc; });
+    if (it == reach_rc.end() || (int) it->r.extent(0) < nsys) {
       if (it != reach_rc.end()) reach_rc.erase(it);
-      reach_rc.emplace_back(rc, V3l("bnl:reach_rc", std::max(nsys, 1)));
+      reach_rc.push_back({rc, 0, V3l("bnl:reach_rc", std::max(nsys, 1))});
       it = reach_rc.end() - 1;
     }
-    const V3l r = it->second;
-    auto hr = Kokkos::create_mirror_view(r);
-    for (int s = 0; s < nsys; s++)
-      for (int k = 0; k < 3; k++) {
-        const size_t g = 3 * (size_t) s + k;
-        hr(s, k) = bin_reach(rc, grid_width[g], grid_nbin[g], grid_pbc[g]);
-      }
-    Kokkos::deep_copy(r, hr);
+    const V3l r = it->r;
+    if (it->gen != build_gen) {
+      auto hr = Kokkos::create_mirror_view(r);
+      for (int s = 0; s < nsys; s++)
+        for (int k = 0; k < 3; k++) {
+          const size_t g = 3 * (size_t) s + k;
+          hr(s, k) = bin_reach(rc, grid_width[g], grid_nbin[g], grid_pbc[g]);
+        }
+      Kokkos::deep_copy(r, hr);
+      it->gen = build_gen;
+    }
     return BatchNeighborVisitor<DeviceType>{perm, sys, b3, bin_start, base, xw, H, nbk, r, pp, rc * rc};
   }
 
@@ -405,6 +424,7 @@ template<class DeviceType> struct BatchNeighborListKK {
   {
     if (!(cutoff > 0.0) || !std::isfinite(cutoff)) throw Error("neighbour search: cutoff must be positive");
     if (nsys_ < 0) throw Error("neighbour search: negative number of structures");
+    ++build_gen;
     nsys = nsys_;
     n = (int) start[nsys];
     nb = 0;
@@ -449,7 +469,7 @@ template<class DeviceType> struct BatchNeighborListKK {
       const double *a = cell + 9 * (size_t) s;
       const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) +
                          a[2] * (a[3] * a[7] - a[4] * a[6]);
-      if (start[s + 1] > start[s] && !(std::abs(det) > 0.0)) throw Error("neighbour search needs a full-rank cell");
+      if (start[s + 1] > start[s] && !full_rank_cell(a, det)) throw Error("neighbour search needs a full-rank cell");
       const double d = std::abs(det) > 0.0 ? 1.0 / det : 0.0;
       double v[9] = {(a[4] * a[8] - a[5] * a[7]) * d, (a[2] * a[7] - a[1] * a[8]) * d, (a[1] * a[5] - a[2] * a[4]) * d,
                      (a[5] * a[6] - a[3] * a[8]) * d, (a[0] * a[8] - a[2] * a[6]) * d, (a[2] * a[3] - a[0] * a[5]) * d,
@@ -611,11 +631,22 @@ template<class DeviceType> struct BatchNeighborListKK {
     if (bins_only) return;
     const BatchNeighborVisitor<DeviceType> visit{pm, sy, bb, bs, base, x, H, nbk, reach, pp, cutoff * cutoff};
     auto cnt = nn;
-    Kokkos::parallel_for("bnl:count", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(const int q) {
+    int zero = 0;    // pairs at distance 0 (two atoms, or an atom and an image, at the same position): an error
+    Kokkos::parallel_reduce("bnl:count", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(const int q, int &z) {
       int64_t c = 0;
-      visit(q, [&](int, int, int, int) { c++; });
+      const int sq = sy(q);
+      visit(q, [&](int p, int s0, int s1, int s2) {
+        c++;
+        double d2 = 0.0;
+        for (int k = 0; k < 3; k++) {
+          const double d = x(p, k) + s0 * HH(sq, k) + s1 * HH(sq, 3 + k) + s2 * HH(sq, 6 + k) - x(q, k);
+          d2 += d * d;
+        }
+        if (d2 == 0.0) z++;
+      });
       cnt(q) = c;
-    });
+    }, zero);
+    if (zero) throw Error("neighbour search: two atoms at the same position (a bond of length 0): not a physical structure");
     auto off = offset;
     int64_t total = 0;
     Kokkos::parallel_scan("bnl:offset", Kokkos::RangePolicy<DeviceType>(0, n),

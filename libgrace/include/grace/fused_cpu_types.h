@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE (lammps-ace, feature/grace-fused); contributing author: Yury Lysogorskiy (ICAMS)
+// Contributing author: Yury Lysogorskiy (ICAMS)
 #ifndef GRACE_FUSED_CPU_TYPES_H
 #define GRACE_FUSED_CPU_TYPES_H
 
@@ -11,6 +11,9 @@
 #include <new>
 #include <type_traits>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace grace {
 namespace fused {
@@ -51,7 +54,7 @@ template<class T, class A = Align64<T>> class SpreadBuf {
   SpreadBuf(const SpreadBuf &) = delete;
   SpreadBuf &operator=(const SpreadBuf &) = delete;
   ~SpreadBuf() { release(); }
-  void assign(size_t m, T v)
+  void assign(size_t m, T v, int nthreads)
   {
     if (m != n) {
       release();
@@ -59,7 +62,10 @@ template<class T, class A = Align64<T>> class SpreadBuf {
       n = m;
     }
     T *q = p;
-#pragma omp parallel for schedule(static)
+#ifdef _OPENMP
+    const int nt = std::min(nthreads > 0 ? nthreads : omp_get_max_threads(), std::max(1, omp_get_num_procs()));
+#pragma omp parallel for schedule(static) num_threads(nt)
+#endif
     for (size_t i = 0; i < m; i++) q[i] = v;
   }
   void clear() { release(); }
@@ -152,7 +158,7 @@ struct ThreadForces {
     if (nthreads != nth || nmax_ > nmax) {
       nth = 0;    // committed after the allocation (a failed one leaves the next call to allocate again)
       nmax = 0;
-      buf.assign((size_t) nthreads * nmax_ * 3, 0.0);
+      buf.assign((size_t) nthreads * nmax_ * 3, 0.0, nthreads);
       nth = nthreads;
       nmax = nmax_;
     }
@@ -162,7 +168,10 @@ struct ThreadForces {
   {
     constexpr int CH = 512;
     const int nch = (nall + CH - 1) / CH;
-#pragma omp parallel for schedule(static)
+#ifdef _OPENMP
+    const int nt = std::min(std::max(1, nth), std::max(1, omp_get_num_procs()));
+#pragma omp parallel for schedule(static) num_threads(nt)
+#endif
     for (int c = 0; c < nch; c++) {
       const size_t q0 = (size_t) 3 * c * CH, q1 = (size_t) 3 * std::min(nall, (c + 1) * CH);
       for (int t = 0; t < nth; t++) {

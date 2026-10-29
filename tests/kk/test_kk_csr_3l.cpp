@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// The GRACE-3L Kokkos engine (Grace3LKK <float,double>, as the former LAMMPS grace/3l/kk/mixed) on CSR bonds with ghost images
+// The GRACE-3L Kokkos engine (Grace3LKK <float,double>) on CSR bonds with ghost images
 // and the layered owner <-> image exchange (ImageExchange3KK) against the LAMMPS GPU references
-// (tests/fixtures/ref_gpu/<cell>_3l_kk from ref_lammps_gpu.sh): energy, per-atom energy, forces, pressure; batch ==
+// (tests/fixtures/ref_gpu/<cell>_3l_kk): energy, per-atom energy, forces, pressure; batch ==
 // alone; isolated atom; another species set on the same engine (set_types) == a fresh engine, and back with the
-// saved type tables (use_type_tables) == the first run; a second model on the engine == a fresh engine.
+// saved type tables (use_type_tables) == the first run, also after a re-setup with other table intervals; a second
+// model on the engine == a fresh engine.
 //   env GRACE_TEST_FIXTURES (default tests/fixtures), GRACE_TEST_REF_DIR (default tests/fixtures/ref_gpu)
 #include "grace/kk/grace_3l_kk_impl.h"
 #include "grace/kk/traits.h"
@@ -49,6 +50,27 @@ void check_types(const std::shared_ptr<grace::GRACE3LModel> &m, const std::strin
   CHECK(std::fabs(rs.e - rf.e) / c.n <= 1e-6 && maxdf(rs, rf) <= 1e-5);
   CHECK(std::fabs(rb.e - r0.e) / c.n <= 1e-6 && maxdf(rb, r0) <= 1e-5);
   CHECK(std::fabs(rs.e - r0.e) / c.n > 1e-4);    // the swap is a different structure (7.6e-4 eV/atom)
+}
+
+// type tables kept across a re-setup with other table intervals: use_type_tables() brings the radial tables back
+// with the shape they were built with, not the one of the last setup
+void check_tables_after_resetup(const std::shared_ptr<grace::GRACE3LModel> &m, const std::string &fx)
+{
+  const Cell c = load_cell(fx + "/WMo54.npz");
+  E3 e;
+  e.set_model(m, type2mu_for(m->element_names));
+  e.setup();
+  const Result r0 = run(e, c);
+  const auto tt = e.type_tables();
+  CHECK(tt.spline_on == 1);
+  e.spline_n = 256;
+  e.setup();
+  CHECK(e.type_tables().spline_on == 1 && e.type_tables().spl_N[2] == 256 && tt.spl_N[2] != 256);    // another shape
+  e.use_type_tables(tt);
+  const Result rb = run(e, c);
+  std::printf("3L use_type_tables after a re-setup with spline_n 256 vs first: dE/n %.3e max|dF| %.3e\n",
+              std::fabs(rb.e - r0.e) / c.n, maxdf(rb, r0));
+  CHECK(std::fabs(rb.e - r0.e) / c.n <= 1e-6 && maxdf(rb, r0) <= 1e-5);
 }
 
 // without the global virial (its own force-scatter kernel): the same energy, forces and per-atom virials
@@ -105,6 +127,7 @@ int main(int argc, char **argv)
     check_engine(e, "3L kk", "3l_kk", tol_fp32, fx, rd);
   }
   check_types(m3, fx);
+  check_tables_after_resetup(m3, fx);
   check_no_global_virial(m3, fx);
   auto m3b = std::make_shared<grace::GRACE3LModel>();
   m3b->load(test_model("GRACE_TEST_M3B", "GRACE-3L-OMAT-large-ft-AM"));

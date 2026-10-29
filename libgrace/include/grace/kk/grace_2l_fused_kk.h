@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// GRACE-2L fused Kokkos engine (from the LAMMPS style grace/2l/fused/kk, lammps-ace feature/grace-runtime a6ba5104dd;
-// contributing author Yury Lysogorskiy, ICAMS): the base engine with fused bond, dense and reduction stages; bond
-// geometry in fp64, the network and the radial tables in fp32, energies / forces / virials accumulated in fp64 (KKA).
+// GRACE-2L fused Kokkos engine (contributing author Yury Lysogorskiy, ICAMS): the base engine with fused bond, dense
+// and reduction stages; bond geometry in fp64, the network and the radial tables in fp32, energies / forces / virials
+// accumulated in fp64 (KKA).
 #pragma once
 
 #include "grace/kk/grace_2l_kk.h"
@@ -34,6 +34,8 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   }
   int store_l1 = 1;                    // keep the L1 forward state per chunk (no recompute in the L1 backward)
   bool l1_kept = true;                 // chunksize auto: store_l1 fits the GPU memory budget next to the chunk
+  bool l1_fits = true;                 // fixed chunksize: store_l1 fits 70 % of the free GPU memory (begin_L1_chunk)
+  int l1_nofit_nch = 0;                // chunks of the run for which it did not fit (decided once per chunk count)
   int no_shape = 0;                    // 'noshape': force the generic CG-product kernels
   int spline_n = 1024;                 // cubic-Hermite intervals on x in [0, 1] ('spline' keyword)
 
@@ -93,7 +95,8 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   grace::kk::View64<V2<F>> d_IT, d_gIT;    // message I and dE/dI (neighbour-contiguous rows, see L2Path)
   grace::kk::View64<V2<F>> d_ITn;      // HIP matrix-core kernels: the message as [nall][niq n + I]
   V2<double> d_vir;                    // [inum, 6] per-atom global-virial partials (bond kernels)
-  V2<int> d_cnb;                       // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+  grace::kk::View64<V2<int>> d_cnb;    // GPU: the run's bonds per local atom (compact_bonds), [inum][maxneigh]
+                                       // (View64: more than 2^31 entries from 33.5M atoms x 64 neighbours)
   V1<int> d_cnum;                      //      and their number, [inum]
   bool bonds_ready = false;            // GPU: d_cnb / d_cnum built for the current run (begin_run .. end of run)
   bool a_mfma = false, bwd_wave = false;    // layer-1 basis on the matrix cores (HIP), wave-per-atom L1 backward
@@ -136,9 +139,9 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   // the bonds the bond kernels read (BondList, fused_hip_bonds.h): on a GPU the run's compact list
   auto bond_list() const
   {
-    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("grace/2l/fused/kk: bond kernel without the run's bond list");
+    if (is_gpu_v<DeviceType> && !bonds_ready) GRACE_KK_ERROR("GRACE-2L/KK: bond kernel without the run's bond list");
     return GraceFusedKK::BondList<Traits, is_gpu_v<DeviceType>, decltype(this->d_neighbors), decltype(this->d_numneigh),
-                                  V2<int>, V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
+                                  decltype(d_cnb), V1<int>>{this->d_neighbors, this->d_numneigh, d_cnb, d_cnum};
   }
   void stage_L1_bond() override;
   void stage_L1_bond_recompute() override;
@@ -154,7 +157,7 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
             M::memory_usage(this->d_AA2) + M::memory_usage(this->d_rho)) / (double) this->d_A.extent(0);
   }
   bool need_L1_recompute() override;
-  bool l1_store_on() const { return store_l1 && (this->chunksize >= 0 || l1_kept); }
+  bool l1_store_on() const { return store_l1 && (this->chunksize >= 0 ? l1_fits : l1_kept); }
   void use_kept(bool on) override
   {
     l1_kept = on;
@@ -165,7 +168,7 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   template<int NO> void fc_bwd(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   template<int NO> void fc_fwd4(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   bool fc_forward_own(typename Base::FCLayer, const t_nn3 &, const t_nn3 &, const t_nn3 &) override;
-  bool uses_cublas_ops() const override { return false; }
+  bool uses_blas_ops() const override { return false; }
   void stage_rev_fc_AA2() override;
   void stage_rev_fc_AA1() override;
   void stage_rev_fc_A1() override;
@@ -211,3 +214,10 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
 
 }    // namespace kk
 }    // namespace grace
+
+// The GRACE-2L engine a consumer (LAMMPS) instantiates explicitly, naming only the device and the traits: this
+// declaration in its headers, GRACE_KK_INSTANTIATE_2L (grace/kk/grace_2l_fused_kk_impl.h) in one translation unit.
+// At global scope, as a statement: GRACE_KK_EXTERN_2L(Device, Traits);
+#define GRACE_KK_EXTERN_2L(Device, Traits)                                    \
+  extern template class grace::kk::Grace2LKK<Device, float, float, Traits>; \
+  extern template class grace::kk::Grace2LFusedKK<Device, Traits>

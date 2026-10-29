@@ -2,7 +2,7 @@
 // Large systems on the fused Kokkos engines (1L, 2L, 3L as the Python module and LAMMPS run them): W54 (bcc W) copied
 // 2^k times, each copy its own periodic cell with its own images, so every copy must give the result of W54 alone.
 // Per-atom energies and forces of all copies against one W54 run catch an index that wraps at large nall (local atoms
-// + images): GRACE-3L exchanges 3200 floats per atom (nall x 3200 > 2^31 from nall 671089, issue #1).
+// + images): GRACE-3L exchanges 3200 floats per atom (nall x 3200 > 2^31 from nall 671089).
 //   env GRACE_TEST_LARGE_K: copies 2^k (default 4; 11: 110592 atoms, nall 860160, about 40 GB with GRACE-3L)
 //       GRACE_TEST_LARGE_MODELS: engines to run, default "123"
 //       GRACE_TEST_LARGE_CHUNK: chunksize of the engines (default auto)

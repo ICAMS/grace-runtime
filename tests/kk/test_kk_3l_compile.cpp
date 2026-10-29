@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// The GRACE-3L Kokkos engine builds without LAMMPS (<float,float>, the base of the fused engine of grace/3l/fused/kk;
+// The GRACE-3L Kokkos engine builds without LAMMPS (<float,float>, the base of the fused engine of grace/runtime/kk;
 // <float,double>, fp64 geometry, the reference of the fp32 tests below), sets a model up on the default device, reports the message widths of the two
 // layered exchanges as LAMMPS used them (comm_forward / comm_reverse) and refuses run() before setup(). Smoke run on
 // the W54 / WMo54 fixture cells (CSR bonds with ghost images, a layered owner <-> image exchange): finite energy,
-// the CPU grace/3l/fused reference (tests/fixtures/ref) within fp32 parity, chunksize 16 == one chunk.
+// the CPU grace/runtime reference (tests/fixtures/ref) within fp32 parity, chunksize 16 == one chunk.
 //   env GRACE_TEST_FIXTURES (default tests/fixtures), GRACE_TEST_REF_DIR (default tests/fixtures/ref)
 #include "grace/kk/csr_images.h"
 #include "grace/kk/grace_3l_kk_impl.h"
@@ -26,7 +26,8 @@ using T = grace::kk::DefaultTraits<Dev>;
 using E3 = grace::kk::Grace3LKK<Dev, float, double, T>;
 using E3F = grace::kk::Grace3LKK<Dev, float, float, T>;
 template class grace::kk::Grace3LKK<Dev, float, double, T>;
-template class grace::kk::Grace3LKK<Dev, float, float, T>;
+GRACE_KK_EXTERN_3L(Dev, T);         // as LAMMPS does: declared in its header,
+GRACE_KK_INSTANTIATE_3L(Dev, T);    // defined in one translation unit
 
 namespace {
 template<class E> void check_engine(const std::shared_ptr<grace::GRACE3LModel> &m)
@@ -44,11 +45,12 @@ template<class E> void check_engine(const std::shared_ptr<grace::GRACE3LModel> &
     CHECK(thrown);
     if (k == 0) e.set_model(m, type2mu);
   }
+  // GRACE-3L-OMAT-large: eq1_norm 64 x 25 (layer 0), eq2_norm 64 x 50 (layer 1); valid before setup(): callers size
+  // their comm buffers with it
+  CHECK(e.comm_width(0) == 1600 && e.comm_width(1) == 3200);
   e.setup();
+  CHECK(e.comm_width(0) == 1600 && e.comm_width(1) == 3200);
   CHECK(e.cutoff(0, 0) > 4.0);
-  // GRACE-3L-OMAT-large: eq1_norm 64 x 25 (layer 0), eq2_norm 64 x 50 (layer 1)
-  CHECK(e.comm_width(0) == 1600);
-  CHECK(e.comm_width(1) == 3200);
   CHECK(e.uq_available() == m->has_uq);
 }
 
