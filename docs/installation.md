@@ -2,9 +2,6 @@
 
 [Manual](index.md) · [GPU requirements](backends.md)
 
-**Runtime packages are not yet released on PyPI; current packages are placeholders.**
-The package commands below apply once published. For now, use [source installation](#cpu-from-source).
-
 ## Python environment
 
 We recommend [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
