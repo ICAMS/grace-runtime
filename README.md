@@ -9,8 +9,7 @@ PACE (ACE) potentials fitted with pacemaker run from their `.yaml` ([PACE models
 
 ## Install
 
-**Runtime packages are not yet released on PyPI; current packages are placeholders.**
-For now, [install from source](docs/installation.md#cpu-from-source). Once published, choose one package:
+Install one package from PyPI ([source builds](docs/installation.md#cpu-from-source) for other targets):
 
 | Backend | Install |
 | --- | --- |
