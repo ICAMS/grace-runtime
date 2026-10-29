@@ -234,3 +234,44 @@ def test_cli_relax(tmp_path):
     assert cli.main(["relax", str(M1), str(src), "-o", str(src), "--device", "cpu"]) == 2    # would empty the input
     assert len(read(src, ":")) == 2
     assert cli.main(["relax", str(M1), str(src), "-o", str(dst), "--device", "cpu", "--max-steps", "2"]) == 1
+
+
+@needs_model
+def test_relax_pool_overhead_guards(model, monkeypatch):
+    from grace_runtime import relax as rx
+    ats = cells()[:2]
+    fire = {"dt": 0.1, "a": 0.1}
+
+    # Fixed-cell _CPUForces never calls Atoms.set_cell per step; variable-cell does
+    p_fix = rx._Pool(False)
+    p_fix.add([(0, ats[0], np.zeros(len(ats[0]), bool), 1.0, None)], fire)
+    cpu = rx._CPUForces(model, 1, None)
+    cpu(p_fix, *p_fix.geometry())
+    _, eng_at = cpu.engines[0]
+    set_cell_calls = []
+    orig_set_cell = eng_at.set_cell
+    monkeypatch.setattr(eng_at, "set_cell", lambda *a, **kw: (set_cell_calls.append(1), orig_set_cell(*a, **kw))[1])
+    cpu(p_fix, *p_fix.geometry())
+    assert len(set_cell_calls) == 0
+    p_fix.filt = True
+    cpu(p_fix, *p_fix.geometry())
+    assert len(set_cell_calls) == 1
+
+    # _GPUForces caches _types across steps while the pool index (pool.starts) is unchanged and refreshes on pool changes
+    seen = []
+    monkeypatch.setattr(rx, "_gpu_batch", lambda *a, **kw: "batch")
+
+    def fake_gpu_compute(b, species, natoms, numbers, pos, cell, pbc, **kw):
+        seen.append((kw.get("starts"), kw.get("types")))
+        return {"energy": np.zeros(len(natoms)), "forces": np.zeros_like(pos), "virial": np.zeros((len(natoms), 6))}
+
+    monkeypatch.setattr(rx, "_gpu_compute", fake_gpu_compute)
+    p_gpu = rx._Pool(False)
+    p_gpu.add([(k, at, np.zeros(len(at), bool), 1.0, None) for k, at in enumerate(ats)], fire)
+    gpu = rx._GPUForces(None, None, ["Mo", "W"], -1, 0, None)
+    gpu(p_gpu, *p_gpu.geometry())
+    gpu(p_gpu, *p_gpu.geometry())
+    assert seen[0][0] is p_gpu.starts and seen[0][1] is seen[1][1]
+    p_gpu.keep(np.array([True, False]))
+    gpu(p_gpu, *p_gpu.geometry())
+    assert seen[2][0] is p_gpu.starts and seen[2][1] is not seen[1][1] and len(seen[2][1]) == len(ats[0])

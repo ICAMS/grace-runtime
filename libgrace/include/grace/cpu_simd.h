@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Ported from lammps-ace feature/grace-fused src/ML-PACE/grace_cpu_simd.h (26c83c526a).
 //   64-byte vectors (16 floats / 8 doubles) of the CPU GRACE kernels. With AVX-512 they are GCC / Clang vector
 //   types, one register each. On narrower ISAs GCC keeps arrays of 64-byte vector types (the register tiles of the
 //   kernels) on the stack and every operation round-trips memory (4-5x slower kernels with AVX2 on Zen 2, 3x with
@@ -171,7 +170,7 @@ inline void store(double *p, const d8 v) { store_parts(p, v); }
 #endif
 
 // one hardware register of floats: a kernel whose register tile of f16 values would spill on the narrower ISAs
-// runs there in lane groups of NF floats (ported from lammps-ace 72299ce02c, GRACE-3L SPBF tiles)
+// runs there in lane groups of NF floats (GRACE-3L SPBF tiles)
 #if defined(__AVX512F__)
 typedef f16 fn;
 #elif defined(__AVX__)
@@ -184,7 +183,7 @@ inline fn loadn(const float *p) { fn v; std::memcpy(&v, p, sizeof(v)); return v;
 inline void storen(float *p, const fn v) { std::memcpy(p, &v, sizeof(v)); }
 
 // the wider x86 vector extension this CPU supports but the code was compiled without, or nullptr
-// (ported from lammps-ace ef190b09fb; the LAMMPS glue warns with it)
+// (the LAMMPS glue warns with it)
 inline const char *isa_hint()
 {
 #if defined(__x86_64__) || defined(__i386__)

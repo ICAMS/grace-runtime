@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_3l_model.h (feature/grace-runtime a73b8b17ee); contributing author:
-// Yury Lysogorskiy (ICAMS). GRACE-3L model container (kokkos.npz weights), shared by grace/3l/fused/kk and grace/3l/fused.
+// Contributing author: Yury Lysogorskiy (ICAMS). GRACE-3L model container (kokkos.npz weights), shared by the CPU and
+// Kokkos GRACE-3L engines.
 #ifndef GRACE_MODEL_3L_H
 #define GRACE_MODEL_3L_H
 
@@ -19,10 +19,10 @@ struct NpyArray;
 // ============================================================================
 // GRACE3LModel: Host-side weight container loaded from .npz file.
 //
-// Holds EVERY weight tensor grace_3l_weights.npz carries (exporter
-// kokkos_export_3l.py), stored RAW (float64 on host) exactly as written.
+// Holds EVERY weight tensor grace_3l_weights.npz carries (the tensorpotential
+// kokkos.npz export), stored RAW (float64 on host) exactly as written.
 // copy_weights_to_device() casts these into the NNScalar/GeomScalar device
-// views. The forward/backward kernels (Tasks 2.3-3.4) consume the device
+// views. The forward/backward kernels consume the device
 // layout; this struct is the CPU staging area + the name/index directory.
 //
 // NORM CONVENTION (PINNED, applied exactly ONCE downstream): every Linear-like

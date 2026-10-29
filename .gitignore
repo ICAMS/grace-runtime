@@ -10,3 +10,4 @@ dist/
 .micromamba/
 .mm/
 .grace-cache/
+.worktrees/

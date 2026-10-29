@@ -166,9 +166,11 @@ def test_energy_only_as_full(model):
     at = wmo54()
     at.rattle(0.03, seed=8)
     full = at.copy()
-    full.calc = gpu(model, energy_only=False)
-    e_full, f_full = full.get_potential_energy(), full.get_forces()
-    at.calc = gpu(model)
+    full.calc = gpu(model)
+    e_full = full.get_potential_energy()
+    assert "forces" in full.calc.results and "stress" in full.calc.results
+    f_full = full.get_forces()
+    at.calc = gpu(model, energy_only=True)
     e = at.get_potential_energy()
     assert "forces" not in at.calc.results
     assert abs(e - e_full) / len(at) <= 2e-6
@@ -216,3 +218,18 @@ def test_model_spline_reaches_the_gpu():
         setups[n] = calculator._KK_MODELS[m[n].path].engine_setups
     assert setups[512] == setups[1024] + 2, setups    # before the fix: the 1024 engines again, no new setup
     assert np.abs(f[512] - f[1024]).max() <= 1e-4
+
+
+@pytest.mark.parametrize("model", [M1, M2, M3], ids=["1l", "2l", "3l"])
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+def test_coincident_atoms_are_an_error(device, model):
+    """two atoms at the same position (a bond of length 0) are not a physical structure: a ValueError on the CPU and
+    the GPU, not a finite or NaN energy"""
+    if not model.exists():
+        pytest.skip(f"{model.parent.name} not in the test cache")
+    from ase import Atoms
+    at = Atoms("W3", positions=[(0, 0, 0), (0, 0, 0), (2.5, 0, 0)], cell=[12, 12, 12], pbc=True)
+    at.calc = GRACERuntimeCalculator(str(model), device=GPU if device == "gpu" else "cpu")
+    with pytest.raises(ValueError, match="same position"):
+        at.get_potential_energy()
+

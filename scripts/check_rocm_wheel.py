@@ -5,8 +5,7 @@ grace_runtime.backends entry point; it bundles no ROCm library (the HIP runtime 
 hipBLAS, rocSOLVER and their Tensile kernels never: rocBLAS is loaded at run time) and no other library than libgomp;
 the modules need libamdhip64.so.6 and no BLAS library (DT_NEEDED), carry no absolute RUNPATH and export only
 PyInit_*; its glibc symbol versions (auditwheel) allow the platform tag (default manylinux_2_28_x86_64; '-': no platform
-checks). Prints the size. Exit status 1
-on a failed check."""
+checks), and the file name carries that tag alone. Prints the size. Exit status 1 on a failed check."""
 import re
 import subprocess
 import sys
@@ -88,8 +87,8 @@ if plat.startswith("manylinux"):    # '-': no platform checks (a wheel for this 
         re.search(r'consistent with the following platform tag:\s*"([^"]+)"', show.stdout)
     if not m or not glibc(m.group(1)) or glibc(m.group(1)) > glibc(plat):
         bad.append(f"auditwheel: not {plat} compatible:\n" + show.stdout[-800:] + show.stderr[-400:])
-    if plat not in wheel.name:
-        bad.append(f"platform tag of {wheel.name} is not {plat}")
+    if not wheel.name.endswith(f"-{plat}.whl"):
+        bad.append(f"platform tag of {wheel.name} is not {plat} alone")
 print(f"{wheel.name}: {wheel.stat().st_size / 2**20:.1f} MB, bundled libs: "
       f"{', '.join(n.rsplit('/', 1)[-1] for n in libs) or 'none'}")
 for b in bad:

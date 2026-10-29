@@ -90,6 +90,24 @@ assert f0 - f1 > 0.5, ("16k atoms took (GB)", f0 - f1)
 assert not kept(l0, l2) and not kept(l0, l3), ("kept after free_gpu_memory (MB)", kept(l0, l2), kept(l0, l3))
 assert abs(e2 - e1) < 1e-6 * len(at) and np.abs(fr2 - fr1).max() < 1e-5, (e2 - e1, np.abs(fr2 - fr1).max())
 """,
+    # calculators that are only garbage (in a reference cycle, e.g. after `del atoms`) go with free_gpu_memory(), and
+    # with them their GPU models: a new calculator of the same file after each free does not add a copy of the weights
+    # (before: free_gpu_memory()'s own list of the live calculators kept them past its gc.collect())
+    "free_drops_dead_calculators": """
+from grace_runtime.calculator import _KK_CALCS
+kk._debug_track_alloc(True)
+w = []
+for r in range(3):
+    at = base.copy()
+    at.calc = GRACERuntimeCalculator("{M3}", device=GPU)
+    at.get_forces()
+    del at
+    grace_runtime.free_gpu_memory()
+    w.append(sum(b for name, b in kk._debug_live_alloc() if name.startswith("g3l:reduce_W")))
+    print("ROUND", r, len(_KK_CALCS), w[-1] / 2**20)
+    assert len(_KK_CALCS) == 0, ("calculators alive after free_gpu_memory()", len(_KK_CALCS))
+assert w[0] == w[1] == w[2] == 0, ("reduce weights live after free_gpu_memory() (bytes)", w)
+""",
     # a 16k-atom 3L System: host memory grows by the neighbour list and outputs, not by ~38 KB per atom + image
     "no_host_rows_3l": """
 c = GRACERuntimeCalculator("{M3}", device=GPU)

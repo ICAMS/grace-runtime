@@ -202,3 +202,64 @@ def test_notice_reaches_stderr_despite_warning_filters():
     r = subprocess.run([sys.executable, "-c", code], env=dict(env, GRACE_RUNTIME_QUIET="1"), capture_output=True,
                        text=True, timeout=120)
     assert "XYZ" not in r.stderr, r.stderr
+
+
+def test_cublas_floor():
+    """12.0 in general, 12.8 from compute capability 10.0 on (Blackwell)"""
+    assert [_cuda.cublas_floor(c) for c in (7, 8, 9, 10, 12)] == [(12, 0)] * 3 + [(12, 8)] * 2
+
+
+def test_cublas_off(monkeypatch):
+    """GRACE_RUNTIME_NO_CUBLAS=1: no cuBLAS, whatever is installed"""
+    monkeypatch.setenv("GRACE_RUNTIME_NO_CUBLAS", "1")
+    assert _cuda.cublas_library() == {"why": "off (GRACE_RUNTIME_NO_CUBLAS)"}
+
+
+def test_cublas_below_the_floor_warns(monkeypatch):
+    """a cuBLAS older than the device's floor is named, with the floor; at or above it nothing is said"""
+    import warnings
+    monkeypatch.setattr(_cuda, "cublas_library", lambda: {"path": "/opt/cuda/lib64/libcublas.so.12.4.5.8",
+                                                          "version": (12, 4, 5), "source": "system"})
+    with pytest.warns(RuntimeWarning, match=r"cuBLAS 12\.4\.5 \(/opt/cuda/.*older than 12\.8.*built-in Kokkos GEMMs"):
+        _cuda._cublas_notice(12)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _cuda._cublas_notice(8)
+
+
+@pytest.mark.parametrize("system", [True, False])
+def test_cublas_wheel_that_does_not_load_warns(monkeypatch, system):
+    """the installed wheel's library does not load: a warning with the reason, then the system cuBLAS or the built-in
+    GEMMs"""
+    c = {"broken": "nvidia-cublas-cu12 (/x/libcublas.so.12) does not load: bad ELF"}
+    c.update({"path": "/usr/lib/libcublas.so.12", "version": (12, 8, 4), "source": "system"} if system else
+             {"why": "no libcublas.so.12"})
+    monkeypatch.setattr(_cuda, "cublas_library", lambda: c)
+    want = "system cuBLAS /usr/lib/libcublas.so.12 is used instead" if system else "built-in Kokkos GEMMs"
+    with pytest.warns(RuntimeWarning, match=r"bad ELF; the " + want):
+        _cuda._cublas_notice(8)
+
+
+def test_cublas_wheel_that_does_not_load_is_reported(tmp_path, monkeypatch):
+    """an installed nvidia-cublas-cu12 whose library does not load: "broken" names it, and the lookup goes on to the
+    loader path (a system cuBLAS or none)"""
+    import types
+    (tmp_path / "lib").mkdir()
+    for name in ("libcublas.so.12", "libcublasLt.so.12"):
+        (tmp_path / "lib" / name).write_bytes(b"not an ELF file")
+    pkg = types.ModuleType("nvidia.cublas")
+    pkg.__path__ = [str(tmp_path)]
+    monkeypatch.setitem(sys.modules, "nvidia.cublas", pkg)
+    monkeypatch.delenv("GRACE_RUNTIME_NO_CUBLAS", raising=False)
+    c = _cuda.cublas_library()
+    assert str(tmp_path / "lib" / "libcublas.so.12") in c["broken"]
+    assert c.get("source", "system") == "system" and ("version" in c) != ("why" in c), c
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the CUDA plugin is Linux-only")
+def test_library_file_names_the_loaded_file():
+    """dladdr: the file a loaded function comes from"""
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"))
+    assert "libc" in os.path.basename(_cuda._library_file(libc.printf))

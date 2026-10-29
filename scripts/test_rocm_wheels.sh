@@ -27,7 +27,7 @@ P="$W/venv/bin/python"
 # the two packages from the wheelhouses only (on dev the CPU package has the version of a release on PyPI), then
 # their dependencies and pytest from PyPI
 "$P" -m pip install -q --no-index --no-deps --find-links "$CPU_WH" --find-links "$GPU_WH" grace-runtime \
-  grace-runtime-rocm6 && "$P" -m pip install -q --find-links "$CPU_WH" --find-links "$GPU_WH" grace-runtime-rocm6 pytest
+  grace-runtime-rocm6 && "$P" -m pip install -q --find-links "$CPU_WH" --find-links "$GPU_WH" grace-runtime-rocm6 pytest pyyaml
 check $? "install wheels"
 "$P" -m pip list 2>/dev/null | grep -E "^grace-runtime"
 mkdir -p "$W/python" "$W/tests"

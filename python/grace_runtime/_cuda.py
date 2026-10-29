@@ -63,24 +63,85 @@ def compute_capability(index: int) -> tuple:
     return major.value, minor.value
 
 
-def _preload_cublas():
-    """libcublas of the nvidia-cublas-cu12 wheel (when installed) into the process, so that the modules' run-time
-    dlopen("libcublas.so.12") finds it (UQ projections); without it they use hand-written kernels"""
+def cublas_floor(cc_major: int) -> tuple:
+    """the oldest cuBLAS (major, minor) the GPU modules use on a device of compute capability cc_major.x: 12.0 (any
+    libcublas.so.12; nvidia-cublas-cu12 12.0.2 to 12.9 pass the GPU tests on an sm86 card), 12.8 from compute capability
+    10.0 on (Blackwell: the first cuBLAS with Blackwell kernels, per NVIDIA's CUDA 12.8 release notes; not measured).
+    The modules apply the same rule (grace/kk/cublas_guard.h)."""
+    return (12, 8) if cc_major >= 10 else (12, 0)
+
+
+class _DlInfo(ctypes.Structure):
+    _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p),
+                ("saddr", ctypes.c_void_p)]
+
+
+def _library_file(fn) -> str | None:
+    """the file a loaded function comes from (dladdr)"""
+    info = _DlInfo()
+    for lib in (None, "libdl.so.2"):    # dladdr: libc since glibc 2.34, libdl before
+        try:
+            dladdr = ctypes.CDLL(lib).dladdr
+        except (OSError, AttributeError):
+            continue
+        if dladdr(ctypes.cast(fn, ctypes.c_void_p), ctypes.byref(info)) and info.fname:
+            return os.path.realpath(info.fname.decode())
+    return None
+
+
+def cublas_library() -> dict:
+    """the cuBLAS the GPU modules use for the dense GEMMs, loaded into the process here, in this order: an installed
+    nvidia-cublas-cu12 wheel (the [cublas] extra, or one another package installed; loaded RTLD_GLOBAL by its path, so
+    the modules' dlopen of the soname libcublas.so.12 takes that copy), a system libcublas.so.12 on the loader path
+    (ldconfig, LD_LIBRARY_PATH, a CUDA toolkit module), none: the built-in Kokkos GEMMs. The library is then looked up
+    by its soname, as the modules do, so a libcublas.so.12 loaded earlier by another package is the one reported.
+    {"path", "version": (major, minor, patch), "source": "wheel" or "system"}, or {"why": ...} without one
+    (GRACE_RUNTIME_NO_CUBLAS=1, none found, version unreadable); "broken": why the installed wheel's library did not
+    load. The modules skip a cuBLAS below cublas_floor of the device."""
     off = os.environ.get("GRACE_RUNTIME_NO_CUBLAS", "")
     if off and off != "0":
-        return
+        return {"why": "off (GRACE_RUNTIME_NO_CUBLAS)"}
+    wheel, broken = None, {}
     try:
-        import nvidia.cublas
+        dirs = [Path(d) / "lib" for d in importlib.import_module("nvidia.cublas").__path__]
     except ImportError:
-        return
-    for d in nvidia.cublas.__path__:
-        for name in ("libcublasLt.so.12", "libcublas.so.12"):
-            p = Path(d) / "lib" / name
-            if p.exists():
-                try:
-                    ctypes.CDLL(str(p), mode=ctypes.RTLD_GLOBAL)
-                except OSError:
-                    pass
+        dirs = []
+    for d in dirs:
+        if (d / "libcublas.so.12").exists():
+            try:    # libcublasLt first: libcublas needs it, and this copy is the one of the same wheel
+                ctypes.CDLL(str(d / "libcublasLt.so.12"), mode=ctypes.RTLD_GLOBAL)
+                ctypes.CDLL(str(d / "libcublas.so.12"), mode=ctypes.RTLD_GLOBAL)
+                wheel = os.path.realpath(d)
+            except OSError as e:
+                broken = {"broken": f"nvidia-cublas-cu12 ({d / 'libcublas.so.12'}) does not load: {e}"}
+            break
+    try:    # by soname, as the modules' dlopen: the copy already in the process, else the loader path's
+        lib = ctypes.CDLL("libcublas.so.12")
+    except OSError as e:
+        return {"why": f"no usable libcublas.so.12 (neither nvidia-cublas-cu12 nor a CUDA 12 toolkit: {e})", **broken}
+    v = [ctypes.c_int() for _ in range(3)]
+    if any(lib.cublasGetProperty(i, ctypes.byref(x)) != 0 for i, x in enumerate(v)):    # MAJOR, MINOR, PATCH_LEVEL
+        return {"why": "cublasGetProperty failed", **broken}
+    path = _library_file(lib.cublasGetProperty) or "libcublas.so.12 (file unknown)"
+    source = "wheel" if wheel and path.startswith(wheel + os.sep) else "system"
+    return {"path": path, "version": tuple(x.value for x in v), "source": source, **broken}
+
+
+def _cublas_notice(cc_major: int):
+    """notices (fallbacks) when cuBLAS is not used as installed: the wheel's library does not load, or the cuBLAS found
+    is below the floor of this device (cublas_floor; the modules then run the built-in Kokkos GEMMs)"""
+    c = cublas_library()
+    if "broken" in c:
+        notice(c["broken"] + (f"; the system cuBLAS {c['path']} is used instead" if "path" in c else
+                              "; the built-in Kokkos GEMMs run instead"), stacklevel=6)
+    f = cublas_floor(cc_major)
+    if "version" in c and c["version"][:2] < f:
+        fix = (f"pip install -U 'nvidia-cublas-cu12>={f[0]}.{f[1]}'" if c["source"] == "wheel" else
+               f"pip install 'grace-runtime-cuda12[cublas]'")
+        notice(f"cuBLAS {'.'.join(map(str, c['version']))} ({c['path']}) is older than {f[0]}.{f[1]}, which this GPU "
+               f"(compute capability {cc_major}.x) needs: the built-in Kokkos GEMMs run instead. {fix} for a current "
+               f"cuBLAS, or set GRACE_RUNTIME_NO_CUBLAS=1 to choose the built-in GEMMs without this notice",
+               stacklevel=6)
 
 
 def _archs_in(directory):
@@ -179,7 +240,6 @@ def select(index: int) -> tuple:
 def module_for(index: int):
     """The GPU module for CUDA device `index` (select())."""
     arch, _ = select(index)
-    _preload_cublas()
     return importlib.import_module(available()[arch])
 
 
@@ -190,7 +250,7 @@ def start(index: int):
     if ptx and strict():
         raise ImportError(f"GRACE_RUNTIME_STRICT=1: {arch} on cuda:{index} would run as PTX (no native module)")
     major, minor = compute_capability(index)
-    _preload_cublas()
+    _cublas_notice(major)
     mod = importlib.import_module(available()[arch])
     if ptx:
         cache = os.environ.get("CUDA_CACHE_PATH") or "~/.nv/ComputeCache"

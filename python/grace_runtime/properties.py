@@ -57,15 +57,19 @@ def eos_batch(model, structures, num_of_point: int = 11, volume_range=0.1, relax
               fit_order: int = 5, fmax: float = 0.005, max_steps: int = 500, device: str = "auto", **kwargs) -> list:
     """Energy-volume curve and its fit for each structure (as amstools MurnaghanCalculator).
 
-    model: path to a kokkos.npz, a registry name or a grace_runtime.Model. structures: ASE Atoms with rank-3 cells.
-    num_of_point: volumes per structure, from V0 (1 - volume_range) to V0 (1 + volume_range), or from volume_range[0]
-        to volume_range[1] (A^3) for a pair (structures with the same number of atoms); cells scaled isotropically
-        with the atoms.
-    relax: "none" (one compute_batch), "atoms" (positions at fixed cell) or "atoms+shape" (positions and cell shape at
-        fixed volume, the Frechet cell filter with constant_volume); fmax (eV/A) and max_steps for the relaxation.
-    fit: "poly" (amstools: polynomial of fit_order; the lowest minimum within the volumes; B = V E'', B' = -(V E''' /
-        E'' + 1)) or an ase.eos type: "murnaghan", "birch", "birchmurnaghan", "pouriertarantola", "vinet".
-    device and other keyword arguments (e.g. dispersion="d3-pbe"): to compute_batch (relax "none") or relax_batch.
+    model: path to a kokkos.npz, a registry name, a PACE .yaml or a grace_runtime.Model.
+    structures: ASE Atoms with rank-3 cells.
+    num_of_point, volume_range: volumes per structure, from V0 (1 - volume_range) to V0 (1 + volume_range), or from
+        volume_range[0] to volume_range[1] (A^3) for a pair (structures with the same number of atoms); cells scaled
+        isotropically with the atoms.
+    relax, fmax, max_steps: "none" (one compute_batch), "atoms" (positions at fixed cell) or "atoms+shape" (positions
+        and cell shape at fixed volume, the Frechet cell filter with constant_volume); fmax (eV/A) and max_steps for
+        the relaxation.
+    fit, fit_order: "poly" (amstools: polynomial of fit_order; the lowest minimum within the volumes; B = V E'',
+        B' = -(V E''' / E'' + 1)) or an ase.eos type: "murnaghan", "birch", "birchmurnaghan", "pouriertarantola",
+        "vinet".
+    device: as compute_batch; other keyword arguments (e.g. dispersion="d3-pbe") are forwarded to compute_batch
+        (relax "none") or relax_batch.
 
     Returns one dict per structure, the points in volume order: "volume" (A^3), "energy" (eV), "pressure" (eV/A^3),
     "equilibrium_volume", "equilibrium_energy", "equilibrium_bulk_modulus" (GPa), "equilibrium_b_prime", "energy_rms"
@@ -82,10 +86,13 @@ def eos_batch(model, structures, num_of_point: int = 11, volume_range=0.1, relax
                                                                                  if fit == "poly" else ""))
     structures = list(structures)
     _full_rank(structures, "eos_batch")
-    if np.ndim(volume_range) == 0:
-        lo, hi = 1 - volume_range, 1 + volume_range
-    else:
-        lo, hi = sorted(volume_range)
+    vr = np.asarray(volume_range, dtype=np.float64)
+    lo, hi = (1.0 - vr, 1.0 + vr) if vr.ndim == 0 else np.sort(vr) if vr.shape == (2,) else (np.nan, np.nan)
+    lo, hi = float(lo), float(hi)
+    if not (np.isfinite([lo, hi]).all() and 0.0 < lo < hi):    # a fraction: 0 < volume_range < 1
+        raise ValueError(f"volume_range must be a fraction in (0, 1) or a pair of two different positive volumes, got "
+                         f"{volume_range!r}")
+    if vr.ndim:
         if len({len(at) for at in structures}) > 1:
             raise ValueError("eos_batch: a volume pair needs structures with the same number of atoms (or a fraction)")
     scaled = []
@@ -158,22 +165,29 @@ def elastic_batch(model, structures, num_of_point: int = 5, eps_range: float = 0
                   fmax: float = 1e-3, max_steps: int = 500, device: str = "auto", **kwargs) -> list:
     """Elastic constants of each structure from stress against strain (the full 6x6 matrix, any crystal system).
 
-    model: as eos_batch. structures: ASE Atoms with relaxed rank-3 cells (e.g. relax_batch(cell_filter="frechet")
-    first; a residual stress shifts the stresses, not their slope).
-    num_of_point: strains per Voigt direction in [-eps_range, eps_range] (the unstrained cell computed once); column j
-        of C is the slope of a linear least-squares fit of the stress (ASE Voigt) against strain j.
-    relax_atoms: the atoms relaxed at each strained cell (relax_batch, fmax eV/A, max_steps; internal relaxation), or
-        clamped (one compute_batch). Small strains need a tight fmax: the error of C goes as residual force / strain.
-    device and other keyword arguments (e.g. dispersion="d3-pbe"): to relax_batch (relax_atoms) or compute_batch.
+    model: as eos_batch.
+    structures: ASE Atoms with relaxed rank-3 cells (e.g. relax_batch(cell_filter="frechet") first; a residual stress
+        shifts the stresses, not their slope).
+    num_of_point, eps_range: strains per Voigt direction in [-eps_range, eps_range] (the unstrained cell computed
+        once); column j of C is the slope of a linear least-squares fit of the stress (ASE Voigt) against strain j.
+    relax_atoms, fmax, max_steps: the atoms relaxed at each strained cell (relax_batch, fmax eV/A, max_steps;
+        internal relaxation), or clamped (one compute_batch). Small strains need a tight fmax: the error of C goes as
+        residual force / strain.
+    device: as compute_batch; other keyword arguments (e.g. dispersion="d3-pbe") are forwarded to relax_batch
+        (relax_atoms) or compute_batch.
 
     Returns one dict per structure: "C" (6x6, GPa, symmetrised), "asymmetry" (GPa, max |C - C^T| / 2 before that: large
     for unconverged relaxations or too large strains), "S" (inverse of C, 1/GPa), Voigt / Reuss / Hill moduli (GPa)
-    "BV", "GV", "EV", "nuV", "BR", "GR", "ER", "nuR", "BH", "GH", "EH", "nuH", "AVR" (100 (GV - GR) / (GV + GR)),
+    "BV", "GV", "EV", "BR", "GR", "ER", "BH", "GH", "EH"; dimensionless Poisson ratios "nuV", "nuR", "nuH";
+    "AVR" (percent, 100 (GV - GR) / (GV + GR)),
     "C_eigval"; "strains" [num_of_point], "stresses" [6, num_of_point, 6] (GPa); relax_atoms: "n_steps", "converged"
     [6, num_of_point] (unconverged relaxations are kept and warned about). A singular C: the Reuss and Hill values None.
     """
     if num_of_point < 2:
         raise ValueError("num_of_point must be >= 2")
+    eps_range = float(eps_range)
+    if not 0.0 < eps_range < 1.0:    # NaN fails too; a strain of +-1 or more makes the cell singular
+        raise ValueError(f"eps_range must be in (0, 1), got {eps_range!r}")
     structures = list(structures)
     _full_rank(structures, "elastic_batch")
     strains = np.linspace(-eps_range, eps_range, num_of_point)

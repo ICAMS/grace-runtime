@@ -59,21 +59,36 @@ def test_bad_inputs(models, fixtures):
     bad = j.copy(); bad[0] = len(types)
     with pytest.raises(ValueError):
         m.compute(SPECIES, types, off, bad, rij)             # neighbour index out of range
-    bt = types.copy(); bt[0] = 3
-    with pytest.raises(ValueError):
-        m.compute(SPECIES, bt, off, j, rij)                  # type beyond the species list
+    for t in (0, 3):
+        bt = types.copy(); bt[0] = t
+        with pytest.raises(ValueError, match="types must be"):
+            m.compute(SPECIES, bt, off, j, rij)              # type outside the species list
 
 
 def test_not_a_model(tmp_path):
+    import zipfile
+
     p = tmp_path / "x.npz"
     np.savez(p, a=np.zeros(3))
     with pytest.raises(ValueError):
         _core.Model(str(p))
+    s = tmp_path / "short.npz"
+    with zipfile.ZipFile(s, "w") as zf:
+        zf.writestr("x", b"123")
+    with pytest.raises(ValueError, match="not a GRACE"):
+        _core.Model(str(s))
+    raw = bytearray(s.read_bytes())
+    cd_pos = raw.index(b"PK\x01\x02")
+    raw[cd_pos + 28 : cd_pos + 30] = (1000).to_bytes(2, "little")    # nl past end of central directory
+    t = tmp_path / "trunc.npz"
+    t.write_bytes(raw)
+    with pytest.raises(ValueError, match="not a GRACE"):
+        _core.Model(str(t))
 
 
 def test_integer_stored_float_is_read_by_value(models, fixtures, tmp_path):
-    """A float field stored as an integer array (here output_scale = 1 as int64) is converted, not reinterpreted (#3:
-    the int64 bit pattern of 1 read as a float64 scaled the energy to ~5e-324 and gave zero forces)."""
+    """A float field stored as an integer array (here output_scale = 1 as int64) is converted, not reinterpreted (the
+    int64 bit pattern of 1 read as a float64 scaled the energy to ~5e-324 and gave zero forces)."""
     with np.load(models["1l"]) as z:
         arrays = {k: z[k] for k in z.files}
     assert float(arrays.get("output_scale", 1.0)) == 1.0
@@ -95,7 +110,7 @@ def test_integer_stored_float_is_read_by_value(models, fixtures, tmp_path):
     ({"chem_embedding": np.ones(3, dtype=np.complex128)}, "chem_embedding.*<c16"),
 ])
 def test_bad_dtype_rejected(tmp_path, bad, match):
-    """Arrays the loader would misread are an error naming the array and its dtype (#3)."""
+    """Arrays the loader would misread are an error naming the array and its dtype."""
     p = tmp_path / "kokkos.npz"
     np.savez(p, mlp_rad_W0=np.ones((2, 2)), **bad)    # mlp_rad_W0: detected as a GRACE-1L export
     with pytest.raises(ValueError, match=match):
@@ -148,7 +163,7 @@ def test_bond_vectors():
 
 class _CudaTagged:
     """A host array exported through DLPack with its device set to CUDA: tests that the CPU bindings reject device
-    memory by the tag, without a GPU and without dereferencing a real device pointer (#4)."""
+    memory by the tag, without a GPU and without dereferencing a real device pointer."""
 
     def __init__(self, a):
         import ctypes as C

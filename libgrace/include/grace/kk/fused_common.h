@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/KOKKOS/grace_fused_kokkos_common.h (07b8fb50d4); contributing author Yury Lysogorskiy (ICAMS)
 
 
 /* ----------------------------------------------------------------------
    Contributing author: Yury Lysogorskiy (ICAMS)
-   Device and host helpers shared by grace/1l/fused/kk and grace/2l/fused/kk.
+   Device and host helpers shared by Grace1LFusedKK and Grace2LFusedKK.
    Internal: include only from their .cpp files.
 ------------------------------------------------------------------------- */
 
@@ -82,7 +81,7 @@ void fma4(F4 &a, const F4 &w, const float x)
   a.x += w.x * x; a.y += w.y * x; a.z += w.z * x; a.w += w.w * x;
 }
 
-// per-atom virial of one bond, as grace/2l/kk: half of del (x) f to each atom; centroid form with 9 components
+// per-atom virial of one bond, as Grace2LKK: half of del (x) f to each atom; centroid form with 9 components
 template<class VA, class CVA>
 KOKKOS_INLINE_FUNCTION
 void tally_vatom(const VA &va, const CVA &cva, bool do_va, bool do_cva, int i, int j, double dx, double dy, double dz,

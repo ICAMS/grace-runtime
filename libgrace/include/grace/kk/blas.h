@@ -7,12 +7,14 @@
 // GRACE_KK_GEMM is defined when the GEMM paths exist in the build (CUDA or HIP Kokkos); without it (host backends)
 // this header declares nothing.
 //   CUDA: cuBLAS (grace/kk/cublas_guard.h), linked or, with GRACE_KK_CUBLAS_DLOPEN, loaded at run time; the calls are
-//         the cuBLAS calls of the engines before this interface, one to one.
+//         the cuBLAS calls of the engines before this interface, one to one. Without cuBLAS (dlopen'ed, not found or
+//         GRACE_RUNTIME_NO_CUBLAS) the handle runs the Kokkos GEMMs of grace/kk/kk_gemm.h, as on HIP.
 //   HIP:  rocBLAS loaded at run time (grace/kk/rocblas_guard.h: the soname of the build's ROCm, .so.4 / .so.5; never linked or
 //         bundled; GRACE_RUNTIME_NO_ROCBLAS skips it). Without rocBLAS the handle runs the hand-written Kokkos GEMMs
 //         of grace/kk/kk_gemm.h (fp32 only; dgemm fails) on the instance given to set_stream;
 //         GRACE_RUNTIME_NO_KKGEMM as well: create fails, the engines run their hand-written fused kernels.
-// available(): a handle can be created (CUDA: libcublas loaded, unless linked; HIP: rocBLAS or the Kokkos GEMMs).
+// available(): a handle can be created (cuBLAS / rocBLAS or the Kokkos GEMMs).
+// has_dgemm(h): dgemm works on h (cuBLAS / rocBLAS; the Kokkos GEMMs are fp32 only).
 // optional: no handle is a supported configuration (dlopen'ed cuBLAS, HIP); else a failed create is an error.
 // name(): "cublas", "rocblas", "kkgemm", or "" (none available).
 // selftest_error(), gemm_selftest(): the engines' GEMM self-tests at construction.
@@ -23,6 +25,7 @@
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublas_v2.h>
 #include "grace/kk/cublas_guard.h"
+#include "grace/kk/kk_gemm.h"
 #define GRACE_KK_GEMM 1
 #elif defined(KOKKOS_ENABLE_HIP)
 #include "grace/kk/kk_gemm.h"
@@ -40,53 +43,6 @@ namespace grace {
 namespace kk {
 namespace blas {
 
-#if defined(KOKKOS_ENABLE_CUDA)
-using handle_t = cublasHandle_t;
-using status_t = cublasStatus_t;
-using op_t = cublasOperation_t;
-inline constexpr status_t SUCCESS = CUBLAS_STATUS_SUCCESS;
-inline constexpr op_t OP_N = CUBLAS_OP_N;
-inline constexpr op_t OP_T = CUBLAS_OP_T;
-#ifdef GRACE_KK_CUBLAS_DLOPEN
-inline constexpr bool optional = true;
-#else
-inline constexpr bool optional = false;
-#endif
-
-inline bool available() { return detail::cublas_ok(); }
-inline const char *name() { return detail::cublas_ok() ? "cublas" : ""; }
-inline status_t create(handle_t *h) { return cublasCreate(h); }
-inline status_t destroy(handle_t h) { return cublasDestroy(h); }
-template<class Exec> status_t set_stream(handle_t h, const Exec &exec)
-{
-  static_assert(std::is_same_v<Exec, Kokkos::Cuda>, "blas::set_stream: a Kokkos::Cuda instance");
-  return cublasSetStream(h, exec.cuda_stream());
-}
-inline status_t set_pedantic_math(handle_t h) { return cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH); }
-inline status_t sgemm(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha, const float *A, int lda,
-                      const float *B, int ldb, const float *beta, float *C, int ldc)
-{
-  return cublasSgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
-}
-inline status_t dgemm(handle_t h, op_t ta, op_t tb, int m, int n, int k, const double *alpha, const double *A, int lda,
-                      const double *B, int ldb, const double *beta, double *C, int ldc)
-{
-  return cublasDgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
-}
-inline status_t sgemm_batched(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha,
-                              const float *const A[], int lda, const float *const B[], int ldb, const float *beta,
-                              float *const C[], int ldc, int batch)
-{
-  return cublasSgemmBatched(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, batch);
-}
-inline status_t sgemm_strided_batched(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha,
-                                      const float *A, int lda, long long sA, const float *B, int ldb, long long sB,
-                                      const float *beta, float *C, int ldc, long long sC, int batch)
-{
-  return cublasSgemmStridedBatched(h, ta, tb, m, n, k, alpha, A, lda, sA, B, ldb, sB, beta, C, ldc, sC, batch);
-}
-
-#elif defined(KOKKOS_ENABLE_HIP)
 namespace detail {
 inline bool kk_gemm_on()
 {
@@ -97,6 +53,94 @@ inline bool kk_gemm_on()
   return on;
 }
 }    // namespace detail
+
+#if defined(KOKKOS_ENABLE_CUDA)
+// cuBLAS handle, or none: the Kokkos GEMMs on exec
+struct Handle {
+  cublasHandle_t cb = nullptr;
+  Kokkos::Cuda exec;
+};
+using handle_t = Handle *;
+using status_t = cublasStatus_t;
+using op_t = cublasOperation_t;
+inline constexpr status_t SUCCESS = CUBLAS_STATUS_SUCCESS;
+inline constexpr status_t NOT_IMPLEMENTED = CUBLAS_STATUS_NOT_SUPPORTED;
+inline constexpr op_t OP_N = CUBLAS_OP_N;
+inline constexpr op_t OP_T = CUBLAS_OP_T;
+#ifdef GRACE_KK_CUBLAS_DLOPEN
+inline constexpr bool optional = true;
+#else
+inline constexpr bool optional = false;
+#endif
+
+inline bool available() { return ::grace::kk::detail::cublas_ok() || detail::kk_gemm_on(); }
+inline const char *name()
+{
+  return ::grace::kk::detail::cublas_ok() ? "cublas" : detail::kk_gemm_on() ? "kkgemm" : "";
+}
+inline bool has_dgemm(handle_t h) { return h && h->cb; }
+inline status_t create(handle_t *h)
+{
+  *h = nullptr;
+  cublasHandle_t cb = nullptr;
+  if (::grace::kk::detail::cublas_ok()) {
+    const status_t st = cublasCreate(&cb);
+    if (st != SUCCESS) return st;
+  } else if (!detail::kk_gemm_on()) {
+    return NOT_IMPLEMENTED;
+  }
+  *h = new Handle{cb, Kokkos::Cuda()};
+  return SUCCESS;
+}
+inline status_t destroy(handle_t h)
+{
+  const status_t st = h && h->cb ? cublasDestroy(h->cb) : SUCCESS;
+  delete h;
+  return st;
+}
+template<class Exec> status_t set_stream(handle_t h, const Exec &exec)
+{
+  static_assert(std::is_same_v<Exec, Kokkos::Cuda>, "blas::set_stream: a Kokkos::Cuda instance");
+  h->exec = exec;
+  return h->cb ? cublasSetStream(h->cb, exec.cuda_stream()) : SUCCESS;
+}
+// the Kokkos GEMMs compute in true fp32 (no tf32)
+inline status_t set_pedantic_math(handle_t h) { return h->cb ? cublasSetMathMode(h->cb, CUBLAS_PEDANTIC_MATH) : SUCCESS; }
+inline status_t sgemm(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha, const float *A, int lda,
+                      const float *B, int ldb, const float *beta, float *C, int ldc)
+{
+  if (h->cb) return cublasSgemm(h->cb, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+  gemm::sgemm(h->exec, ta == OP_T, tb == OP_T, m, n, k, *alpha, gemm::StridedOperands{A, B, C, 0, 0, 0}, lda, ldb,
+              *beta, ldc, 1);
+  return SUCCESS;
+}
+inline status_t dgemm(handle_t h, op_t ta, op_t tb, int m, int n, int k, const double *alpha, const double *A, int lda,
+                      const double *B, int ldb, const double *beta, double *C, int ldc)
+{
+  if (!h->cb) return NOT_IMPLEMENTED;    // no fp64 Kokkos GEMM: callers check has_dgemm
+  return cublasDgemm(h->cb, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+inline status_t sgemm_batched(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha,
+                              const float *const A[], int lda, const float *const B[], int ldb, const float *beta,
+                              float *const C[], int ldc, int batch)
+{
+  if (h->cb) return cublasSgemmBatched(h->cb, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, batch);
+  gemm::sgemm(h->exec, ta == OP_T, tb == OP_T, m, n, k, *alpha, gemm::ArrayOperands{A, B, C}, lda, ldb, *beta, ldc,
+              batch);
+  return SUCCESS;
+}
+inline status_t sgemm_strided_batched(handle_t h, op_t ta, op_t tb, int m, int n, int k, const float *alpha,
+                                      const float *A, int lda, long long sA, const float *B, int ldb, long long sB,
+                                      const float *beta, float *C, int ldc, long long sC, int batch)
+{
+  if (h->cb)
+    return cublasSgemmStridedBatched(h->cb, ta, tb, m, n, k, alpha, A, lda, sA, B, ldb, sB, beta, C, ldc, sC, batch);
+  gemm::sgemm(h->exec, ta == OP_T, tb == OP_T, m, n, k, *alpha, gemm::StridedOperands{A, B, C, sA, sB, sC}, lda, ldb,
+              *beta, ldc, batch);
+  return SUCCESS;
+}
+
+#elif defined(KOKKOS_ENABLE_HIP)
 // rocBLAS handle, or none: the Kokkos GEMMs on exec
 struct Handle {
   ::grace::kk::detail::rocblas_handle_t rb = nullptr;
@@ -116,6 +160,7 @@ inline const char *name()
 {
   return ::grace::kk::detail::rocblas_ok() ? "rocblas" : detail::kk_gemm_on() ? "kkgemm" : "";
 }
+inline bool has_dgemm(handle_t h) { return h && h->rb; }
 inline status_t create(handle_t *h)
 {
   *h = nullptr;

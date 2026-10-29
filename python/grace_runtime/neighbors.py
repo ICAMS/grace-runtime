@@ -6,8 +6,12 @@ than ``skin / 2`` since the last build (or the cell, pbc or atomic numbers chang
 the 2L driver distributes atoms over threads with a static schedule and relies on neighbours of one thread's atoms
 being close in index.
 
-Cells with zero vectors (molecules, ``cell.rank < 3``) get padded vectors orthogonal to the others, long enough that no
-image is within range; positions are shifted into that box for the search only, bond vectors use the true positions.
+Zero cell vectors (molecules, ``cell.rank < 3``) and the vectors of open directions get padded vectors orthogonal to the
+periodic ones, long enough that no image is within range; positions are shifted into that box for the search only, bond
+vectors use the true positions.
+
+Per bond the list keeps the neighbour ``j`` (new order) and ``image``, its row of ``shifts`` (the distinct S cell): 8
+bytes per bond.
 """
 import numpy as np
 from ._core import bond_vectors, neighbor_search
@@ -15,20 +19,23 @@ from ._core import bond_vectors, neighbor_search
 
 def _padded_cell(atoms, reach):
     """Cell for the neighbour search and the shift that puts the atoms inside it."""
-    return _padded_cell_arrays(atoms.cell.array, atoms.positions, reach)
+    return _padded_cell_arrays(atoms.cell.array, atoms.positions, reach, atoms.pbc)
 
 
-def _padded_cell_arrays(cell, pos, reach):
-    """_padded_cell for a cell (rows: vectors) and positions [n, 3]."""
+def _padded_cell_arrays(cell, pos, reach, pbc=None):
+    """_padded_cell for a cell (rows: vectors) and positions [n, 3]. Zero vectors and, with pbc, the vectors of the
+    open directions are replaced by directions normal to the periodic vectors: the bonds do not depend on an open
+    vector, and one nearly in the periodic plane made the bins of the periodic directions about as thin as its normal
+    component (a search over ~1e10 bins for c = (5, 5, 1e-4))."""
     cell = np.array(cell, dtype=np.float64)
-    if all(np.any(cell[k]) for k in range(3)):
+    pad = [k for k in range(3) if not np.any(cell[k]) or (pbc is not None and not pbc[k])]
+    if not pad:
         return cell, np.zeros(3)
-    zero = [k for k in range(3) if not np.any(cell[k])]
-    given = np.array([cell[k] for k in range(3) if k not in zero]).reshape(-1, 3)
+    given = np.array([cell[k] for k in range(3) if k not in pad]).reshape(-1, 3)
     # orthonormal basis of the complement of span(given): the last right-singular vectors
     dirs = np.linalg.svd(given)[2][len(given):] if len(given) else np.eye(3)
     shift = np.zeros(3)
-    for k, d in zip(zero, dirs):
+    for k, d in zip(pad, dirs):
         proj = pos @ d
         cell[k] = d * (np.ptp(proj) + 2.0 * reach + 1.0) if len(pos) else d * (2.0 * reach + 1.0)
         if len(pos):
@@ -62,7 +69,7 @@ class NeighborList:
         """Rebuild when needed; True when the list was rebuilt."""
         key = self._system_key(atoms)
         if self._x0 is not None and key == self._key and len(atoms) == len(self._x0):
-            if len(atoms) == 0 or np.linalg.norm(atoms.positions - self._x0, axis=1).max() <= 0.5 * self.skin:
+            if len(atoms) == 0 or ((atoms.positions - self._x0) ** 2).sum(axis=1).max() <= (0.5 * self.skin) ** 2:
                 return False
         self._build(atoms)
         self._key = key
@@ -75,13 +82,15 @@ class NeighborList:
         reach = self.cutoff + self.skin
         cell, shift = _padded_cell(atoms, reach)
         pos = atoms.positions + shift
-        self.perm, self.offset, self.j, self._io, self._jo, self._shift = neighbor_search(
+        self.perm, self.offset, self.j, self.image, self.shifts = neighbor_search(
             np.ascontiguousarray(pos, dtype=np.float64), np.ascontiguousarray(cell, dtype=np.float64),
             [bool(p) for p in atoms.pbc], reach, num_threads=self.num_threads)
         self.inv = np.empty(n, np.int64)
         self.inv[self.perm] = np.arange(n)
 
     def rij(self, atoms, num_threads: int = 0):
-        """Bond vectors x_j - x_i + S cell for the current positions (new atom order), [nbonds, 3]."""
-        return bond_vectors(np.ascontiguousarray(atoms.positions, dtype=np.float64), self._io, self._jo, self._shift,
-                            num_threads=num_threads)
+        """Bond vectors x_j - x_i + S cell for the current positions (new atom order), [nbonds, 3]. The engines form
+        them themselves: Model.compute(..., positions=atoms.positions[perm], image=image, shifts=shifts)."""
+        i = np.repeat(np.arange(len(self.perm)), np.diff(self.offset))
+        return bond_vectors(np.ascontiguousarray(atoms.positions[self.perm], dtype=np.float64), i, self.j,
+                            self.shifts[self.image], num_threads=num_threads)

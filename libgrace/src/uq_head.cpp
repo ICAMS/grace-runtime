@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_uq.cpp (GraceUQHead::load_uq).
+// load_uq_head: the uqv6 UQ head of a model from kokkos.npz.
 #include "grace/uq_head.h"
 #include "npz3.h"
 

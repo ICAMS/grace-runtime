@@ -5,5 +5,4 @@
 #include "grace/kk/grace_3l_kk_impl.h"
 #include "grace/kk/traits.h"
 
-template class grace::kk::Grace3LKK<Kokkos::DefaultExecutionSpace, float, float,
-                                    grace::kk::DefaultTraits<Kokkos::DefaultExecutionSpace>>;
+GRACE_KK_INSTANTIATE_3L(Kokkos::DefaultExecutionSpace, grace::kk::DefaultTraits<Kokkos::DefaultExecutionSpace>);

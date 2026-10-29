@@ -7,6 +7,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace grace {
 
@@ -52,15 +53,16 @@ inline constexpr D3BJPreset kD3BJPresets[] = {
     {"r2scan", 1.0, 0.49484001, 0.78981345, 5.73083694, "10.1063/5.0041008"},
 };
 
-// the published D3(BJ) parameters of a functional (lower-case name); throws std::invalid_argument for an unknown name
-inline const D3BJPreset &d3bj_preset(const std::string &name)
+// the published D3(BJ) parameters of a functional (lower-case name); throws std::invalid_argument for an unknown name.
+// name as std::string_view: with a const std::string & every call with a literal made g++ >= 14 warn
+// -Wdangling-reference, although the result is an entry of kD3BJPresets
+inline const D3BJPreset &d3bj_preset(std::string_view name)
 {
-  std::string names;
-  for (const auto &q : kD3BJPresets) {
+  for (const auto &q : kD3BJPresets)
     if (name == q.name) return q;
-    names += (names.empty() ? "" : ", ") + std::string(q.name);
-  }
-  throw std::invalid_argument("unknown D3(BJ) functional '" + name + "' (presets: " + names + ")");
+  std::string names;
+  for (const auto &q : kD3BJPresets) names += (names.empty() ? "" : ", ") + std::string(q.name);
+  throw std::invalid_argument("unknown D3(BJ) functional '" + std::string(name) + "' (presets: " + names + ")");
 }
 
 }    // namespace grace

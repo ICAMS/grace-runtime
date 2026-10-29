@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """A device allocation failure part-way through a growth (injected with the module's _debug_fail_alloc: the nth
-allocation whose label matches throws "failed to allocate") must not leave a half-grown engine or System behind: the
-same calculator, and other calculators sharing the engine, give the result of a fresh calculator afterwards. Each case
+allocation whose label matches throws "failed to allocate"; or a kernel launch out of memory, _debug_fail_launch) must
+not leave a half-grown engine or System behind: the same calculator, and other calculators sharing the engine, give the
+result of a fresh calculator afterwards. Each case
 runs in its own process (a broken engine may lose the GPU context)."""
 import os
 import subprocess
@@ -117,6 +118,47 @@ except RuntimeError as e:
     assert "engine" in str(e) and "GPU memory" in str(e) and "0 atoms" not in str(e), e
 finally:
     kk._debug_fail_alloc("", 0)
+""",
+    # a kernel launch that ran out of device memory (on a nearly full GPU, e.g. the local memory of a kernel's first
+    # launch; injected with _debug_fail_launch) is out of memory too: chunksize auto retries with a smaller chunk
+    # (5488 atoms in one pass -> 2048) instead of raising the raw cudaErrorMemoryAllocation / hipErrorOutOfMemory
+    "launch_oom_auto": """
+m = "{M2}"
+mid = bulk("W", "bcc", a=3.165, cubic=True).repeat(14)
+mid.rattle(0.02, seed=3)
+c = GRACERuntimeCalculator(m, device=GPU)
+ef(c, small)    # the engine is set up: the injected failure hits the run
+kk._debug_fail_launch(1)
+try:
+    e, f = ef(c, mid)
+finally:
+    kk._debug_fail_launch(0)
+assert 0 < c.chunksize <= 2048, c.chunksize
+e0, f0 = ef(GRACERuntimeCalculator(m, device=GPU, chunksize=2048), mid)
+assert abs(e - e0) / len(mid) <= 1e-6 and np.abs(f - f0).max() <= 1e-5, (e - e0, np.abs(f - f0).max())
+""",
+    # a batch's own buffers at max_nall <= 16384 (no smaller pass to retry with): the failed growth of the pass
+    # positions must not leave a types view grown and a positions view empty for the retry with a smaller chunk or the
+    # next call (an illegal address there)
+    "batch_buffers": """
+from grace_runtime import Model, compute_batch
+m = Model("{M1}")
+cells = [small, big]
+def run(c=cells):
+    return compute_batch(m, c, device=GPU, max_nall=16384)
+run([small])    # the batch's buffers sized for 54 atoms: the next call grows them
+r0 = compute_batch(Model("{M1}"), cells, device=GPU, max_nall=16384)
+def same(r):
+    for a, b, at in zip(r, r0, cells):
+        assert abs(a["energy"] - b["energy"]) / len(at) <= 1e-6 and np.abs(a["forces"] - b["forces"]).max() <= 1e-5
+kk._debug_fail_alloc("batch:pos_new", 1)
+try:
+    same(run())    # chunksize auto: retried with a smaller chunk
+except RuntimeError as e:
+    assert "failed to allocate" in str(e), e
+finally:
+    kk._debug_fail_alloc("", 0)
+same(run())
 """,
     # the System's own buffers (positions, list)
     "system_buffers": """

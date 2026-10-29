@@ -106,13 +106,13 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     auto hn = Kokkos::create_mirror_view(numneigh);
     auto ho = Kokkos::create_mirror_view(owner);
     auto htc = Kokkos::create_mirror_view(tcart);
-    auto hb = Kokkos::create_mirror_view(neighbors);
+    auto hb = Kokkos::create_mirror_view(neighbors.base());    // [n][maxneigh]: indexed with a 64-bit row below
     for (int i = 0; i < n; i++) {
       for (int k = 0; k < 3; k++) hx(i, k) = pos[3 * i + k];
       ht(i) = typ[i];
       hi(i) = i;
       hn(i) = (int) (offset[i + 1] - offset[i]);
-      for (int64_t b = offset[i]; b < offset[i + 1]; b++) hb(i, (int) (b - offset[i])) = nbr[b];
+      for (int64_t b = offset[i]; b < offset[i + 1]; b++) hb((size_t) i, (size_t) (b - offset[i])) = nbr[b];
     }
     for (int g = 0; g < (int) imgs.size(); g++) {
       const auto &q = imgs[g];
@@ -131,7 +131,7 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     Kokkos::deep_copy(numneigh, hn);
     Kokkos::deep_copy(owner, ho);
     Kokkos::deep_copy(tcart, htc);
-    Kokkos::deep_copy(neighbors, hb);
+    Kokkos::deep_copy(neighbors.base(), hb);
   }
 
   // images from a device neighbour list (grace/kk/neighbors_kk.h NeighborListKK: CSR offset / j in its new atom
@@ -152,13 +152,18 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     auto off = nl.offset;
     auto jj = nl.j;
     auto SS = nl.S;
+    // the bonds to images (S != 0) counted first: the sort keys are one per such bond, not one per bond (a large cell
+    // has few: 1L at 33M atoms, 64 bonds per atom, needed 15.75 GiB for keys of all bonds)
     int bad = 0;
-    Kokkos::parallel_reduce("csr:check_S", Kokkos::RangePolicy<DeviceType>(0, nbd), KOKKOS_LAMBDA(const int64_t b, int &v) {
+    int64_t nimg = 0;
+    Kokkos::parallel_reduce("csr:check_S", Kokkos::RangePolicy<DeviceType>(0, nbd),
+        KOKKOS_LAMBDA(const int64_t b, int &v, int64_t &c) {
       for (int k = 0; k < 3; k++)
         if (SS(b, k) <= -512 || SS(b, k) >= 512) v++;
-    }, bad);
+      if (SS(b, 0) != 0 || SS(b, 1) != 0 || SS(b, 2) != 0) c++;
+    }, bad, nimg);
     if (bad) throw grace::Error("CSR images: lattice translation beyond +-511 cells");
-    Kokkos::View<uint64_t *, DeviceType> keys("csr:keys", std::max<int64_t>(nbd, 1));
+    Kokkos::View<uint64_t *, DeviceType> keys("csr:keys", std::max<int64_t>(nimg, 1));
     int64_t nk = 0;
     Kokkos::parallel_scan("csr:keys", Kokkos::RangePolicy<DeviceType>(0, nbd),
         KOKKOS_LAMBDA(const int64_t b, int64_t &acc, const bool fin) {

@@ -318,12 +318,19 @@ class FakeModule:
         pass
 
 
-def test_ensure_init_and_one_gpu_per_process(no_env):
+@pytest.fixture
+def fake_rocm(no_env):
+    """a ROCm module stand-in that _gpu.ensure_init starts (the process-wide GPU state restored afterwards)"""
     mod = FakeModule()
     no_env.setattr(_rocm, "start", lambda index: (mod, {"arch": "gfx90a", "ptx": False, "cc": "gfx90a"}))
     no_env.setattr("atexit.register", lambda f: f)
     for k in ("platform", "device", "arch", "ptx", "cc"):
         no_env.setitem(_gpu._state, k, _gpu._state[k])
+    return mod
+
+
+def test_ensure_init_and_one_gpu_per_process(fake_rocm):
+    mod = fake_rocm
     assert _gpu.ensure_init("hip") is mod and mod.inits == [0]
     assert _gpu.info() == {"device": "rocm:0", "platform": "rocm", "arch": "gfx90a", "cc": "gfx90a", "native": True}
     assert _gpu.ensure_init("rocm:0") is mod and _gpu.ensure_init("gpu") is mod and mod.inits == [0]
@@ -333,6 +340,17 @@ def test_ensure_init_and_one_gpu_per_process(no_env):
             _gpu.ensure_init(other)
     with pytest.raises(ValueError, match="one GPU per process: already using rocm:0"):
         _cuda.ensure_init("cuda")
+
+
+def test_ensure_init_nonzero_gpu_with_generic_gpu(fake_rocm):
+    """When rocm:1 is already active, device='gpu:1' uses it; device='gpu' means GPU 0 (as 'cuda' and 'rocm' without an
+    index) and is refused with the one-GPU error, not silently mapped to the GPU in use."""
+    mod = fake_rocm
+    assert _gpu.ensure_init("rocm:1") is mod and mod.inits == [1]
+    assert _gpu.ensure_init("gpu:1") is mod and mod.inits == [1]
+    for other in ("gpu", "gpu:0", "rocm", "rocm:0", "cuda", "cuda:1"):
+        with pytest.raises(ValueError, match="one GPU per process: already using rocm:1"):
+            _gpu.ensure_init(other)
 
 
 # ---- grace-runtime info ----
@@ -351,3 +369,18 @@ def test_info_amd_native(amd_node, capsys):
     out = capsys.readouterr().out
     assert "GPU modules installed: gfx90a, gfx942 (gfx942: built, untested)" in out and "native module gfx90a" in out, out
     assert "rocBLAS:" in out
+
+
+def test_info_zero_visible_cuda_devices(amd_node, capsys):
+    """cuInit(0) succeeds with 0 visible CUDA devices (ValueError from compute_capability(0)): info falls back to
+    AMD or CPU instead of crashing."""
+    amd_node.setattr(_cuda, "compute_capability",
+                     lambda index: (_ for _ in ()).throw(ValueError("cuda:0 does not exist (0 visible CUDA device(s))")))
+    amd_node.setattr(_rocm, "available", lambda: {"gfx90a": "x._kk_gfx90a"})
+    assert cli.main(["info"]) == 0
+    out = capsys.readouterr().out
+    assert "GPU rocm:0: gfx90a" in out and "native module gfx90a" in out, out
+    amd_node.setattr(_rocm, "kfd_present", lambda: False)
+    assert cli.main(["info"]) == 0
+    out = capsys.readouterr().out
+    assert "GPU: none usable (cuda:0 does not exist (0 visible CUDA device(s))); device='auto' runs on the CPU" in out

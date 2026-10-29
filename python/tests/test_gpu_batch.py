@@ -176,6 +176,23 @@ def test_batch_keep_buffers_device_neighbors(mod):
     assert np.abs(got["forces"] - ref_small["forces"]).max() <= 1e-5 and got["energies"].shape == (56,)
 
 
+def test_types_out_of_range(mod):
+    """an atom type outside 1 .. len(species) is refused before any engine run: the engines read the tables of a
+    central atom's element without a check (grace/type_map.h)"""
+    m = mod.Model(str(MODELS["2l"]))
+    s, b = mod.System(m, SPECIES), mod.Batch(m, SPECIES)
+    types, pos, cell, pbc = arrays(lmp("WMo54"), s.cutoff)
+    natoms, btypes, bpos, cells, bpbc = concat([lmp("W54"), lmp("WMo54")], b.cutoff)
+    msg = r"types must be 1 \.\. len\(species\)"
+    for bad in (0, len(SPECIES) + 1):
+        t, bt = types.copy(), btypes.copy()
+        t[5] = bt[60] = bad
+        with pytest.raises(ValueError, match=msg):
+            s.compute(t, pos, cell, pbc)
+        with pytest.raises(ValueError, match=msg):
+            b.compute(natoms, bt, bpos, cells, bpbc)
+
+
 def test_batch_unknown_element(mod):
     m = mod.Model(str(MODELS["2l"]))
     with pytest.raises(ValueError, match="not in the model"):

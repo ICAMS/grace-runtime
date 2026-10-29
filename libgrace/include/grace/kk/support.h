@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Helpers of the Kokkos engines that LAMMPS used to provide: view reallocation (MemoryKokkos::realloc_kokkos),
-// view memory usage, and errors with {} placeholders (LAMMPS error->all) thrown as grace::Error.
+// Helpers of the Kokkos engines that LAMMPS provides to its own styles: view reallocation
+// (MemoryKokkos::realloc_kokkos), view memory usage, and errors with {} placeholders (LAMMPS error->all) thrown as
+// grace::Error.
 #pragma once
 
 #include "grace/error.h"
@@ -11,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -266,7 +268,7 @@ template<class Member> KOKKOS_INLINE_FUNCTION BondSlot bond_slot(const Member &t
 
 // A View whose element access computes the offset in 64 bits. Kokkos 5 View::operator() computes the offset in the
 // common type of the indices (an optimisation of Kokkos 5), so v(i, j, k) with int indices wraps once the view holds
-// more than 2^31 elements: the GRACE-3L [nall][64][50] message rows from nall = 671089 (issue #1). The views with a
+// more than 2^31 elements: the GRACE-3L [nall][64][50] message rows from nall = 671089. The views with a
 // row per atom of nall (local + ghost) are View64; every other view stays below 2^31 elements (MemKK::realloc_kokkos
 // checks it, chunksize auto picks the chunk below that).
 template<class V> class View64 : V {    // private base: a View64 never passes as a plain V (int offsets again)
@@ -329,6 +331,12 @@ struct MemKK {
   }
   // the views emptied: an allocation goes with its last reference
   template<class... V> static void drop(V &...v) { ((v = V()), ...); }
+  // host copy h of the rank-3 View64 d, made on first use (and again when d's extents changed)
+  template<class H, class D> static void ensure_mirror(H &h, const D &d)
+  {
+    if (h.extent(0) != d.extent(0) || h.extent(1) != d.extent(1) || h.extent(2) != d.extent(2))
+      h = Kokkos::create_mirror_view(d.base());
+  }
   template<typename TYPE> static double memory_usage(const TYPE &data)
   {
     return (double) data.span() * sizeof(typename TYPE::value_type);
@@ -374,11 +382,16 @@ inline int comm_values(int n, int w)
   return (int) v;
 }
 
+// the smallest chunk of chunksize auto and of its smaller chunks after an allocation failure (python/kk): GRACE-3L-
+// large on an RTX 2070 8 GB fits ~10 % more atoms with 512 than with 1024 at the same speed (RTX 3090, 65k atoms: 512
+// is 18 % slower than 1024, 256 62 %; the floor is reached only when the larger chunks do not fit)
+inline constexpr int kChunkMin = 512;
+
 // chunksize auto: atoms per chunk for n atoms with up to mn neighbours. grow(c0, mn) re-grows every chunk work buffer
 // for c0 <= 1024 atoms, counted (bytes per atom); the chunk is all n atoms when they fit 70 % of this process's share
 // of the free device memory (free + the counted buffers, over ranks_per_device processes on the GPU), else the largest
-// power of two that fits, at least 1024 (a structure too large even then fails at allocation as before). Host memory:
-// one chunk.
+// power of two that fits, at least kChunkMin (a structure too large even then fails at allocation as before). Host
+// memory: one chunk.
 // stored(): bytes per atom the engine keeps for all n atoms when there is more than one chunk (2L fused store_l1).
 // kept_fits (optional): false when the kept bytes do not fit the budget next to the chosen chunk.
 template<class DeviceType, class Grow, class Stored>
@@ -407,7 +420,7 @@ int auto_chunk(int n, int mn, int ranks_per_device, Grow &&grow, Stored &&stored
   const double budget = 0.7 * ((double) free_b + bytes) / std::max(1, ranks_per_device);
   int c = n;
   if (per_atom * n > budget || n > cmax) {
-    c = std::min(n, 1024);
+    c = std::min(n, kChunkMin);
     while (2.0 * c < n && per_atom * 2.0 * c + kept * n <= budget && 2.0 * c <= cmax) c *= 2;
     if (c > cmax) c = std::max(1, (int) cmax);
     if (kept_fits) *kept_fits = per_atom * c + kept * n <= budget;
@@ -437,6 +450,16 @@ std::pair<int, bool> auto_chunk_keep(int n, int mn, int ranks_per_device, Grow &
   return {c, keep};
 }
 
+// tests (the GPU module's _debug_fail_launch): the nth check_kernel_launches from now on reports an out-of-memory
+// launch failure (0: off)
+inline std::atomic<int> g_fail_launch{0};
+inline bool fail_launch_now()
+{
+  int n = g_fail_launch.load();
+  while (n > 0 && !g_fail_launch.compare_exchange_weak(n, n - 1)) {}
+  return n == 1;
+}
+
 // Throws grace::Error when a GPU kernel launch (or another CUDA / HIP runtime call) failed since the last check.
 // Kokkos checks kernel launches only with KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK: in a release build a launch that fails,
 // e.g. out of memory for the kernel's code (lazy module loading) or its local memory when the GPU is nearly full,
@@ -446,7 +469,8 @@ template<class DeviceType> void check_kernel_launches(const char *who)
 {
 #if defined(KOKKOS_ENABLE_CUDA)
   if constexpr (is_cuda_v<DeviceType>) {
-    const cudaError_t e = cudaGetLastError();
+    cudaError_t e = cudaGetLastError();
+    if (fail_launch_now()) e = cudaErrorMemoryAllocation;
     if (e != cudaSuccess)
       throw grace::Error(fmt("{}: a GPU kernel launch or runtime call failed ({}: {}); the results of this step are "
                              "invalid. With 'out of memory': free GPU memory (other processes, fewer MPI ranks per "
@@ -454,7 +478,8 @@ template<class DeviceType> void check_kernel_launches(const char *who)
   }
 #elif defined(KOKKOS_ENABLE_HIP)
   if constexpr (is_hip_v<DeviceType>) {
-    const hipError_t e = hipGetLastError();
+    hipError_t e = hipGetLastError();
+    if (fail_launch_now()) e = hipErrorOutOfMemory;
     if (e != hipSuccess)
       throw grace::Error(fmt("{}: a GPU kernel launch or runtime call failed ({}: {}); the results of this step are "
                              "invalid. With 'out of memory': free GPU memory (other processes, fewer MPI ranks per "

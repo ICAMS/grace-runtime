@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// The Kokkos engines on CSR bonds (grace/kk/csr_images.h: ghost images, image exchange, batch sums) against the
-// LAMMPS GPU references of the same styles (tests/fixtures/ref_gpu from ref_lammps_gpu.sh): energy, per-atom energy,
-// forces, pressure within fp32 parity (GPU runs are not reproducible bit for bit); the per-atom virial sums to the
-// global one; two cells in one batch give each cell's result.
+// The Kokkos engines on CSR bonds (grace/kk/csr_images.h: ghost images, image exchange, batch sums) against the LAMMPS
+// GPU references of the same engines (tests/fixtures/ref_gpu): energy, per-atom energy, forces, pressure within fp32
+// parity (GPU runs are not reproducible bit for bit); the per-atom virial sums to the global one; two cells in one
+// batch give each cell's result. The generic 1L engine refuses reduce layouts its kernels cannot run; the fused one
+// runs them.
 //   env GRACE_TEST_FIXTURES (default tests/fixtures), GRACE_TEST_REF_DIR (default tests/fixtures/ref_gpu)
 #include "grace/kk/csr_images.h"
 #include "grace/kk/grace_1l_fused_kk_impl.h"
@@ -215,6 +216,73 @@ template<class Eng, class M> void check_unmapped_neighbours(const std::shared_pt
   CHECK(std::fabs(ra.e - rw.e) / w.n <= 2e-6 && df <= 2e-5 && fmo == 0.0 && ea.bonds() == ew.bonds());
 }
 
+// the last weight tile and connection of a 1L rho reduce gone
+void drop_last(grace::GRACE1LModel::ReduceWeights &r)
+{
+  std::vector<double> W;
+  for (size_t q = 0; q < r.W.size(); q++)
+    if ((int64_t) (q % r.w_shape) != r.w_shape - 1) W.push_back(r.W[q]);
+  r.W = W;
+  r.w_shape--;
+  r.collect_ind.pop_back();
+  r.w_l_tile.pop_back();
+}
+
+// rho reduce layouts the generic 1L reduce cannot run (it reads weight tile c with function collect_ind[c] and assigns
+// the adjoints, zeroing only those of A and AA) are refused at its setup: a function collected twice, tiles out of
+// order, an AAAA function left out; a partial AA reduce runs, as on the fused engine. The fused engine has its own
+// reduce: the same model with two AA tiles and their weights swapped gives it the original results.
+void check_reduce_layouts(const std::shared_ptr<grace::GRACE1LModel> &m1, const std::string &fx)
+{
+  using M = grace::GRACE1LModel;
+  auto edited = [&](void (*edit)(M &)) {
+    auto m = std::make_shared<M>(*m1);
+    edit(*m);
+    return m;
+  };
+  auto refused = [](const std::shared_ptr<M> &m) {
+    try {
+      E1 e;
+      e.set_model(m, type2mu_for(m->element_names));
+      e.setup();
+    } catch (const grace::Error &err) {
+      std::printf("1L kk fp64 refuses: %s\n", err.what());
+      CHECK(std::string(err.what()).find("layout the generic engine does not run") != std::string::npos);
+      return true;
+    }
+    return false;
+  };
+  CHECK(m1->reduce_AA.w_shape >= 2 && m1->reduce_AAA.collect_ind.size() >= 2);    // the edits below need two tiles
+  // tiles 0 and 1 of the AA reduce exchanged with their weights: the same function
+  auto swap_aa = [](M &m) {
+    auto &r = m.reduce_AA;
+    std::swap(r.w_l_tile[0], r.w_l_tile[1]);
+    for (size_t q = 0; q < r.W.size(); q += r.w_shape) std::swap(r.W[q], r.W[q + 1]);
+  };
+  CHECK(!refused(m1));
+  CHECK(refused(edited([](M &m) { m.reduce_AAA.collect_ind[1] = m.reduce_AAA.collect_ind[0]; })));
+  CHECK(refused(edited(swap_aa)));
+  CHECK(refused(edited([](M &m) { drop_last(m.reduce_AAAA); })));
+  const auto mp = edited([](M &m) { drop_last(m.reduce_AA); });
+  CHECK(!refused(mp));
+  const Cell c = load_cell(fx + "/WMo54.npz");
+  // the fused engine on model b vs engine E on model a
+  auto vs_fused = [&](auto &&e, const std::shared_ptr<M> &a, const std::shared_ptr<M> &b, const char *what) {
+    E1F f;
+    e.set_model(a, type2mu_for(a->element_names));
+    e.setup();
+    f.set_model(b, type2mu_for(b->element_names));
+    f.setup();
+    const Result ra = run(e, c), rb = run(f, c);
+    double df = 0;
+    for (size_t q = 0; q < ra.f.size(); q++) df = std::max(df, std::fabs(ra.f[q] - rb.f[q]));
+    std::printf("1L fused, %s: dE/n %.3e max|dF| %.3e\n", what, std::fabs(ra.e - rb.e) / c.n, df);
+    CHECK(std::fabs(ra.e - rb.e) / c.n <= tol_fp32_vs_fp64.e && df <= tol_fp32_vs_fp64.f);
+  };
+  vs_fused(E1F(), m1, edited(swap_aa), "AA tiles swapped vs original");
+  vs_fused(E1(), mp, mp, "AA without its last function vs kk fp64");    // the accepted partial layout is right
+}
+
 int main(int argc, char **argv)
 {
   Kokkos::ScopeGuard guard(argc, argv);
@@ -252,6 +320,7 @@ int main(int argc, char **argv)
   check_compact_bonds_unmapped();
   check_unmapped_neighbours<E1F>(m1, "1L fused", fx);
   check_unmapped_neighbours<E2F>(m2, "2L fused", fx);
+  check_reduce_layouts(m1, fx);
   std::printf("kk csr ok\n");
   return 0;
 }

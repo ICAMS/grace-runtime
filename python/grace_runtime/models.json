@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "generated_by": "tensorpotential ci/gen_grace_runtime_models.py",
+ "generated_by": "tensorpotential",
  "models": [
   {
    "name": "GRACE-1L-OMAT-large-base",

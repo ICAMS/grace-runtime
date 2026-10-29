@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // Part of grace::kk::Grace3LKK (grace_3l_kk.h), included by grace_3l_kk_impl.h:
 // FunctionReduceN, FCRight2Left, equivariant / invariant RMS norms and the readout backward.
-// Moved from the LAMMPS style grace/3l/kk (lammps-ace 5f5ab57aa7, pair_grace_3l_kokkos_dense.cpp).
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
@@ -17,8 +16,8 @@ namespace kk {
 using namespace sph_const;
 
 // ======================================================================
-// Kernel: TagReduceN (Task 2.6) — generic FunctionReduceN. Reproduces
-// numpy_forward_3l.reduce_n EXACTLY for one reduce r over the current chunk:
+// Kernel: TagReduceN — generic FunctionReduceN. Reproduces
+// the reference reduce_n EXACTLY for one reduce r over the current chunk:
 //   for each instruction ins with n_conn connections:
 //     for each connection c: gather A[a, n, collect_ind[c]] over n in
 //     [0,n_in), dot with W[e, k, n, w_l_tile[c]] (e = elem_dep ? mu_i : 0;
@@ -77,7 +76,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagReduc
 }
 
 // ======================================================================
-// compute_reduceN (Task 2.6) — generic FunctionReduceN. Sets the per-call
+// compute_reduceN — generic FunctionReduceN. Sets the per-call
 // launch state (reduce metadata + per-instruction input views + output view)
 // captured by TagReduceN, then launches one flat pass over (atom, n_out) for
 // the current chunk. Reused by every A*_*_red / eq* / rho* reduce; the caller
@@ -94,11 +93,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN(
   if (blas_handle && sizeof(NNScalar) == 4) {
     const DeviceReduce *rbase = d_reduce;
     const int idx = (int) (&r - rbase);
-    if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok && h_reduce[idx].grouped &&
+    if (idx >= 0 && idx < n_reduces && h_reduce[idx].gemm_form_ok && h_reduce[idx].grouped &&
         compute_reduceN_grouped(idx, inputs[0], out, false))
       return;
-    if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok &&
-        compute_reduceN_cublas(r, idx, inputs, out))
+    if (idx >= 0 && idx < n_reduces && h_reduce[idx].gemm_form_ok &&
+        compute_reduceN_blas(r, idx, inputs, out))
       return;
   }
 #endif
@@ -111,9 +110,9 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN(
 }
 
 #ifdef GRACE_KK_GEMM
-// Opt 17: cuBLAS batched-GEMM ReduceN forward. out(a,k,f) = Σ_{c:tsi(c)=f} Σ_n
+// BLAS batched-GEMM ReduceN forward. out(a,k,f) = Σ_{c:tsi(c)=f} Σ_n
 // A(a,n,ci(c)) * Wsc[c](k,n), where Wsc already carries norm*norm_map(f). Zero `out`,
-// then issue one cublasSgemmBatched per round (each round has DISTINCT f -> the beta=1
+// then issue one blas::sgemm_batched per round (each round has DISTINCT f -> the beta=1
 // accumulate into disjoint out(:,:,f) slabs is race-free). A/out LayoutLeft slabs are
 // column-major (ld=extent(0), slab stride=extent(0)*extent(1)); the batch selects the
 // gathered slabs via a device pointer array. OP_N/OP_T (K=n_in). True fp32 (PEDANTIC).
@@ -133,7 +132,7 @@ const uintptr_t *Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::red_uplo
 }
 
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
-bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_cublas(
+bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_blas(
     const DeviceReduce &r, int idx, const t_nn_3d inputs[GRACE3L_MAX_REDUCE_INSTR],
     const t_nn_3d &out)
 {
@@ -170,15 +169,15 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_cubl
         Aarr + off, ldA, Barr + off, n_out, &beta,
         Carr + off, ldC, bs);
     if (st != blas::SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: reduceN fwd cublasSgemmBatched failed (status {})", (int) st);
+      GRACE_KK_ERROR("GRACE-3L/KK: reduceN fwd GEMM ({}) failed (status {})", blas::name(), (int) st);
   }
   return true;
 }
 #endif
 
 // ======================================================================
-// Kernel: TagFCRight2Left (Task 2.6) — generic FCRight2Left. Reproduces
-// numpy_forward_3l.fc_right2left EXACTLY for one FC f over the current chunk:
+// Kernel: TagFCRight2Left — generic FCRight2Left. Reproduces
+// the reference fc_right2left EXACTLY for one FC f over the current chunk:
 //   left_t[lm,a,k] = left_coefs ? norm_left * Sum_n w_left[k,n,w_tile_left[lm]]
 //                                            * left[a,n,lm]     (lm in [0,n_funcs_left))
 //                               : left[a,k,lm]      (left already at this FC's n_out)
@@ -237,7 +236,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagFCRig
 }
 
 // ======================================================================
-// compute_fc (Task 2.6) — generic FCRight2Left. Sets the per-call launch
+// compute_fc — generic FCRight2Left. Sets the per-call launch
 // state (FC metadata + left/right input views + output view) captured by
 // TagFCRight2Left, then launches one flat pass over (atom, n_out) for the
 // current chunk. Reused by every A*_2a/2b FC.
@@ -262,7 +261,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_fc(
         (const float*) f.Bw.data(), ni, (long long) no * ni,
         &one, (float*) out.data(), (int) out.extent(0), (long long) out.extent(0) * out.extent(1), nf);
     if (st != blas::SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: FC forward cublas failed (status {})", (int) st);
+      GRACE_KK_ERROR("GRACE-3L/KK: FC forward GEMM ({}) failed (status {})", blas::name(), (int) st);
     return;
   }
 #endif
@@ -275,8 +274,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_fc(
 }
 
 // ======================================================================
-// Kernel: TagEqNorm (Task 2.7) — generic EquivariantRMSNorm. Reproduces
-// numpy_forward_3l.equivariant_rms_norm EXACTLY for one eqnorm e over the
+// Kernel: TagEqNorm — generic EquivariantRMSNorm. Reproduces
+// the reference equivariant_rms_norm EXACTLY for one eqnorm e over the
 // current chunk. x = eqnorm_in[a, feat, lm] with feat in [0,n_out=n_feat),
 // lm in [0,M):
 //   center_l0: l0_mean[lm] = mean_over_feat(x[a,:,lm]) * l0_mask[lm]
@@ -334,7 +333,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagEqNor
 }
 
 // ======================================================================
-// compute_equiv_rms_norm (Task 2.7) — generic EquivariantRMSNorm. Sets the
+// compute_equiv_rms_norm — generic EquivariantRMSNorm. Sets the
 // per-call launch state captured by TagEqNorm, then launches one thread per
 // atom for the current chunk. Reused for eq1_norm/eq2_norm.
 // ======================================================================
@@ -373,7 +372,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_equiv_rms_no
 }
 
 // ======================================================================
-// Kernel: TagEqNormBwd (Task 3.2) — generic EquivariantRMSNorm VJP. Analytic
+// Kernel: TagEqNormBwd — generic EquivariantRMSNorm VJP. Analytic
 // transpose of TagEqNorm. Forward (per atom a; x=eqnorm_in[a,f,lm], f<n_feat,
 // lm<M):
 //   l0mean[lm] = mean_f(x[a,:,lm]) * l0_mask[lm]     (center_l0)
@@ -455,7 +454,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagEqNor
     }
 }
 
-// compute_equiv_rms_norm_bwd (Task 3.2) — sets the per-call state captured by
+// compute_equiv_rms_norm_bwd — sets the per-call state captured by
 // TagEqNormBwd, then launches one thread per atom. ASSIGNS adj_in.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_equiv_rms_norm_bwd(
@@ -477,15 +476,15 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_equiv_rms_no
 }
 
 // ======================================================================
-// Kernel: TagRMSNorm (Task 2.7) — generic InvariantLayerRMSNorm. Reproduces
-// numpy_forward_3l.invariant_rms_norm EXACTLY for one rmsnorm r over the
+// Kernel: TagRMSNorm — generic InvariantLayerRMSNorm. Reproduces
+// the reference invariant_rms_norm EXACTLY for one rmsnorm r over the
 // current chunk, at one (atom, lm) column x[a,:,lm]:
 //   full        (scale_len==n_out):   rms = 1/sqrt(mean_over_ch(x^2)+eps);
 //                                      out[ch] = x[ch]*rms*scale[ch]
 //   only_nonlin (scale_len==n_out-1): out[0] = x[0] (passthrough); rms over
 //                                      channels [1,n_out) only;
 //                                      out[ch] = x[ch]*rms*scale[ch-1], ch>=1
-// eps=1e-10 fixed (oracle hardcodes F32(1e-10), not an npz-loaded value).
+// eps=1e-10 fixed (the reference hardcodes F32(1e-10), not an npz-loaded value).
 // One thread owns the whole column x[a,:,lm] (flat index over atom a, lm) ->
 // no atomics needed (same ownership pattern as TagReduceN/TagFCRight2Left).
 // ======================================================================
@@ -528,7 +527,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagRMSNo
 }
 
 // ======================================================================
-// compute_invariant_rms_norm (Task 2.7) — generic InvariantLayerRMSNorm.
+// compute_invariant_rms_norm — generic InvariantLayerRMSNorm.
 // Sets the per-call launch state captured by TagRMSNorm, then launches one
 // flat pass over (atom, lm) for the current chunk. Reused for
 // rho1_norm/rho2_norm/rho3_norm.
@@ -547,8 +546,8 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_invariant_rm
 }
 
 // ======================================================================
-// ============ Task 3.1: readout + Layer-3 backward (adjoints) ==========
-// GENERIC reverse-mode VJP kernels + launchers (reused by Tasks 3.2/3.3 for
+// ============ readout + Layer-3 backward (adjoints) ==========
+// GENERIC reverse-mode VJP kernels + launchers (reused for
 // L2/L1). Each is the analytic transpose of the matching forward routine.
 // ======================================================================
 
@@ -635,7 +634,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagReado
   // channel/lm first (n_lm==1 for rho, but stay general), then set ch0 + ch1..nin0.
   const int nch = (int) d_rho3_norm_adj.extent(1);
   const int n_lm = (int) d_rho3_norm_adj.extent(2);
-  // Task 3.5b: rho1/rho2 readout adjoints are natom-promoted -> write the dense
+  // rho1/rho2 readout adjoints are natom-promoted -> write the dense
   // list-order row (ii+chunk_offset) so they survive until P5/P4; rho3 stays
   // chunk-local (ii, consumed within THIS P3 chunk).
   const int io = ii + chunk_offset;
@@ -820,11 +819,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd(
   if (blas_handle && sizeof(NNScalar) == 4) {
     const DeviceReduce *rbase = d_reduce;
     const int idx = (int) (&r - rbase);
-    if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok && h_reduce[idx].grouped &&
+    if (idx >= 0 && idx < n_reduces && h_reduce[idx].gemm_form_ok && h_reduce[idx].grouped &&
         compute_reduceN_grouped(idx, adj_inputs[0], adj_out, true))
       return;
-    if (idx >= 0 && idx < n_reduces && h_reduce[idx].cublas_ok &&
-        compute_reduceN_bwd_cublas(r, idx, adj_out, adj_inputs[0]))
+    if (idx >= 0 && idx < n_reduces && h_reduce[idx].gemm_form_ok &&
+        compute_reduceN_bwd_blas(r, idx, adj_out, adj_inputs[0]))
       return;
   }
 #endif
@@ -852,10 +851,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_
   const int idx = (int) (&r - d_reduce);
   if (!off && blas_handle && sizeof(NNScalar) == 4 && idx >= 0 && idx < n_reduces && r.n_instr == 1) {
     const ReduceHost &hr = h_reduce[idx];
-    bool cover = hr.cublas_ok && hr.grouped && hr.n_conn == (int) adj_in.extent(2);
+    bool cover = hr.gemm_form_ok && hr.grouped && hr.n_conn == (int) adj_in.extent(2);
     for (size_t f = 0; cover && f < hr.gn.size(); f++)
       if (hr.gn[f] > 0 && hr.gstart[f] + hr.gn[f] > (int) adj_in.extent(2)) cover = false;
-    // collect_ind is a bijection (cublas_ok), so n_conn columns in range are every column exactly once
+    // collect_ind is a bijection (gemm_form_ok), so n_conn columns in range are every column exactly once
     if (cover && compute_reduceN_grouped(idx, adj_in, adj_out, true, true)) return;
   }
 #endif
@@ -866,14 +865,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_
 }
 
 #ifdef GRACE_KK_GEMM
-// Opt 17: cuBLAS batched-GEMM ReduceN backward (VJP). adj_in(a,n,ci(c)) += Σ_k
+// BLAS batched-GEMM ReduceN backward (VJP). adj_in(a,n,ci(c)) += Σ_k
 // adj_out(a,k,tsi(c)) * Wsc[c](k,n), Wsc carrying norm*norm_map(tsi(c)) (same fold as
-// forward). collect_ind is a bijection (enforced at setup: cublas_ok is cleared for any
+// forward). collect_ind is a bijection (enforced at setup: gemm_form_ok is cleared for any
 // reduce with duplicate collect_ind) -> every connection writes a DISTINCT adj_in slab,
 // so a single beta=1 batch accumulates into the (pre-zeroed, fan-in) adj_in with no
 // scatter and no race. OP_N/OP_N (K=n_out). True fp32 (PEDANTIC handle).
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
-bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_cublas(
+bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_blas(
     const DeviceReduce &r, int idx, const t_nn_3d &adj_out, const t_nn_3d &adj_in)
 {
   const ReduceHost &hr = h_reduce[idx];
@@ -902,7 +901,7 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_bwd_
       Aarr, ldAo, Barr, n_out, &beta,
       Carr, ldAi, nc);
   if (st != blas::SUCCESS)
-    GRACE_KK_ERROR("GRACE-3L/KK: reduceN bwd cublasSgemmBatched failed (status {})", (int) st);
+    GRACE_KK_ERROR("GRACE-3L/KK: reduceN bwd GEMM ({}) failed (status {})", blas::name(), (int) st);
   return true;
 }
 #endif
@@ -951,14 +950,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_grou
       st = blas::sgemm_batched(blas_handle, blas::OP_N, blas::OP_T, K, chunk_size, n_out, &one,
                                (const float **) Pw, K, (const float **) Pout, (int) E0o, &zero, Pin, (int) ldT, cnt);
     if (st != blas::SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: row-major grouped reduce cublasSgemmBatched failed (status {})", (int) st);
+      GRACE_KK_ERROR("GRACE-3L/KK: row-major grouped reduce GEMM ({}) failed (status {})", blas::name(), (int) st);
   }
 }
 
 #endif
 #ifdef GRACE_KK_GEMM
 // Grouped reduce: forward out(:,:,f) = in(:, :, gstart f .. +gn f) [cs x gn n_in] * Bg_f [gn n_in x n_out];
-// backward din(:, :, block f) += dout(:,:,f) * Bg_f^T. One cublasSgemmBatched per set of outputs with equal gn.
+// backward din(:, :, block f) += dout(:,:,f) * Bg_f^T. One blas::sgemm_batched per set of outputs with equal gn.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_grouped(
     int idx, const t_nn_3d &in, const t_nn_3d &out, bool bwd, bool assign)
@@ -999,7 +998,7 @@ bool Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_reduceN_grou
                                (const float **) Pout, (int) E0o, (const float **) Pw, K, assign ? &zero : &one, Pin,
                                (int) E0i, cnt);
     if (st != blas::SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: grouped reduce cublasSgemmBatched failed (status {})", (int) st);
+      GRACE_KK_ERROR("GRACE-3L/KK: grouped reduce GEMM ({}) failed (status {})", blas::name(), (int) st);
   }
   return true;
 }
@@ -1025,7 +1024,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_fc_bwd(
         &one, (float*) adj_right.data(), (int) adj_right.extent(0),
         (long long) adj_right.extent(0) * adj_right.extent(1), nf);
     if (st != blas::SUCCESS)
-      GRACE_KK_ERROR("GRACE-3L/KK: FC backward cublas failed (status {})", (int) st);
+      GRACE_KK_ERROR("GRACE-3L/KK: FC backward GEMM ({}) failed (status {})", blas::name(), (int) st);
     return;
   }
 #endif

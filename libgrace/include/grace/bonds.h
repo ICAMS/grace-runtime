@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Bond gathering of the fused CPU drivers, one specialisation per bond source. The LammpsBonds version is
-// the former gather_bonds of the LAMMPS styles with the same statements in the same order (the LAMMPS
-// results must stay bit-identical); the CsrBonds version differs only in where j and r_ij come from.
+// Bond gathering of the fused CPU drivers, one specialisation per bond source: the LammpsBonds and CsrBonds
+// versions differ only in where j and r_ij come from.
 #pragma once
 
 #include "grace/fused_cpu.h"
@@ -9,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace grace {
 
@@ -46,6 +46,21 @@ template<class W> double bond_couple(W &w, const Coupling &c, int i, int j, doub
 }
 }    // namespace detail
 
+// A bond of length 0 (two atoms, or an atom and an image of one, at the same position) is not physical: the gathers
+// note the first one in the Work (zero_i, zero_j) and skip it, and the engine raises with throw_zero_bond after its
+// parallel region (an exception must not leave an OpenMP region).
+template<class Works> void throw_zero_bond(Works &work)
+{
+  for (auto &w : work)
+    if (w && w->zero_i >= 0) {
+      const int i = w->zero_i, j = w->zero_j;
+      for (auto &v : work)
+        if (v) v->zero_i = v->zero_j = -1;
+      throw Error("two atoms at the same position (a bond of length 0 between atoms " + std::to_string(i) + " and " +
+                  std::to_string(j) + " of the neighbour list): not a physical structure");
+    }
+}
+
 // two-group coupling: the model's bond gradient fv (at r' = rm) -> the gradient in r_ij, fv = J^T fv with
 // J = dr'/dr n n^T + r'/r (1 - n n^T); dE/dlambda into dedl; returns the true r (for the virial)
 inline double couple_force(const double *cp, double rm, const double *rh, double *fv, double &dedl)
@@ -78,12 +93,16 @@ template<> struct BondGather<LammpsBonds> {
         const double dx = s.x[j][0] - xi, dy = s.x[j][1] - yi, dz = s.x[j][2] - zi;
         const double rsq = dx * dx + dy * dy + dz * dz;
         const int jt = s.type[j];
-        if (rsq >= f.cutsq[itype][jt]) continue;
+        if (!(rsq < f.cutsq[itype][jt])) continue;    // beyond the cutoff (NaN too)
+        if (rsq == 0.0) {    // not physical: an error after the parallel region (throw_zero_bond)
+          if (w.zero_i < 0) { w.zero_i = i; w.zero_j = j; }
+          continue;
+        }
         const double r = std::sqrt(rsq), ir = 1.0 / r;
         double rm = r;    // the model's bond length (coupling: r')
         if (f.cpl) {
           rm = detail::bond_couple(w, *f.cpl, i, j, r, f.rcut_type[itype * f.ntp + jt], nb);
-          if (rm >= f.rcut_type[itype * f.ntp + jt]) continue;
+          if (!(rm < f.rcut_type[itype * f.ntp + jt] && rm > 0.0)) continue;
         }
         w.bj[nb] = j;
         w.bt[nb] = jt;
@@ -113,15 +132,21 @@ template<> struct BondGather<CsrBonds> {
       const int itype = s.type[i];
       for (int64_t q = s.offset[i]; q < s.offset[i + 1]; q++) {
         const int j = s.j[q];
-        const double dx = s.rij[3 * q], dy = s.rij[3 * q + 1], dz = s.rij[3 * q + 2];
+        double buf[3];
+        const double *d = s.bond(i, q, buf);
+        const double dx = d[0], dy = d[1], dz = d[2];
         const double rsq = dx * dx + dy * dy + dz * dz;
         const int jt = s.type[j];
-        if (rsq >= f.cutsq[itype][jt]) continue;
+        if (!(rsq < f.cutsq[itype][jt])) continue;    // beyond the cutoff (NaN too)
+        if (rsq == 0.0) {    // not physical: an error after the parallel region (throw_zero_bond)
+          if (w.zero_i < 0) { w.zero_i = i; w.zero_j = j; }
+          continue;
+        }
         const double r = std::sqrt(rsq), ir = 1.0 / r;
         double rm = r;    // the model's bond length (coupling: r')
         if (f.cpl) {
           rm = detail::bond_couple(w, *f.cpl, i, j, r, f.rcut_type[itype * f.ntp + jt], nb);
-          if (rm >= f.rcut_type[itype * f.ntp + jt]) continue;
+          if (!(rm < f.rcut_type[itype * f.ntp + jt] && rm > 0.0)) continue;
         }
         w.bj[nb] = j;
         w.bt[nb] = jt;

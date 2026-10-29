@@ -11,11 +11,9 @@ import os
 
 import numpy as np
 import pytest
-from ase import Atoms
-from ase.build import bulk, molecule
-from ase.spacegroup import crystal
 
 tp = pytest.importorskip("tensorpotential.calculator.asecalculator")
+from gate_cells import equilibrium_structures as structures  # noqa: E402
 from grace_runtime import GRACERuntimeCalculator, Model  # noqa: E402
 
 CACHE = os.path.expanduser(os.environ.get("GRACE_CACHE", "~/.cache/grace"))
@@ -28,38 +26,6 @@ MODELS = [  # (name, kokkos.npz of the fp32 model, fp64 SavedModel)
 TOL = {"3L-OMAT-large": (2e-6, 2e-6, 5e-5)}    # (dE/atom >= 10 atoms, below, dF); default (1e-6, 2e-6, 2e-5); 3L measured
 # dE/atom <= 2.2e-7 (C64; 9.6e-7 for the 1-atom W1), dF <= 1.0e-5 against the fp32 SavedModel
 TOL_S, TOL_E_ATOM = 2e-5, 1e-5    # stress (relative, see the module doc), per-atom energy (eV); all models
-HEA25 = ["Al", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo", "Ru", "Rh", "Pd",
-         "Ag", "Hf", "Ta", "W", "Re", "Os", "Ir"]
-
-
-def structures():
-    rng = np.random.default_rng(7)
-    out = {}
-    w = bulk("W", "bcc", a=3.165, cubic=True).repeat(3)
-    w.rattle(0.05, seed=1)
-    out["W54"] = w
-    sto = crystal(["Sr", "Ti", "O"], basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)], spacegroup=221,
-                  cellpar=[3.905] * 3 + [90] * 3).repeat(2)
-    sto.rattle(0.03, seed=2)
-    out["SrTiO3-40"] = sto
-    hea = bulk("W", "bcc", a=3.165, cubic=True).repeat(3)
-    hea.set_chemical_symbols(rng.permutation(np.resize(HEA25, len(hea))))
-    hea.rattle(0.03, seed=3)
-    out["HEA25-54"] = hea
-    c = bulk("C", "diamond", a=3.567, cubic=True).repeat(2)
-    c.rattle(0.03, seed=4)
-    out["C64"] = c
-    tri = bulk("W", "bcc", a=3.165).repeat((2, 1, 1))
-    tri.rattle(0.03, seed=5)
-    out["W2tri"] = tri
-    out["W1"] = bulk("W", "bcc", a=3.165)
-    out["H2O"] = molecule("H2O")
-    slab = bulk("Al", "fcc", a=4.05, cubic=True).repeat((2, 2, 3))
-    slab.center(vacuum=8.0, axis=2)
-    slab.pbc = (True, True, False)
-    slab.rattle(0.03, seed=6)
-    out["Al-slab"] = slab
-    return out
 
 
 @pytest.mark.parametrize("name,npz,saved", MODELS, ids=[m[0] for m in MODELS])

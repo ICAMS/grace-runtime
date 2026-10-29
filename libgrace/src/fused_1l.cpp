@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE/pair_grace_1l_fused.cpp (lammps-ace, feature/grace-fused); contributing author:
-// Yury Lysogorskiy (ICAMS). Model layout, layers and the compute loop are unchanged; LAMMPS calls are replaced
-// by the bond source, Outputs, grace::Error and the Logger.
+// Contributing author: Yury Lysogorskiy (ICAMS). Input through the bond source, results through Outputs, errors
+// through grace::Error and the Logger.
 
 #include "grace/fused_1l.h"
 
@@ -26,7 +25,7 @@ namespace grace {
 using namespace fused;
 
 namespace {
-// "{}" placeholders filled in order (the log lines of the former LAMMPS style)
+// "{}" placeholders filled in order
 inline void braces_rec(std::ostringstream &o, const char *f) { o << f; }
 template<class T, class... R> void braces_rec(std::ostringstream &o, const char *f, const T &v, const R &...r)
 {
@@ -53,6 +52,7 @@ inline void add_bond_virial(double *v, const double *rh, double r, const double 
 
 struct Grace1LFused::Work {
   int nbat = 0, ty = 0;
+  int zero_i = -1, zero_j = -1;    // the first bond of length 0 its gathers met (throw_zero_bond)
   int atom[NB];
   double E[NB];
   std::vector<int> boff, bj, bt;
@@ -105,7 +105,7 @@ void Grace1LFused::build_splines()
   const double h = 1.0 / N;
   const auto &layers = m.mlp_rad_layers;
   const int nout = layers.back().n_out;
-  if (nout != CA * nl) throw Error("pair grace/1l/fused: radial MLP output width mismatch");
+  if (nout != CA * nl) throw Error("GRACE-1L: radial MLP output width mismatch");
   std::vector<double> fv((size_t) (N + 1) * nout), dv((size_t) (N + 1) * nout), g, dg, out, dout;
   for (int k = 0; k <= N; k++) {
     radial_basis_x(k * h, m.radial_basis_p, m.nradbase, g, dg);
@@ -132,12 +132,12 @@ void Grace1LFused::build_model()
   const GRACE1LModel &m = *model;
   const Ctx cx{ntypes, &type2mu, m.n_elements};
   lmax = m.lmax;
-  if (lmax > MAX_LMAX) throw Error(braces("pair grace/1l/fused: lmax > {} not supported", MAX_LMAX));
+  if (lmax > MAX_LMAX) throw Error(braces("GRACE-1L: lmax > {} not supported", MAX_LMAX));
   nl = lmax + 1;
   nlm = nl * nl;
   CA = m.nradmax;
   CF = m.fc_A1.n_out;
-  if (m.fc_AA1.n_out != CF || m.fc_AA2.n_out != CF) throw Error("pair grace/1l/fused: FC widths differ");
+  if (m.fc_AA1.n_out != CF || m.fc_AA2.n_out != CF) throw Error("GRACE-1L: FC widths differ");
   PA = pad16(CA);
   PF = pad16(CF);
   nrho = m.rho_n_out;
@@ -211,7 +211,7 @@ void Grace1LFused::build_model()
   build_fc(fcAA1, m.fc_AA1, CF, CA, PF, PA, PF, liveAA1, cx);
   build_fc(fcAA2, m.fc_AA2, CF, CA, PF, PA, PF, liveAA2, cx);
   if (fcA1.nfl != nlm || fcAA1.nfl != nAA || fcAA2.nfl != nAA)
-    throw Error("pair grace/1l/fused: unexpected function counts");
+    throw Error("GRACE-1L: unexpected function counts");
   rowred = !getenv("G2LF_NOROWRED");
   if (rowred) {
     build_rowred(rrRho_3, rRho, 2, nAAA);
@@ -226,18 +226,18 @@ void Grace1LFused::build_model()
     e_nout.push_back(Lr.n_out);
   }
   if (e_nin.empty() || e_nin[0] != nrho - 1 || e_nout.back() != 1)
-    throw Error("pair grace/1l/fused: unexpected energy MLP shape");
+    throw Error("GRACE-1L: unexpected energy MLP shape");
   // energy_atom keeps the activations in fixed stack buffers act/pre[8][256] (it runs inside the parallel region,
   // where it cannot throw): at most 7 layers and every width at most 256
-  if (e_nin.size() > 7) throw Error(braces("pair grace/1l/fused: energy MLP has {} layers, at most 7 supported", e_nin.size()));
+  if (e_nin.size() > 7) throw Error(braces("GRACE-1L: energy MLP has {} layers, at most 7 supported", e_nin.size()));
   for (size_t L = 0; L < e_nin.size(); L++)
     if (e_nin[L] > 256 || e_nout[L] > 256 || e_nin[L] < 1 || e_nout[L] < 1 || L + 1 < e_nin.size() && e_nout[L] != e_nin[L + 1] ||
         eW[L].size() != (size_t) e_nin[L] * e_nout[L])
-      throw Error(braces("pair grace/1l/fused: energy MLP layer {} is {} x {} (widths 1..256, consecutive layers must match)",
+      throw Error(braces("GRACE-1L: energy MLP layer {} is {} x {} (widths 1..256, consecutive layers must match)",
                          L, e_nin[L], e_nout[L]));
   e_act = m.energy_mlp_activation;
   out_scale = m.output_scale;
-  log.info(braces("[grace/1l/fused] lmax {} | A {} ch, FC {} ch | live A1 {}/{} AA {}/{} AA1 {}/{} AAA {}/{} AA2 {}/{} "
+  log.info(braces("[GRACE-1L] lmax {} | A {} ch, FC {} ch | live A1 {}/{} AA {}/{} AA1 {}/{} AAA {}/{} AA2 {}/{} "
                    "AAAA {}/{} | rho {} | spline N {}",
                    lmax, CA, CF, count(liveA1), nlm, count(nAAv), nAA, count(liveAA1), nAA, count(nAAAv), nAAA,
                    count(liveAA2), nAA, count(nAAAAv), nAAAA, nrho, spline_n));
@@ -389,6 +389,7 @@ double Grace1LFused::energy_atom(const float *rho, int ty, float *grho) const
     }
   }
   const double Ei = (act[nlay][0] + rho[0]) * out_scale + shift_type[ty];
+  if (!grho) return Ei;
   double g[MAXW], gn[MAXW];
   g[0] = out_scale;
   for (int L = nlay - 1; L >= 0; L--) {
@@ -396,7 +397,7 @@ double Grace1LFused::energy_atom(const float *rho, int ty, float *grho) const
       for (int c = 0; c < e_nout[L]; c++) {
         const double v = pre[L][c];
         if (e_act == 1) {
-          const double t = std::tanh(v);
+          const double t = act[L + 1][c];
           g[c] *= 1.0 - t * t;
         } else {
           const double sg = 1.0 / (1.0 + std::exp(-v));
@@ -420,7 +421,7 @@ Grace1LFused::Grace1LFused(std::shared_ptr<const GRACE1LModel> m, FusedSettings 
     log(log_), model(std::move(m))
 {
   spline_n = s.spline_n;
-  if (spline_n < 16) throw Error("pair grace/1l/fused: spline N must be >= 16");
+  if (spline_n < 16) throw Error("GRACE-1L: spline N must be >= 16");
   g_prof_on = getenv("G2LF_PROF") != nullptr;
 }
 
@@ -430,7 +431,7 @@ void Grace1LFused::setup_types(int ntypes_, const std::vector<int> &type2mu_)
 {
   ntypes = ntypes_;
   type2mu = type2mu_;
-  check_type2mu(type2mu, ntypes, model->n_elements, "pair grace/1l/fused");
+  check_type2mu(type2mu, ntypes, model->n_elements, "GRACE-1L");
   build_model();
   const int ntp = ntypes + 1;
   cutsq_flat.assign((size_t) ntp * ntp, 0.0);
@@ -465,9 +466,9 @@ template<class Src>
 void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nodes, const Src &src, Outputs &out,
                            const ComputeFlags &fl, int nthreads_req)
 {
-  if (ntypes == 0) throw Error("pair grace/1l/fused: setup_types() not called");
+  if (ntypes == 0) throw Error("GRACE-1L: setup_types() not called");
   if (fl.couple.eq && (fl.couple.eq < 1 || fl.couple.eq > 4 || !fl.couple.mask))
-    throw Error("grace fused: two-group coupling needs eq 1..4 and the atom mask");
+    throw Error("GRACE-1L: two-group coupling needs eq 1..4 and the atom mask");
   const int *type = src.type;
   const bool eflag_atom = fl.eflag_atom && out.eatom;
   vflag_atom = fl.vflag_atom && out.vatom;
@@ -487,7 +488,7 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   bcount.clear();
   for (int q = 0; q < inum;) {
     if (type2mu[type[order[q]]] < 0)    // its per-type rows are not built (pair_style hybrid keeps it out of the list)
-      throw Error(braces("pair grace/1l/fused: atom {} of unmapped type {} in the atom list", order[q], type[order[q]]));
+      throw Error(braces("GRACE-1L: atom {} of unmapped type {} in the atom list", order[q], type[order[q]]));
     int n = 1;
     while (n < NB && q + n < inum && type[order[q + n]] == type[order[q]]) n++;
     bstart.push_back(q);
@@ -521,10 +522,10 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   const int nall = n_nodes;
   const bool uq_on = fl.uq;
   const bool eonly = fl.energy_only;    // no backward pass: no forces, no virials
-  if (uq_on && !uq_ready) throw Error("grace/1l/fused: UQ requested before enable_uq()");
+  if (uq_on && !uq_ready) throw Error("GRACE-1L: UQ requested before enable_uq()");
   if (uq_on && inum > 0 && !(out.gamma && out.atomic_sigma && out.gmm_cluster))    // no atoms: nothing written
-    throw Error("grace/1l/fused: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
-  fthr.ensure(nthreads, nmax_nodes);
+    throw Error("GRACE-1L: UQ requested without the gamma / atomic_sigma / gmm_cluster outputs");
+  if (!eonly) fthr.ensure(nthreads, nmax_nodes);
   double eng = 0.0;
 #pragma omp parallel reduction(+ : eng) num_threads(nth)
   {
@@ -536,18 +537,18 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
     const int tid = 0;
 #endif
     Work &w = *work[tid];
-    w.ft = fthr.of(tid);
+    w.ft = eonly ? nullptr : fthr.of(tid);
     w.nbat = bcount[q];
     for (int a = 0; a < w.nbat; a++) w.atom[a] = order[bstart[q] + a];
     w.ty = type[w.atom[0]];
     { PROF(T_BOND); bonds(w, src, !eonly); }
     forward(w);
     if (uq_on) uq_batch(w, out);
-    vzero(w.gRho.data(), (size_t) NB * PRHO);
+    if (!eonly) vzero(w.gRho.data(), (size_t) NB * PRHO);
     {
       PROF(T_EN);
       for (int a = 0; a < w.nbat; a++) {
-        const double Ei = energy_atom(w.Rho.data() + a * PRHO, w.ty, w.gRho.data() + a * PRHO);
+        const double Ei = energy_atom(w.Rho.data() + a * PRHO, w.ty, eonly ? nullptr : w.gRho.data() + a * PRHO);
         eng += Ei;
         if (eflag_atom) out.eatom[w.atom[a]] += Ei;
       }
@@ -560,6 +561,7 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   if (uq_on) uq_flush(*work[0], out);
 #endif
   }
+  throw_zero_bond(work);
   if (nall > 0 && !eonly) fthr.reduce(out.f, nall);
   out.energy += eng;
   if (g_prof_on) g_prof[T_P3] += now_s() - t0;
@@ -575,13 +577,13 @@ void Grace1LFused::enable_uq()
   const GRACE1LModel &m = *model;
   m.validate_uq();
   if (fused::uq_width(rRho) != m.uq_d_basis)
-    throw Error(braces("grace/1l/fused UQ: basis width {} != uq_rp_matrix rows {}", fused::uq_width(rRho), m.uq_d_basis));
-  if (m.uq_feature_dim != m.uq_rp_dim + m.uq_n_density) throw Error("grace/1l/fused UQ: inconsistent UQ head");
+    throw Error(braces("GRACE-1L UQ: basis width {} != uq_rp_matrix rows {}", fused::uq_width(rRho), m.uq_d_basis));
+  if (m.uq_feature_dim != m.uq_rp_dim + m.uq_n_density) throw Error("GRACE-1L UQ: inconsistent UQ head");
   uq_rp.assign(m.uq_rp_matrix.begin(), m.uq_rp_matrix.end());
   uq_ready = true;
 }
 
-// UQ of a batch after the forward (as grace/1l/kk): one invariant block, the rho reduce sources
+// UQ of a batch after the forward (as Grace1LKK): one invariant block, the rho reduce sources
 void Grace1LFused::uq_batch(Work &w, Outputs &out)
 {
   const GRACE1LModel &m = *model;

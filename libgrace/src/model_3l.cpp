@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from lammps-ace src/ML-PACE/grace_3l_model.cpp (GRACE3LModel::load).
+// GRACE3LModel::load: the GRACE-3L model from kokkos.npz.
 #include "grace/model_3l.h"
 #include "grace/error.h"
 #include "npz3.h"
@@ -24,7 +24,7 @@ bool has(const cnpy::npz_t &npz, const std::string &key) { return npz.find(key) 
 // a size: in [1, kMaxDim], required
 int get_size(const cnpy::npz_t &npz, const std::string &key) { return npz_require_int_in(npz, key, 1, kMaxDim); }
 
-// The GRACE-3L dataflow, as both engines (grace/3l/fused, GRACE-3L/KK) resolve it by name. Per layer k = 1, 2, 3
+// The GRACE-3L dataflow, as both engines (Grace3LFused, Grace3LKK) resolve it by name. Per layer k = 1, 2, 3
 // (K = A1, A2, A3), X are the layer's lm features: A1 the scalar SPBF itself; A2, A3 the reduce K_red of the
 // equivariant SPBF K, which couples the message eq{k-1}_norm of the layer before:
 //   K_2 = cp_l(X, X), K_2_red = reduce(K_2), K_2a = fc(K_2_red, X), K_3 = cp_l(K_2a, X), K_3_red = reduce(K_3),
@@ -165,6 +165,7 @@ void GRACE3LModel::load(const std::string &filepath) { load_arrays(npz_open(file
 void GRACE3LModel::load_arrays(const cnpy::npz_t &npz) {
   // a second load into the same object must keep nothing of the previous model
   *this = GRACE3LModel();
+  check_grace_format(npz, "GRACE-3L");
 
   // ---- Global metadata ----
   n_elements = get_size(npz, "n_elements");

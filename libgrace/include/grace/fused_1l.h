@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-// Moved from LAMMPS src/ML-PACE/pair_grace_1l_fused (lammps-ace, feature/grace-fused); contributing author:
-// Yury Lysogorskiy (ICAMS).
+// Contributing author: Yury Lysogorskiy (ICAMS).
 //
 // GRACE-1L fused CPU driver, fp32, type-homogeneous batches of NB atoms per OpenMP thread, tensors
 // [function][atom][channel] in a thread-private workspace, SIMD over channels; one pass (forward, energy,
@@ -32,7 +31,7 @@ class Grace1LFused {
   void setup_types(int ntypes, const std::vector<int> &type2mu);
   double cutoff(int t1, int t2) const { return rcut_type[t1 * (ntypes + 1) + t2]; }
 
-  // UQ (uqv6 gamma_only, as grace/1l/kk): validates the model's UQ head against the built reduces; throws Error when
+  // UQ (uqv6 gamma_only, as Grace1LKK): validates the model's UQ head against the built reduces; throws Error when
   // the model has none or an unusable one. Afterwards compute() with ComputeFlags::uq fills Outputs::gamma etc.
   void enable_uq();
   bool uq_enabled() const { return uq_ready; }
@@ -95,6 +94,7 @@ class Grace1LFused {
   void backward(Work &);
   void uq_batch(Work &, Outputs &);
   void uq_flush(Work &, Outputs &);
+  // the atom's energy from its rho; grho = dE/drho, skipped when nullptr (energy only)
   double energy_atom(const float *rho, int ty, float *grho) const;
 };
 

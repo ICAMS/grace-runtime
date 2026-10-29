@@ -4,6 +4,8 @@
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define GRACE_HD __host__ __device__ inline
+#define GRACE_NOINLINE __attribute__((noinline))    // a device function kept out of line (its frame off the caller's)
 #else
 #define GRACE_HD inline
+#define GRACE_NOINLINE
 #endif

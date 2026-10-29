@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 """Foundation model names -> ``kokkos.npz`` in the GRACE cache shared with tensorpotential.
 
-``models.json`` is generated from tensorpotential's ``foundation_models.py`` (``ci/gen_grace_runtime_models.py`` there).
+``models.json`` is generated from tensorpotential's ``foundation_models.py``.
 Files live in ``$GRACE_CACHE`` or ``~/.cache/grace``, at ``<name>/kokkos.npz``; variants sharing one file
 (``X`` and ``X-fp64``) are one entry with aliases, cached once under the entry name. Next to the file,
 ``.grace_origin.kokkos.json`` records where it came from; tensorpotential writes the same record. Rules:

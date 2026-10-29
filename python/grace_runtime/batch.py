@@ -4,11 +4,11 @@ per-structure sums on the device), or a loop over the CPU kernels with the same 
 from collections import OrderedDict
 
 import numpy as np
-from ase.data import atomic_numbers, chemical_symbols
+from ase.data import atomic_numbers
 
 from ._core import Model
-from .calculator import (_KK_CALCS, _KK_LOCK, _KK_MODELS, _chunk_arg, _CpuEngine, _results, _select_device,
-                         _type_lut, default_threads)
+from .calculator import (_KK_CALCS, _KK_LOCK, _KK_MODELS, _chunk_arg, _CpuEngine, _kk_model_key, _load_kk_model,
+                         _results, _select_device, _species_from_z, _type_lut, default_threads)
 from .dispersion import resolve as _resolve_dispersion
 from .neighbors import _padded_cell_arrays
 
@@ -23,17 +23,21 @@ def compute_batch(model, structures, device: str = "auto", uq: bool = False, ene
                   dispersion_parts: bool = False) -> list:
     """Energy, forces and stress of many ASE structures at once.
 
-    model: path to a kokkos.npz, a registry name or a grace_runtime.Model.
+    model: path to a kokkos.npz, a registry name, a PACE .yaml or a grace_runtime.Model.
+    structures: iterable of ASE Atoms.
     device: "auto" (default: the GPU when usable, as GRACERuntimeCalculator), "cuda" / "cuda:N", "rocm" / "rocm:N",
         "gpu" / "gpu:N" (fused GPU kernels, fp32) or "cpu" (the CPU kernels, one structure after another).
-    uq: the UQ head (uqv6 "gamma_only") as GRACERuntimeCalculator(uq=True).
-    energies: per-atom energies. energy_only: no forces / stress (no backward pass).
+    uq: the UQ head (uqv6 "gamma_only") as GRACERuntimeCalculator(uq=True); PACE models: their extrapolation grade
+        (the active set of the model), "gamma" only.
+    energies: return per-atom energies.
+    energy_only: skip forces and stress (no backward pass).
     max_atoms: atoms per call into the GPU module (GPU memory of the neighbour lists; structures are not split).
     max_nall: atoms + periodic images per engine pass (GPU memory; small cells have many images per atom).
     num_threads: threads of the CPU kernels (the GPU builds its neighbour lists itself).
     chunksize: atoms per GPU engine pass, as GRACERuntimeCalculator ("auto" or a number).
     dispersion: a dispersion correction added to the model, as GRACERuntimeCalculator (a grace_runtime.D3 or "d3-pbe",
-        "d3-r2scan"); dispersion_parts: also its own forces, stress and per-atom energies.
+        "d3-r2scan").
+    dispersion_parts: also return the dispersion's own forces, stress and per-atom energies.
 
     Returns one dict per structure: "energy" (eV), "forces" [n, 3] (eV/A), "stress" (ASE Voigt, eV/A^3, zeros for
     cells of rank < 3), with energies: "energies" [n], with uq: "gamma", "atomic_sigma", "gmm_cluster" [n] and
@@ -61,8 +65,6 @@ def compute_batch_iter(model, structures, device: str = "auto", uq: bool = False
     m = model if isinstance(model, Model) else Model(model)
     device, kkm, _ = _select_device(device, m)
     if uq:
-        if not m.has_uq:
-            raise ValueError("the model has no UQ head (kokkos.npz exported without UQ artifacts)")
         m.validate_uq()
     if kkm is None:
         nth = int(num_threads) if num_threads else default_threads()
@@ -93,7 +95,7 @@ def compute_batch_iter(model, structures, device: str = "auto", uq: bool = False
 def _species_of(structures) -> list:
     """sorted element symbols of the structures"""
     z = {int(n) for a in structures for n in np.unique(a.numbers)}
-    return sorted(chemical_symbols[k] for k in z)
+    return _species_from_z(z)
 
 
 def _portions(structures, max_atoms):
@@ -114,13 +116,14 @@ def _gpu_batch(kk, m, species, chunk, keep=False, dispersion=None):
     module; keep: one that keeps its device buffers between calls (MD loops, the TorchSim model); dispersion: a D3 set
     on the batch (part of the cache key, so batches with and without it never mix)"""
     dkey = None if dispersion is None else tuple(sorted(dispersion.params().items()))
-    key = (m.path, m.spline, tuple(species), chunk, dkey, keep)
+    mkey = _kk_model_key(m)
+    key = (mkey, m.spline, tuple(species), chunk, dkey, keep)
     with _KK_LOCK:
-        if m.path not in _KK_MODELS:
-            _KK_MODELS[m.path] = kk.Model(m.path)
+        if mkey not in _KK_MODELS:
+            _KK_MODELS[mkey] = _load_kk_model(kk, m)
         if key not in _KK_BATCHES:
             # ValueError: element the model lacks
-            b = kk.Batch(_KK_MODELS[m.path], species, spline=m.spline, chunksize=chunk)
+            b = kk.Batch(_KK_MODELS[mkey], species, spline=m.spline, chunksize=chunk)
             if dispersion is not None:
                 b.set_dispersion(dispersion.params(), [atomic_numbers[s] for s in species])
             b.keep_buffers = keep
@@ -132,18 +135,22 @@ def _gpu_batch(kk, m, species, chunk, keep=False, dispersion=None):
 
 
 def _gpu_compute(b, species, natoms, numbers, pos, cells, pbc, uq=False, energies=False, energy_only=False,
-                 max_nall=1 << 21, dispersion_parts=False):
+                 max_nall=1 << 21, dispersion_parts=False, *, starts=None, types=None):
     """One call into the GPU module for structures given as arrays: natoms [S], numbers [N] and pos [N, 3] of all
-    atoms (structure after structure), cells [S, 3, 3] (rows: cell vectors; zero vectors are padded), pbc [S, 3].
+    atoms (structure after structure), cells [S, 3, 3] (rows: cell vectors; zero ones and those of open directions
+    are padded), pbc [S, 3].
     Returns the module's output (energy [S], forces [N, 3], virial [S, 6] xx yy zz xy xz yz, ...)."""
     natoms = np.asarray(natoms, dtype=np.int32)
     pos = np.ascontiguousarray(pos, dtype=np.float64).reshape(-1, 3)
-    types = np.ascontiguousarray(_type_lut(species)[np.asarray(numbers)], dtype=np.int32)
+    if types is None:
+        types = np.ascontiguousarray(_type_lut(species)[np.asarray(numbers)], dtype=np.int32)
     cells = np.array(cells, dtype=np.float64).reshape(-1, 3, 3)
-    starts = np.concatenate([[0], np.cumsum(natoms)])
-    for k in np.flatnonzero(~np.any(cells != 0.0, axis=2).all(axis=1)):    # zero vectors: padded (open directions)
-        cells[k] = _padded_cell_arrays(cells[k], pos[starts[k]:starts[k + 1]], b.cutoff)[0]
+    if starts is None:
+        starts = np.concatenate([[0], np.cumsum(natoms)])
     pbc = np.ascontiguousarray(pbc, dtype=bool).reshape(-1, 3)
+    # zero vectors and the vectors of open directions: padded (normal to the periodic ones)
+    for k in np.flatnonzero(~(np.any(cells != 0.0, axis=2) & pbc).all(axis=1)):
+        cells[k] = _padded_cell_arrays(cells[k], pos[starts[k]:starts[k + 1]], b.cutoff, pbc[k])[0]
     return b.compute(natoms, types, pos, cells, pbc, energies=energies, uq=uq, energy_only=energy_only,
                      max_nall=max_nall, dispersion_parts=dispersion_parts)
 
@@ -183,9 +190,10 @@ def _split(out, at, k, n0, uq, energies, energy_only, disp=False, parts=False):
             o["dispersion_virial"] = out["dispersion_virial"][k]
     if energies:
         o["energies"] = out["energies"][sl].copy()
-    if uq:
-        o.update({key: out[key][sl].copy() for key in ("gamma", "atomic_sigma", "gmm_cluster")})
-        o["total_sigma"] = o["atomic_sigma"].sum()
+    if uq:    # PACE: the extrapolation grade (gamma) only
+        o.update({key: out[key][sl].copy() for key in ("gamma", "atomic_sigma", "gmm_cluster") if key in out})
+        if "atomic_sigma" in o:
+            o["total_sigma"] = o["atomic_sigma"].sum()
     return _results(at, o)
 
 
@@ -213,4 +221,5 @@ def free_gpu_memory():
         _KK_MODELS.clear()
     for c in calcs:    # outside the lock: a compute running in another thread holds its System until it returns
         c.free_gpu_memory()
+    calcs = c = None    # this function's own references must not keep a calculator (in a cycle) alive past the collect
     gc.collect()

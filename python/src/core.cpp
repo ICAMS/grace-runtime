@@ -9,6 +9,11 @@
 #include "grace/fused_1l.h"
 #include "grace/fused_2l.h"
 #include "grace/fused_3l.h"
+#include "grace/model_kind.h"
+#include "grace/pace_cpu.h"
+#include "grace/pace_model.h"
+#include "grace/pace_radial.h"
+#include "pace_convert.h"
 #include "dispersion_args.h"
 #include "neighbors.h"
 
@@ -16,22 +21,22 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <tuple>
-#include <set>
 #include <string>
 #include <vector>
 #ifdef __linux__
@@ -60,43 +65,14 @@ int affinity_threads()
 #endif
 }
 
-// member names of a zip archive from its central directory (only the end of the file is read)
-std::set<std::string> zip_names(const std::string &path)
-{
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f) throw nb::value_error(("cannot open " + path).c_str());
-  const int64_t size = f.tellg();
-  const int64_t tail = std::min<int64_t>(size, 65536 + 22);
-  std::vector<unsigned char> b(tail);
-  f.seekg(size - tail);
-  f.read(reinterpret_cast<char *>(b.data()), tail);
-  auto u16 = [&](const unsigned char *p) { return (uint32_t) p[0] | (uint32_t) p[1] << 8; };
-  auto u32 = [&](const unsigned char *p) { return u16(p) | u16(p + 2) << 16; };
-  int64_t eocd = -1;
-  for (int64_t q = tail - 22; q >= 0; q--)
-    if (u32(&b[q]) == 0x06054b50u) { eocd = q; break; }
-  if (eocd < 0) throw nb::value_error(("not a zip/npz file: " + path).c_str());
-  const uint32_t cd_size = u32(&b[eocd + 12]), cd_off = u32(&b[eocd + 16]);
-  std::vector<unsigned char> cd(cd_size);
-  f.seekg(cd_off);
-  f.read(reinterpret_cast<char *>(cd.data()), cd_size);
-  if (!f) throw nb::value_error(("cannot read the zip directory of " + path).c_str());
-  std::set<std::string> names;
-  for (size_t q = 0; q + 46 <= cd.size() && u32(&cd[q]) == 0x02014b50u;) {
-    const uint32_t nl = u16(&cd[q + 28]), xl = u16(&cd[q + 30]), cl = u16(&cd[q + 32]);
-    names.emplace(reinterpret_cast<const char *>(&cd[q + 46]), nl);
-    q += 46 + nl + xl + cl;
-  }
-  return names;
-}
-
+// "1l" / "2l" / "3l" / "pace" (grace::model_kind); not a model: ValueError
 std::string detect_arch(const std::string &path)
 {
-  const auto n = zip_names(path);
-  if (n.count("mlp_rad_W0.npy")) return "1l";
-  if (n.count("B0_lin_transform_W.npy")) return "2l";
-  if (n.count("prod_names.npy")) return "3l";
-  throw nb::value_error(("not a GRACE-1L/2L/3L kokkos.npz: " + path).c_str());
+  try {
+    return grace::model_kind_tag(grace::model_kind(path));
+  } catch (const grace::Error &e) {
+    throw nb::value_error(e.what());
+  }
 }
 
 template<class T> nb::ndarray<nb::numpy, double> owned(std::unique_ptr<T[]> p, std::initializer_list<size_t> shape)
@@ -118,7 +94,7 @@ template<class T> nb::ndarray<nb::numpy, T> from_vec(std::vector<T> &&v, std::in
   return nb::ndarray<nb::numpy, T>(p->data(), shape, own);
 }
 
-// cell-list neighbour search (NeighborList backend "native"): perm, offset, j, io, jo, shift
+// cell-list neighbour search (NeighborList backend "native"): perm, offset, j, image, shifts
 auto neighbor_search(HostArray<const double, nb::shape<-1, 3>> x,
                      HostArray<const double, nb::shape<3, 3>> cell, std::array<bool, 3> pbc, double cutoff,
                      int num_threads)
@@ -136,8 +112,8 @@ auto neighbor_search(HostArray<const double, nb::shape<-1, 3>> x,
   }
   const size_t nb_ = r.j.size();
   return std::make_tuple(from_vec(std::move(r.perm), {(size_t) n}), from_vec(std::move(r.offset), {(size_t) n + 1}),
-                         from_vec(std::move(r.j), {nb_}), from_vec(std::move(r.io), {nb_}),
-                         from_vec(std::move(r.jo), {nb_}), from_vec(std::move(r.shift), {nb_, 3}));
+                         from_vec(std::move(r.j), {nb_}), from_vec(std::move(r.image), {nb_}),
+                         from_vec(std::move(r.shifts), {r.shifts.size() / 3, 3}));
 }
 
 // r_ij = x[j] - x[i] + shift, one row per bond (the calculator's per-step bond vectors)
@@ -203,6 +179,45 @@ nb::dict dispersion_compute(const nb::dict &params, HostArray<const int32_t, nb:
   return d;
 }
 
+// the PACE npz arrays of a pacemaker B-basis .yaml and its active set (asi: the .asi or empty), as name -> (numpy
+// descr, shape, bytes), for np.savez in Python (cnpy has no npz writer)
+std::map<std::string, std::tuple<std::string, std::vector<size_t>, nb::bytes>> pace_arrays(const std::string &path,
+                                                                                          const std::string &asi)
+{
+  grace::cnpy::npz_t z;
+  {
+    nb::gil_scoped_release nogil;
+    z = grace::pace::npz_from_yaml(path, asi);
+  }
+  std::map<std::string, std::tuple<std::string, std::vector<size_t>, nb::bytes>> out;
+  for (const auto &[k, a] : z)
+    out.emplace(k, std::make_tuple(a.descr, a.shape, nb::bytes(a.data_holder->data(), a.num_bytes())));
+  return out;
+}
+
+// tests: the PACE radial functions of the pair (i, j) of a PACE npz at the distances r (fp64, no splines)
+nb::dict pace_radial(const std::string &path, int i, int j, HostArray<const double, nb::ndim<1>> r)
+{
+  grace::PaceModel m;
+  m.load(path);
+  if (i < 0 || j < 0 || i >= m.n_elements || j >= m.n_elements || !m.bond(i, j).defined)
+    throw nb::value_error("no radial basis for this pair");
+  const grace::PaceBond &b = m.bond(i, j);
+  const size_t n = r.shape(0), nbase = b.nradbase, L = b.lmax + 1, nf = (size_t) b.nradmax * L;
+  std::vector<double> gr(n * nbase), dgr(n * nbase), fr(n * nf), dfr(n * nf), cr(n), dcr(n);
+  for (size_t q = 0; q < n; q++)
+    grace::pace::radial(b, m.inner_cutoff_type, r.data()[q], &gr[q * nbase], &dgr[q * nbase], &fr[q * nf], &dfr[q * nf],
+                        cr[q], dcr[q]);
+  nb::dict d;
+  d["gr"] = from_vec(std::move(gr), {n, nbase});
+  d["dgr"] = from_vec(std::move(dgr), {n, nbase});
+  d["fr"] = from_vec(std::move(fr), {n, (size_t) b.nradmax, L});
+  d["dfr"] = from_vec(std::move(dfr), {n, (size_t) b.nradmax, L});
+  d["cr"] = from_vec(std::move(cr), {n});
+  d["dcr"] = from_vec(std::move(dcr), {n});
+  return d;
+}
+
 // the published D3(BJ) parameters of a functional (lower case), a2 in Bohr
 std::map<std::string, double> d3bj_preset(const std::string &name)
 {
@@ -225,13 +240,24 @@ std::vector<std::string> d3bj_presets()
 
 class Model {
  public:
-  Model(const std::string &path, int spline) : path_(path)
+  Model(const std::string &path, int spline, std::optional<double> store_max_gb,
+        std::optional<std::string> asi = std::nullopt) : path_(path), asi_(asi)
   {
-    if (spline < 16) throw nb::value_error("spline must be >= 16 (intervals of the radial tables)");
+    if (store_max_gb && !(std::isfinite(*store_max_gb) && *store_max_gb >= 0.0))
+      throw nb::value_error("store_max_gb must be a finite number >= 0 (GB), or None for the automatic limit");
+    if (asi_ && !grace::is_pace_yaml(path))
+      throw nb::value_error("asi= goes with a PACE .yaml");
     arch_ = detect_arch(path);
+    if (spline < 16 && !(arch_ == "pace" && spline == 0))    // PACE: 0 evaluates the radial functions directly
+      throw nb::value_error("spline must be >= 16 (intervals of the radial tables; PACE models also 0: none)");
     fs_.spline_n = spline;
+    fs_.store_l1_max_gb = fs_.store_fwd_max_gb = store_max_gb.value_or(-1.0);    // < 0: auto
     nb::gil_scoped_release nogil;
-    if (arch_ == "1l") {
+    if (arch_ == "pace") {
+      mp_ = std::make_shared<grace::PaceModel>();
+      mp_->load(path, asi_.value_or(""));
+      names_ = mp_->element_names;
+    } else if (arch_ == "1l") {
       m1_ = std::make_shared<grace::GRACE1LModel>();
       m1_->load(path);
       names_ = m1_->element_names;
@@ -257,7 +283,8 @@ class Model {
     std::unique_ptr<double[]> c(new double[k * k]);
     for (size_t a = 0; a < k; a++)
       for (size_t b = 0; b < k; b++)
-        c[a * k + b] = e->d1 ? e->d1->cutoff((int) a + 1, (int) b + 1)
+        c[a * k + b] = e->dp ? e->dp->cutoff((int) a + 1, (int) b + 1)
+                     : e->d1 ? e->d1->cutoff((int) a + 1, (int) b + 1)
                      : e->d3 ? e->d3->cutoff((int) a + 1, (int) b + 1) : e->d2->cutoff((int) a + 1, (int) b + 1);
     return owned(std::move(c), {k, k});
   }
@@ -265,14 +292,24 @@ class Model {
   nb::dict compute(const std::vector<std::string> &species, HostArray<const int32_t, nb::ndim<1>> types,
                    HostArray<const int64_t, nb::ndim<1>> offset,
                    HostArray<const int32_t, nb::ndim<1>> j,
-                   HostArray<const double, nb::shape<-1, 3>> rij, bool energies, int num_threads,
-                   bool uq, bool energy_only)
+                   std::optional<HostArray<const double, nb::shape<-1, 3>>> rij, bool energies, int num_threads,
+                   bool uq, bool energy_only, std::optional<HostArray<const double, nb::shape<-1, 3>>> positions,
+                   std::optional<HostArray<const int32_t, nb::ndim<1>>> image,
+                   std::optional<HostArray<const double, nb::shape<-1, 3>>> shifts)
   {
+    // the bond vectors: rij, or r_ij = positions[j] - positions[i] + shifts[image] formed by the engine
+    const bool table = positions.has_value() && image.has_value() && shifts.has_value();
+    if (rij.has_value() == (positions.has_value() || image.has_value() || shifts.has_value()) ||
+        (!rij.has_value() && !table))
+      throw nb::value_error("give rij or positions, image and shifts");
     if (types.shape(0) > (size_t) INT_MAX) throw nb::value_error("more atoms than an int can index");
+    if (uq && !has_uq()) validate_uq();    // no head (PACE: its own message); a head is checked once in enable_uq
     const int n = (int) types.shape(0);
     const int ns = (int) species.size();
     if ((int64_t) offset.shape(0) != (int64_t) n + 1) throw nb::value_error("offset must have len(types) + 1 entries");
-    if (j.shape(0) != rij.shape(0)) throw nb::value_error("j and rij differ in length");
+    if (rij && j.shape(0) != rij->shape(0)) throw nb::value_error("j and rij differ in length");
+    if (image && j.shape(0) != image->shape(0)) throw nb::value_error("j and image differ in length");
+    if (positions && (int64_t) positions->shape(0) != n) throw nb::value_error("positions must have len(types) rows");
     const int32_t *ty = types.data();
     const int64_t *off = offset.data();
     const int32_t *jj = j.data();
@@ -281,19 +318,32 @@ class Model {
     if (off[0] != 0 || off[n] != (int64_t) j.shape(0)) throw nb::value_error("offset[0] must be 0 and offset[-1] == len(j)");
     for (int a = 0; a < n; a++)
       if (off[a + 1] < off[a]) throw nb::value_error("offset must be non-decreasing");
-    for (int64_t q = 0; q < off[n]; q++)
-      if (jj[q] < 0 || jj[q] >= n) throw nb::value_error("j must index atoms 0 .. len(types)-1");
+    const int nth = num_threads > 0 ? num_threads : affinity_threads();
+    {    // per bond, every step: in parallel (4M bonds: ~1.5 ms each serially)
+      const int32_t *im = image ? image->data() : nullptr;
+      const int64_t nim = shifts ? (int64_t) shifts->shape(0) : 0;
+      bool bad_j = false, bad_im = false;
+#pragma omp parallel for schedule(static) num_threads(nth) reduction(|| : bad_j, bad_im)
+      for (int64_t q = 0; q < off[n]; q++) {
+        bad_j = bad_j || jj[q] < 0 || jj[q] >= n;
+        bad_im = bad_im || (im && (im[q] < 0 || im[q] >= nim));
+      }
+      if (bad_j) throw nb::value_error("j must index atoms 0 .. len(types)-1");
+      if (bad_im) throw nb::value_error("image must index rows of shifts");
+    }
     std::unique_ptr<double[]> f(new double[(size_t) 3 * std::max(n, 1)]());
     std::unique_ptr<double[]> e(energies ? new double[std::max(n, 1)]() : nullptr);
     std::unique_ptr<double[]> v(new double[6]());
     std::unique_ptr<double[]> ug(uq ? new double[std::max(n, 1)]() : nullptr), us(uq ? new double[std::max(n, 1)]() : nullptr),
         uc(uq ? new double[std::max(n, 1)]() : nullptr);
     double energy = 0.0;
+    grace::StoreInfo store;
     {
       nb::gil_scoped_release nogil;
       auto ent = entry(species);
       std::lock_guard<std::mutex> lk(ent->mu);
-      grace::CsrBonds src{ty, off, jj, rij.data()};
+      grace::CsrBonds src{ty, off, jj, rij ? rij->data() : nullptr, positions ? positions->data() : nullptr,
+                          image ? image->data() : nullptr, shifts ? shifts->data() : nullptr};
       grace::Outputs out;
       out.f = f.get();
       out.eatom = e.get();
@@ -310,9 +360,10 @@ class Model {
         out.atomic_sigma = us.get();
         out.gmm_cluster = uc.get();
       }
-      const int nth = num_threads > 0 ? num_threads : affinity_threads();
       grace::NoExchange ex;
-      if (ent->d1)
+      if (ent->dp)
+        ent->dp->compute(n, nullptr, n, n, src, out, fl, nth);
+      else if (ent->d1)
         ent->d1->compute(n, nullptr, n, n, src, out, fl, nth);
       else if (ent->d3)
         ent->d3->compute(n, nullptr, n, n, src, ex, out, fl, nth);
@@ -320,15 +371,20 @@ class Model {
         ent->d2->compute(n, nullptr, n, n, src, ex, out, fl, nth);
       energy = out.energy;
       std::copy(out.virial, out.virial + 6, v.get());
+      if (ent->d2) store = ent->d2->store_info();
+      if (ent->d3) store = ent->d3->store_info();
     }
     nb::dict r;
     r["energy"] = energy;
+    if (store.need_gb > 0.0) r["store"] = nb::make_tuple(store.kept, store.need_gb, store.limit_gb);
     if (!energy_only) {
       r["forces"] = owned(std::move(f), {(size_t) n, 3});
       r["virial"] = owned(std::move(v), {6});
     }
     if (energies) r["energies"] = owned(std::move(e), {(size_t) n});
-    if (uq) {
+    if (uq && mp_) {    // PACE: the extrapolation grade only
+      r["gamma"] = owned(std::move(ug), {(size_t) n});
+    } else if (uq) {
       double ts = 0.0;
       for (int a = 0; a < n; a++) ts += us[a];
       r["total_sigma"] = ts;
@@ -339,15 +395,24 @@ class Model {
     return r;
   }
 
-  bool has_uq() const { return m1_ ? m1_->has_uq : m3_ ? m3_->has_uq : m2_->has_uq; }
+  bool has_uq() const { return mp_ ? mp_->has_uq : m1_ ? m1_->has_uq : m3_ ? m3_->has_uq : m2_->has_uq; }
   int spline() const { return fs_.spline_n; }
+  std::optional<double> store_max_gb() const
+  {
+    return fs_.store_l1_max_gb < 0.0 ? std::nullopt : std::optional<double>(fs_.store_l1_max_gb);
+  }
   // throws ValueError unless the model carries a usable uqv6 head
   void validate_uq() const
   {
+    if (mp_) {    // the extrapolation grade from the model's active set
+      if (!mp_->has_uq)
+        throw grace::Error("the PACE model has no active set for the extrapolation grade: load it with "
+                           "Model(model.yaml, asi=model.asi)");
+      return;
+    }
+    if (!has_uq()) throw grace::Error("the model has no UQ head (kokkos.npz exported without UQ artifacts)");
     if (m1_) m1_->validate_uq();
-    else if (m3_) {    // the 3L loader checks the UQ head itself; the driver checks it against its basis
-      if (!m3_->has_uq) throw grace::Error("the model has no UQ head (kokkos.npz exported without UQ artifacts)");
-    } else m2_->validate_uq();
+    else if (m2_) m2_->validate_uq();    // the 3L loader checks the UQ head itself; the driver checks it against its basis
   }
 
   size_t cached_drivers()
@@ -357,10 +422,12 @@ class Model {
   }
 
   std::string arch_, path_;
+  std::optional<std::string> asi_;
   std::vector<std::string> names_;
 
  private:
   struct Entry {
+    std::unique_ptr<grace::PaceCpu> dp;
     std::unique_ptr<grace::Grace1LFused> d1;
     std::unique_ptr<grace::Grace2LFused> d2;
     std::unique_ptr<grace::Grace3LFused> d3;
@@ -393,7 +460,10 @@ class Model {
       t2m[t + 1] = (int) (el - names_.begin());
     }
     auto e = std::make_shared<Entry>();
-    if (arch_ == "1l") {
+    if (arch_ == "pace") {
+      e->dp = std::make_unique<grace::PaceCpu>(mp_, fs_.spline_n);
+      e->dp->setup_types((int) species.size(), t2m);
+    } else if (arch_ == "1l") {
       e->d1 = std::make_unique<grace::Grace1LFused>(m1_, fs_, grace::Logger{});
       e->d1->setup_types((int) species.size(), t2m);
     } else if (arch_ == "3l") {
@@ -416,6 +486,7 @@ class Model {
   std::shared_ptr<grace::GRACE1LModel> m1_;
   std::shared_ptr<grace::GRACE2LModel> m2_;
   std::shared_ptr<grace::GRACE3LModel> m3_;
+  std::shared_ptr<grace::PaceModel> mp_;
   std::map<std::string, std::shared_ptr<Entry>> drivers_;
   uint64_t stamp_ = 0;
   std::mutex map_mu_;
@@ -436,17 +507,23 @@ NB_MODULE(GRACE_RUNTIME_MODULE, m)    // _core_x86_64_v3 / _core_x86_64_v4 / _co
         "energy_only"_a = false, "num_threads"_a = 0);
   m.def("d3bj_preset", &d3bj_preset, "name"_a);
   m.def("d3bj_presets", &d3bj_presets);
+  m.def("_pace_radial", &pace_radial, "path"_a, "i"_a, "j"_a, "r"_a);
+  m.def("pace_arrays", &pace_arrays, "path"_a, "asi"_a = "");
   m.attr("BOHR") = grace::kBohr;
   nb::class_<Model>(m, "Model")
-      .def(nb::init<const std::string &, int>(), "path"_a, "spline"_a = 1024)
+      .def(nb::init<const std::string &, int, std::optional<double>, std::optional<std::string>>(), "path"_a,
+           "spline"_a = 1024, "store_max_gb"_a = nb::none(), "asi"_a = nb::none())
       .def_ro("arch", &Model::arch_)
       .def_ro("path", &Model::path_)
+      .def_ro("asi", &Model::asi_)
       .def_ro("elements", &Model::names_)
       .def_prop_ro("spline", &Model::spline)
+      .def_prop_ro("store_max_gb", &Model::store_max_gb)
       .def("cutoff_matrix", &Model::cutoff_matrix, "species"_a)
       .def_prop_ro("has_uq", &Model::has_uq)
       .def_prop_ro("cached_drivers", &Model::cached_drivers)
       .def("validate_uq", &Model::validate_uq)
-      .def("compute", &Model::compute, "species"_a, "types"_a, "offset"_a, "j"_a, "rij"_a, "energies"_a = false,
-           "num_threads"_a = 0, "uq"_a = false, "energy_only"_a = false);
+      .def("compute", &Model::compute, "species"_a, "types"_a, "offset"_a, "j"_a, "rij"_a = nb::none(),
+           "energies"_a = false, "num_threads"_a = 0, "uq"_a = false, "energy_only"_a = false, nb::kw_only(),
+           "positions"_a = nb::none(), "image"_a = nb::none(), "shifts"_a = nb::none());
 }

@@ -5,6 +5,7 @@ forces / stress of batched states against GRACERuntimeCalculator on the same dev
 one-atom systems, a species set changing between calls; refused autograd. Skipped without torch_sim."""
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -161,6 +162,19 @@ def test_autograd_refused():
         model(state)
 
 
+def test_empty_scaler_and_invalid_atomic_numbers():
+    model = GRACERuntimeModel(str(M1), device="cpu", max_atoms=4096)
+    empty = SimpleNamespace(n_atoms=0)    # torch-sim refuses a SimState without atoms (0.6.2)
+    model._kk = object()
+    assert model.max_memory_scaler(empty) == 4096.0
+    model._kk = None
+    for bad in (0, -1, 119):
+        state = ts.io.atoms_to_state([periodic()[0]], torch.device("cpu"), torch.float64)
+        state.atomic_numbers[0] = bad
+        with pytest.raises(ValueError, match="atomic number"):
+            model(state)
+
+
 @pytest.mark.skipif(not _cuda_ok(), reason="no CUDA module / torch GPU")
 def test_cpu_state_on_cuda_model():
     structures = periodic()[:2]
@@ -184,9 +198,11 @@ def test_split_calls_and_memory_scaler():
     model = GRACERuntimeModel(str(M3), device="cuda")
     model(state)    # the model's Batch keeps its buffers: the probe must still measure a call's full allocation
     scaler = model.max_memory_scaler(state)
-    # 3L keeps ~64 KB per atom + image (small cells: several images per atom): on a 24 GB card thousands to a few
-    # tens of thousands of atoms per call, not the max_atoms cap; 1L is lighter
-    assert 2048 <= scaler <= 60000, scaler
+    # the memory per atom of a call that the scaler implies (0.7 of the free memory of the model's device), independent
+    # of the card: 3L keeps ~64 KB per atom + image plus a full step's work buffers, 1.7 MB measured on 8 and 24 GB
+    # cards (841 and 8482 atoms); not the max_atoms cap. 1L is lighter
+    per_atom = 0.7 * model._kk.memory_info()[0] / scaler
+    assert 3e5 <= per_atom <= 8e6 and scaler <= 60000, (scaler, per_atom)
     assert GRACERuntimeModel(str(M1), device="cuda").max_memory_scaler(state) > scaler
     batcher = ts.autobatching.BinningAutoBatcher(model, memory_scales_with=model.memory_scales_with,
                                                  max_memory_scaler=scaler)

@@ -20,7 +20,7 @@ def main(argv=None):
                                 "module (native or PTX), fallback settings, JIT cache, install command")
     rl = sub.add_parser("relax", help="relax all structures of a file together (FIRE as ASE, optionally with the "
                                       "cell); each one is written as it finishes")
-    rl.add_argument("model", help="registry name or path of a kokkos.npz")
+    rl.add_argument("model", help="registry name, kokkos.npz or PACE .yaml")
     rl.add_argument("input", help="structure file, all frames (any format ASE reads)")
     rl.add_argument("-o", "--output", required=True, help="extxyz file of the relaxed structures (overwritten); info: "
                                                           "relax_index (input frame), relax_n_steps, relax_converged, "
@@ -92,14 +92,15 @@ def info():
     from . import _cuda, _rocm
     print(f"grace-runtime {grace_runtime.__version__}, CPU module {grace_runtime.cpu_module}")
     flags = {k: os.environ[k] for k in ("GRACE_RUNTIME_DEVICE", "GRACE_RUNTIME_ALLOW_PTX", "GRACE_RUNTIME_STRICT",
-                                        "GRACE_RUNTIME_QUIET", "GRACE_RUNTIME_CUDA_ARCH", "CUDA_VISIBLE_DEVICES",
-                                        "GRACE_RUNTIME_ROCM_ARCH", "GRACE_RUNTIME_NO_ROCBLAS", "ROCR_VISIBLE_DEVICES",
-                                        "HIP_VISIBLE_DEVICES", "HSA_XNACK", "HSA_OVERRIDE_GFX_VERSION")
+                                        "GRACE_RUNTIME_QUIET", "GRACE_RUNTIME_CUDA_ARCH", "GRACE_RUNTIME_NO_CUBLAS",
+                                        "CUDA_VISIBLE_DEVICES", "GRACE_RUNTIME_ROCM_ARCH", "GRACE_RUNTIME_NO_ROCBLAS",
+                                        "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "HSA_XNACK",
+                                        "HSA_OVERRIDE_GFX_VERSION")
              if k in os.environ}
     print("settings:", ", ".join(f"{k}={v}" for k, v in flags.items()) or "defaults")
     try:
         _cuda.compute_capability(0)
-    except _cuda.NoGPU as e:
+    except (_cuda.NoGPU, ValueError) as e:
         if _rocm.kfd_present():
             return _info_rocm()
         print(f"GPU: none usable ({e}); device='auto' runs on the CPU")
@@ -124,6 +125,7 @@ def _info_cuda():
         print(f"GPU modules: {e}")
         return 1
     print(f"GPU modules installed: {', '.join(sorted(avail)) or 'none'}")
+    print(f"cuBLAS: {_cublas(major)}")
     try:
         arch, ptx = _cuda.select(0)
     except ImportError as e:
@@ -139,6 +141,18 @@ def _info_cuda():
         return 1
     print(f"native module {arch}")
     return 0
+
+
+def _cublas(cc_major: int) -> str:
+    """the cuBLAS the NVIDIA GPU modules would use (_cuda.cublas_library), or why they run the built-in GEMMs"""
+    from . import _cuda
+    c = _cuda.cublas_library()
+    out = c["broken"] + "; " if "broken" in c else ""
+    if "version" not in c:
+        return out + f"none: built-in Kokkos GEMMs ({c['why']})"
+    v, f = c["version"], _cuda.cublas_floor(cc_major)
+    out += f"{v[0]}.{v[1]}.{v[2]} ({c['source']}: {c['path']})"
+    return out + (f", older than {f[0]}.{f[1]} for this GPU: built-in Kokkos GEMMs" if v[:2] < f else "")
 
 
 def _rocblas() -> str:

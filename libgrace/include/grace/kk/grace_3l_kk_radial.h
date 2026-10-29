@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
 // Part of grace::kk::Grace3LKK (grace_3l_kk.h), included by grace_3l_kk_impl.h:
 // radial MLP (cuBLAS layers, derivative pass) and the per-pair cubic-Hermite radial tables.
-// Moved from the LAMMPS style grace/3l/kk (lammps-ace 5f5ab57aa7, pair_grace_3l_kokkos_radial.cpp).
 #pragma once
 
 #include "grace/kk/grace_3l_kk.h"
@@ -17,10 +16,10 @@ namespace kk {
 using namespace sph_const;
 
 // ======================================================================
-// Kernel: TagComputeMLPRadial (Task 2.4 A1 / Task 2.8 A2) — generic radial
+// Kernel: TagComputeMLPRadial (A1 / A2) — generic radial
 // MLP, one bond per thread, for the SPBF layer selected by the member
 // radial_mlp_spbf (0=A1, idx_spbf_A2=A2). Reproduces
-// numpy_forward_3l.radial_mlp EXACTLY:
+// the reference radial_mlp EXACTLY:
 //   x = concat([basis32, z_table[mu_i], z_table[mu_j]])         (width 138)
 //   x = x @ (W_i*norm_i); hidden layers (i<n_layers-1) add b_i*norm_i, silu;
 //   output layer (i==n_layers-1) is linear, no bias.
@@ -29,7 +28,7 @@ using namespace sph_const;
 // l_tile when it forms a_nl. All arithmetic in NNScalar (fp32 Mixed
 // default); d_radial_basis (GeomScalar) is cast down on read, d_chem_embed
 // is already NNScalar. Team-policy (ii,jj) decode copied from
-// TagComputeRadialBasis (Task 2.3). The A1/A2 MLPs share this code path but
+// TagComputeRadialBasis. The A1/A2 MLPs share this code path but
 // use their own weights (d_spbf[radial_mlp_spbf].mlp_*) and n_rad_max; the
 // chem-embedding concat input is spbf-independent.
 // ======================================================================
@@ -55,7 +54,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
   NNScalar buf_a[GRACE3L_MAX_MLP_DIM], buf_b[GRACE3L_MAX_MLP_DIM];
   NNScalar* h_cur = buf_a; NNScalar* h_nxt = buf_b;
 
-  // Input: concat([basis32, z_i32, z_j32]) — order pinned by the oracle.
+  // Input: concat([basis32, z_i32, z_j32]) — order pinned by the reference.
   const int mu_i = d_mu_i(ii);
   const int mu_j = d_mu_j(ii, jj);
   int k = 0;
@@ -93,7 +92,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 }
 
 // ======================================================================
-// Task 3.3: geometry backward (per-bond forces).
+// geometry backward (per-bond forces).
 // ======================================================================
 
 // ---- TagComputeMLPRadialDeriv: radial MLP forward + its r-derivative, one bond
@@ -197,14 +196,14 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
 
 #ifdef KOKKOS_ENABLE_CUDA
 // ======================================================================
-// Opt 15 (value path): support kernels for the batched cuBLAS radial MLP.
+// Value path: support kernels for the batched cuBLAS radial MLP.
 // TagMLPAssembleVal builds the tightly-packed row-major input matrix
 // d_mlp_X[M x n_in0], one bond per thread. Bond b decodes to
 // (ii = b / bond_stride, jj = b % bond_stride) with bond_stride =
 // d_radial_basis.extent(1) (== allocated maxneigh). Padding rows (jj >=
 // ncount) are zeroed so the batched SGEMM stays finite; their outputs are
 // ignored downstream (consumers loop jj < ncount). Input order is pinned to
-// the oracle: [Chebyshev basis, chem_embed(mu_i), chem_embed(mu_j)].
+// the reference: [Chebyshev basis, chem_embed(mu_i), chem_embed(mu_j)].
 // TagMLPActVal applies the per-layer affine (s = raw*norm + bias*norm) and
 // silu in place on d_mlp_h{0,1} (raw = X*W from the GEMM, no norm folded).
 // ======================================================================
@@ -231,7 +230,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAs
 
 #endif
 #ifdef KOKKOS_ENABLE_CUDA
-// TagMLPAssembleDeriv (Opt 15b): value input d_mlp_X[b, :n_in0] (identical to
+// TagMLPAssembleDeriv: value input d_mlp_X[b, :n_in0] (identical to
 // AssembleVal) + deriv input d_mlp_dX[b, :nradbase] (Chebyshev dT/dr recurrence;
 // embeddings are r-independent so excluded, giving the K=nradbase input sub-GEMM). Reproduces the
 // hand kernel TagComputeMLPRadialDeriv's input math EXACTLY. Padding bonds (jj>=ncount) zero X and dX
@@ -289,11 +288,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAs
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPActVal,
-    const int idx) const
+    const int64_t idx) const
 {
   const int nout = mlp_act_n;
-  const int b = idx / nout;
-  const int j = idx - b * nout;
+  const int b = (int) (idx / nout);
+  const int j = (int) (idx - (int64_t) b * nout);
   const DeviceSPBF &sp = d_spbf[mlp_assemble_idx];
   const NNScalar norm = mlp_act_norm;
   if (mlp_act_layer == 0) {
@@ -307,7 +306,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAc
 
 #endif
 #ifdef KOKKOS_ENABLE_CUDA
-// TagMLPActDeriv (Opt 15b): fused value+deriv activation. Reads the raw value
+// TagMLPActDeriv: fused value+deriv activation. Reads the raw value
 // GEMM output (d_mlp_h*) and raw deriv GEMM output (d_mlp_dh*), forms
 // s = raw*norm + bias*norm and ds = raw_deriv*norm, then writes silu(s) and
 // silu'(s)*ds in place. silu'(s) = sig*(1 + s*(1-sig)) -- identical to the hand
@@ -315,11 +314,11 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAc
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPActDeriv,
-    const int idx) const
+    const int64_t idx) const
 {
   const int nout = mlp_act_n;
-  const int b = idx / nout;
-  const int j = idx - b * nout;
+  const int b = (int) (idx / nout);
+  const int j = (int) (idx - (int64_t) b * nout);
   const DeviceSPBF &sp = d_spbf[mlp_assemble_idx];
   const NNScalar norm = mlp_act_norm;
   if (mlp_act_layer == 0) {
@@ -346,13 +345,13 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAc
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPScatterR,
-    const int idx) const
+    const int64_t idx) const
 {
   const int lm1 = lmax + 1;
   const int D3  = d_spbf[mlp_assemble_idx].n_rad_max * lm1;
   const int bs  = (int) d_radial_basis.extent(1);
-  const int b   = idx / D3;
-  const int j   = idx - b * D3;
+  const int b   = (int) (idx / D3);
+  const int j   = (int) (idx - (int64_t) b * D3);
   const int ii  = b / bs;
   const int jj  = b - ii * bs;
   if (jj >= d_ncount(ii)) return;
@@ -369,10 +368,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPSc
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPLayer0Val,
-    const int idx) const
+    const int64_t idx) const
 {
   const int d1 = mlp_act_n;
-  const int b = idx / d1, j = idx - b * d1;
+  const int b = (int) (idx / d1), j = (int) (idx - (int64_t) b * d1);
   const int bs = (int) d_radial_basis.extent(1);
   const int ii = b / bs, jj = b - ii * bs;
   if (jj >= d_ncount(ii)) { d_mlp_h0(b, j) = NNScalar(0.0); return; }
@@ -388,10 +387,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPLa
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPLayer0Deriv,
-    const int idx) const
+    const int64_t idx) const
 {
   const int d1 = mlp_act_n;
-  const int b = idx / d1, j = idx - b * d1;
+  const int b = (int) (idx / d1), j = (int) (idx - (int64_t) b * d1);
   const int bs = (int) d_radial_basis.extent(1);
   const int ii = b / bs, jj = b - ii * bs;
   if (jj >= d_ncount(ii)) { d_mlp_h0(b, j) = NNScalar(0.0); d_mlp_dh0(b, j) = NNScalar(0.0); return; }
@@ -458,7 +457,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_radial_splines
   // engine's own tables counted as free (a re-setup, with the store and chunk buffers of the last run still
   // allocated, decides as the first one)
   double budget = spline_mb;
-  if (budget < 0.0 && std::equal(Nl, Nl + 3, spl_n_built) && spl_mus == mus && d_splR.size() > 0) {
+  if (budget < 0.0 && std::equal(Nl, Nl + 3, spl_N) && spl_mus == mus && d_splR.size() > 0) {
     budget = mb;    // auto: the tables of the last setup fit then, keep them (the last run's buffers are still held)
   } else if (budget < 0.0) {
     budget = 2048.0;
@@ -477,7 +476,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::build_radial_splines
   }
   spl_mus = mus;
   for (int si = 0; si < 3; si++) {
-    spl_n_built[si] = spl_N[si] = Nl[si];
+    spl_N[si] = Nl[si];
     spl_off[si] = off[si];
   }
   spl_Ntot = Ntot;
@@ -603,8 +602,10 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::radial_from_splines(
   auto mui = d_mu_i; auto muj = d_mu_j; auto nc = d_ncount;
   NNScalar *R = d_R1_nl.data(), *DR = d_DR1_nl.data();
   const bool dv = deriv;
-  Kokkos::parallel_for("g3l:spl_radial", Kokkos::RangePolicy<DeviceType>(0, chunk_size * bs * d3), KOKKOS_LAMBDA(const int q) {
-    const int b = q / d3, o = q - b * d3, ii = b / bs, jj = b - ii * bs;
+  Kokkos::parallel_for("g3l:spl_radial",
+                       Kokkos::RangePolicy<DeviceType, Kokkos::IndexType<int64_t>>(0, (int64_t) chunk_size * bs * d3),
+                       KOKKOS_LAMBDA(const int64_t q) {
+    const int b = (int) (q / d3), o = (int) (q - (int64_t) b * d3), ii = b / bs, jj = b - ii * bs;
     if (jj >= nc(ii)) return;
     const int mi = mui(ii), mj = muj(ii, jj);
     const int p = spm(mi) * nsp + spm(mj);
@@ -622,7 +623,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::radial_from_splines(
 
 
 // ======================================================================
-// Opt 15: value-only radial MLP forward for layer `radial_mlp_spbf`, writing
+// value-only radial MLP forward for layer `radial_mlp_spbf`, writing
 // d_R1_nl. On CUDA with a live handle and the expected 3-layer architecture,
 // runs the batched true-fp32 cuBLAS path (assemble -> SGEMM/act x2 -> output
 // SGEMM straight into d_R1_nl); otherwise falls back to the hand kernel
@@ -656,7 +657,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
       // 1-3. layer 0 + silu from the Chebyshev basis and the per-element embedding terms
       mlp_act_n = d1; d_mlp_W0c_cur = d_mlp_W0c[si]; d_mlp_E_cur = d_mlp_E[si];
       Kokkos::parallel_for("MLPLayer0Val",
-          Kokkos::RangePolicy<DeviceType, TagMLPLayer0Val>(0, M * d1), *this);
+          Kokkos::RangePolicy<DeviceType, TagMLPLayer0Val, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d1), *this);
     } else {
       // 1. assemble X[M x n_in0]
       Kokkos::parallel_for("MLPAssembleVal",
@@ -668,7 +669,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
       // 3. Act0: silu(h0*norm0 + b0*norm0)
       mlp_act_layer = 0; mlp_act_n = d1; mlp_act_norm = (NNScalar) hmlp.norm[0];
       Kokkos::parallel_for("MLPActVal0",
-          Kokkos::RangePolicy<DeviceType, TagMLPActVal>(0, M * d1), *this);
+          Kokkos::RangePolicy<DeviceType, TagMLPActVal, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d1), *this);
     }
 
     // 4. h1 = h0 * W1
@@ -678,7 +679,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
     // 5. Act1: silu(h1*norm1 + b1*norm1)
     mlp_act_layer = 1; mlp_act_n = d2; mlp_act_norm = (NNScalar) hmlp.norm[1];
     Kokkos::parallel_for("MLPActVal1",
-        Kokkos::RangePolicy<DeviceType, TagMLPActVal>(0, M * d2), *this);
+        Kokkos::RangePolicy<DeviceType, TagMLPActVal, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d2), *this);
 
     // 6. R = out_norm * (h1 * W2) (output layer: linear, no bias), written straight into the
     //    row-major d_R1_nl: row = bond, columns n * (lmax+1) + l, leading dim = its (n, l) extent
@@ -700,7 +701,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial()
 }
 
 #ifdef GRACE_KK_GEMM
-// Opt 15: true-fp32 batched SGEMM. Row-major C[M x n_out] = alpha*In[M x n_in]*Wg[n_in x n_out].
+// true-fp32 batched SGEMM. Row-major C[M x n_out] = alpha*In[M x n_in]*Wg[n_in x n_out].
 // cuBLAS is column-major, so this equals the col-major product
 // C^T[n_out x M] = alpha * Wg^T[n_out x n_in] * In^T[n_in x M], i.e. OP_N/OP_N with
 // leading dims = the row-major operands' physical row strides. CUBLAS_PEDANTIC_MATH
@@ -717,16 +718,16 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_sgemm(
       (const float*) In, ldIn,
       &beta, (float*) C, ldC);
   if (st != blas::SUCCESS)
-    GRACE_KK_ERROR("GRACE-3L/KK: cublasSgemm failed (status {})", (int) st);
+    GRACE_KK_ERROR("GRACE-3L/KK: radial MLP GEMM ({}) failed (status {})", blas::name(), (int) st);
 }
 
 #endif
 #ifdef GRACE_KK_GEMM
-// Opt 15 hard gate: verify the layer-0 SGEMM (transpose/leading-dim convention +
+// Hard gate: verify the layer-0 SGEMM (transpose/leading-dim convention +
 // true-fp32 path) reproduces a host fp64 reference on a tiny deterministic batch
 // before the full chain is ever used; gate: blas::selftest_error <= 1.
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
-void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_cublas_selftest()
+void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_blas_selftest()
 {
   const auto &mlp = grace_model->spbf[0].mlp;   // A1
   if (mlp.n_layers < 1) return;
@@ -737,16 +738,16 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::mlp_cublas_selftest(
         mlp_sgemm(Wg.data(), X, C, n_out, M, n_in, (int) Wg.extent(1), n_in, n_out, NNScalar(1.0));
       });
   if (err > 1.0)
-    GRACE_KK_ERROR("GRACE-3L/KK: {} layer-0 selftest FAILED (max error {:.3g} x the fp32 rounding bound)",
+    GRACE_KK_ERROR("GRACE-3L/KK: {} GEMM selftest FAILED (layer-0 max error {:.3g} x the fp32 rounding bound)",
                    blas::name(), err);
-  log.info(fmt("[GRACE-3L/KK] {} radial-MLP selftest OK (layer-0 error {:.2f} x the fp32 rounding bound)\n",
+  log.info(fmt("[GRACE-3L/KK] {} GEMM selftest OK (layer-0 error {:.2f} x the fp32 rounding bound)\n",
                blas::name(), err));
 }
 #endif
 
 // ---------------------- force launchers ----------------------
 
-// Opt 15b: radial MLP forward value + r-derivative for layer `radial_mlp_spbf`,
+// radial MLP forward value + r-derivative for layer `radial_mlp_spbf`,
 // writing d_R1_nl (R) and d_DR1_nl (dR/dr). On CUDA with a live handle
 // and the expected 3-layer architecture, runs the batched true-fp32 cuBLAS path
 // (6 SGEMMs: 3 value + 3 deriv, deriv layer-0 is a K=nradbase sub-GEMM since only
@@ -775,7 +776,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial_d
       // 1-3. layer 0 value + r-derivative from the Chebyshev basis
       mlp_act_n = d1; d_mlp_W0c_cur = d_mlp_W0c[si]; d_mlp_E_cur = d_mlp_E[si];
       Kokkos::parallel_for("MLPLayer0Deriv",
-          Kokkos::RangePolicy<DeviceType, TagMLPLayer0Deriv>(0, M * d1), *this);
+          Kokkos::RangePolicy<DeviceType, TagMLPLayer0Deriv, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d1), *this);
     } else {
       // 1. assemble X[M x n_in0], dX[M x nradbase]
       Kokkos::parallel_for("MLPAssembleDeriv",
@@ -790,7 +791,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial_d
       // 3. act-deriv layer 0
       mlp_act_layer = 0; mlp_act_n = d1; mlp_act_norm = (NNScalar) hmlp.norm[0];
       Kokkos::parallel_for("MLPActDeriv0",
-          Kokkos::RangePolicy<DeviceType, TagMLPActDeriv>(0, M * d1), *this);
+          Kokkos::RangePolicy<DeviceType, TagMLPActDeriv, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d1), *this);
     }
 
     // 4. layer 1: value h1 = h0*W1; deriv dh1 = dh0*W1
@@ -803,7 +804,7 @@ void Grace3LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::compute_mlp_radial_d
     // 5. act-deriv layer 1
     mlp_act_layer = 1; mlp_act_n = d2; mlp_act_norm = (NNScalar) hmlp.norm[1];
     Kokkos::parallel_for("MLPActDeriv1",
-        Kokkos::RangePolicy<DeviceType, TagMLPActDeriv>(0, M * d2), *this);
+        Kokkos::RangePolicy<DeviceType, TagMLPActDeriv, Kokkos::IndexType<int64_t>>(0, (int64_t) M * d2), *this);
 
     // 6. output layer (linear, no bias): value R=h1*W2*out_norm -> d_R1_nl;
     //    deriv DR=dh1*W2*out_norm -> d_DR1_nl (both row-major, written directly).
