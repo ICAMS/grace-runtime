@@ -53,6 +53,9 @@ void check_guards()
   const int c = grace::kk::auto_chunk<Dev>(1000000, 1, 1, grow, [] { return 0.0; }, grace::Logger{}, "test");
   std::printf("guards: refused a 2^32-element view; chunksize auto %d for 10000 values per atom\n", c);
   CHECK((double) c * 10000 <= (double) INT32_MAX);
+  // a range over 2^31 bonds (GRACE-1L at 2^25 atoms): a policy with an int index aborts on this bound when built
+  const grace::kk::Range64<Dev> bonds(0, int64_t(1) << 31);
+  CHECK(bonds.end() == int64_t(1) << 31);
 }
 
 template<class Eng> void check_copies(Eng &eng, const char *tag, const Cell &w, const Cell &big)

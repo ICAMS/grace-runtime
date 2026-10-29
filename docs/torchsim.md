@@ -2,7 +2,8 @@
 
 [Installation](installation.md#optional-dependencies) · [API reference](api.md#torchsim-adapter)
 
-Install the `torchsim` extra with Python >= 3.12. This complete example uses the default device selection:
+Install the `torchsim` extra with Python >= 3.12 (on macOS, PyTorch from conda-forge instead: see
+[macOS](installation.md#macos)). This complete example uses the default device selection:
 
 ```python
 import numpy  # load before torch

@@ -3,6 +3,43 @@
 Notable changes of grace-runtime, grace-runtime-cuda12 and grace-runtime-rocm6 (they share one version). Each
 release has a section "Changed defaults" when a default behaves differently.
 
+## [0.1.1](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.1) (2026-10-29)
+
+Bug fixes and documentation.
+
+### Fixed
+
+- NVIDIA and AMD GPUs: GRACE-1L with 33.5 million atoms (2^25) or more stopped the whole process instead of running.
+  It now runs up to the GPU memory (A100 80 GB: 41 million atoms) and beyond that raises the usual "does not fit the
+  GPU memory" error.
+- The PyPI page of `grace-runtime` shows the README.
+- macOS: `pip install "grace-runtime[torchsim]"` installed PyTorch from PyPI, whose OpenMP runtime clashes with the
+  one of grace-runtime (`OMP: Error #15`). On macOS the extra now installs nothing; install PyTorch from conda-forge
+  (see the installation guide).
+- macOS: `grace-runtime info` says that the GPU modules are Linux-only, instead of listing where it looked for the
+  NVIDIA driver.
+
+### LAMMPS (`grace-runtime` branch of the LAMMPS fork)
+
+- CPU styles: `GRACE_BLAS=AUTO` uses a BLAS only if it is MKL, OpenBLAS, BLIS or Accelerate, otherwise the built-in
+  kernel. Other BLAS libraries (for example ATLAS) made GRACE-3L about 4x slower, and on HPE Cray systems the BLAS
+  linked by the compiler made the link fail.
+- CMake warns when the CPU styles are built with GCC older than 12: with GCC 11 GRACE-3L runs about 37 % slower,
+  with GCC 9 GRACE-1L about 4.6x and GRACE-3L about 6.6x slower.
+
+### Documentation
+
+- LAMMPS guide: build the fork for CPU, NVIDIA and AMD GPUs (with an example for LUMI), get a model, and run a first
+  input that also prints the extrapolation grade.
+- Windows through WSL2; GCC 12 or newer for source builds.
+- Benchmarks: time per atom and the largest system per GPU (L40S, A100, MI250X), and time per atom on a CPU.
+
+### Changed defaults
+
+- LAMMPS `GRACE_BLAS=AUTO` (see above): with a BLAS other than MKL, OpenBLAS, BLIS or Accelerate the CPU styles use
+  the built-in kernel. `-D GRACE_BLAS=ON` uses any BLAS that provides `cblas_sgemm`.
+- macOS: the `torchsim` extra installs no packages.
+
 ## [0.1.0](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.0) (2026-10-29)
 
 First release on PyPI: `grace-runtime` (CPU), `grace-runtime-cuda12` (NVIDIA) and `grace-runtime-rocm6` (AMD). It

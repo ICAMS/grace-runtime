@@ -50,6 +50,7 @@ print([r["energy"] for r in results])
 | Use TorchSim integrators and optimizers | [TorchSim](torchsim.md) |
 | Build LAMMPS and run GRACE or PACE in it | [LAMMPS](lammps.md) |
 | Manage memory, threads and fallbacks | [Performance and diagnostics](advanced.md) |
+| See speed and the largest systems per GPU | [Benchmarks](benchmarks.md) |
 | Look up parameters, defaults, CLI and results | [API reference](api.md) |
 | Build and test | [Development](development.md) |
 

@@ -2,13 +2,16 @@
 """check_cuda_wheel.py <wheel> [archs]: a grace-runtime-cuda12 wheel holds one module per architecture (default sm70,
 sm80, sm90, sm100, sm120) for its CPython tag, the plug-in package with ABI and the grace_runtime.backends entry point; no CUDA driver
 or toolkit library except the redistributable cudart; every module exports only PyInit_* (Kokkos and libstdc++ hidden);
-auditwheel accepts it as manylinux_2_17 x86_64. Prints the size. Exit status 1 on a failed check."""
+it is manylinux_2_17 x86_64 but for libcuda.so.1, which the driver provides (wheel_policy.py). Prints the size. Exit
+status 1 on a failed check."""
 import re
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+import wheel_policy
 
 wheel = Path(sys.argv[1])
 archs = (sys.argv[2] if len(sys.argv) > 2 else "sm70,sm80,sm90,sm100,sm120").split(",")
@@ -37,17 +40,15 @@ with zipfile.ZipFile(wheel) as z:
         if re.match(r"lib(cuda|cublas|cublasLt|nvrtc|cufft|cusparse)[.-]", base):
             bad.append(f"bundles {base} (driver / toolkit library)")
     with tempfile.TemporaryDirectory() as d:
-        for n in names:
-            if "/_kk_" in n and n.endswith(".so"):
-                z.extract(n, d)
-                out = subprocess.run(["nm", "-D", "--defined-only", str(Path(d) / n)], capture_output=True,
-                                     text=True).stdout
+        elfs = {n: Path(z.extract(n, d)) for n in names if re.search(r"\.so(\.\d+)*$", n)}
+        for n, p in elfs.items():
+            if "/_kk_" in n:
+                out = subprocess.run(["nm", "-D", "--defined-only", str(p)], capture_output=True, text=True).stdout
                 extra = [l.split()[-1] for l in out.splitlines() if l.split() and not l.split()[-1].startswith("PyInit_")]
                 if extra:
                     bad.append(f"{n} exports {len(extra)} symbols besides PyInit_*: {extra[:5]}")
-show = subprocess.run([sys.executable, "-m", "auditwheel", "show", str(wheel)], capture_output=True, text=True)
-if "manylinux_2_17_x86_64" not in show.stdout:
-    bad.append("auditwheel: not manylinux_2_17_x86_64 compatible:\n" + show.stdout[-800:] + show.stderr[-400:])
+        needs = {n: wheel_policy.needed(p) for n, p in elfs.items()}
+        bad += wheel_policy.check(wheel, "manylinux_2_17_x86_64", needs, ["libcuda.so.1"])
 print(f"{wheel.name}: {wheel.stat().st_size / 2**20:.1f} MB, bundled libs: "
       f"{', '.join(n.rsplit('/', 1)[-1] for n in libs) or 'none'}")
 for b in bad:

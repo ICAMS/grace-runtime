@@ -4,14 +4,17 @@
 grace_runtime.backends entry point; it bundles no ROCm library (the HIP runtime comes from the system ROCm; rocBLAS,
 hipBLAS, rocSOLVER and their Tensile kernels never: rocBLAS is loaded at run time) and no other library than libgomp;
 the modules need libamdhip64.so.6 and no BLAS library (DT_NEEDED), carry no absolute RUNPATH and export only
-PyInit_*; its glibc symbol versions (auditwheel) allow the platform tag (default manylinux_2_28_x86_64; '-': no platform
-checks), and the file name carries that tag alone. Prints the size. Exit status 1 on a failed check."""
+PyInit_*; it is of the platform tag but for libamdhip64.so.6, which the system ROCm provides (wheel_policy.py; default
+manylinux_2_28_x86_64; '-': no platform checks), and the file name carries that tag alone. Prints the size. Exit
+status 1 on a failed check."""
 import re
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+import wheel_policy
 
 wheel = Path(sys.argv[1])
 archs = (sys.argv[2] if len(sys.argv) > 2 else "gfx90a,gfx942").split(",")
@@ -53,12 +56,13 @@ with zipfile.ZipFile(wheel) as z:
         if not re.match(r"libgomp[.-]", base):
             bad.append(f"bundles {base} (only libgomp may be: the ROCm libraries come from the system)")
     with tempfile.TemporaryDirectory() as d:
+        needs = {}
         for n in names:
             if not re.search(r"\.so(\.\d+)*$", n):
                 continue
             p = Path(z.extract(n, d))
             dyn = elf(p, "-d")
-            needed = re.findall(r"\(NEEDED\)\s+Shared library: \[([^]]+)\]", dyn)
+            needed = needs[n] = wheel_policy.needed(p)
             blas = [x for x in needed if re.match(r"lib(rocblas|hipblas|hipblaslt|rocsolver|cublas)", x)]
             if blas:
                 bad.append(f"{n} needs {blas} (BLAS must be loaded at run time, not linked)")
@@ -73,22 +77,10 @@ with zipfile.ZipFile(wheel) as z:
                 extra = [l.split()[-1] for l in out.splitlines() if l.split() and not l.split()[-1].startswith("PyInit_")]
                 if extra:
                     bad.append(f"{n} exports {len(extra)} symbols besides PyInit_*: {extra[:5]}")
-
-def glibc(tag):
-    """(major, minor) of a manylinux tag (manylinux2014 = 2.17), None for others"""
-    m = re.match(r"manylinux_(\d+)_(\d+)_", tag)
-    return (int(m.group(1)), int(m.group(2))) if m else (2, 17) if tag.startswith("manylinux2014") else None
-
-
-if plat.startswith("manylinux"):    # '-': no platform checks (a wheel for this machine)
-    show = subprocess.run([sys.executable, "-m", "auditwheel", "show", str(wheel)], capture_output=True, text=True)
-    # the excluded HIP runtime keeps the verdict at linux_x86_64; the glibc symbol versions give the constraint
-    m = re.search(r'constrains the platform tag to\s*"([^"]+)"', show.stdout) or \
-        re.search(r'consistent with the following platform tag:\s*"([^"]+)"', show.stdout)
-    if not m or not glibc(m.group(1)) or glibc(m.group(1)) > glibc(plat):
-        bad.append(f"auditwheel: not {plat} compatible:\n" + show.stdout[-800:] + show.stderr[-400:])
-    if not wheel.name.endswith(f"-{plat}.whl"):
-        bad.append(f"platform tag of {wheel.name} is not {plat} alone")
+        if plat.startswith("manylinux"):    # '-': no platform checks (a wheel for this machine)
+            bad += wheel_policy.check(wheel, plat, needs, ["libamdhip64.so.6"])
+            if not wheel.name.endswith(f"-{plat}.whl"):
+                bad.append(f"platform tag of {wheel.name} is not {plat} alone")
 print(f"{wheel.name}: {wheel.stat().st_size / 2**20:.1f} MB, bundled libs: "
       f"{', '.join(n.rsplit('/', 1)[-1] for n in libs) or 'none'}")
 for b in bad:

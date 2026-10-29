@@ -50,6 +50,7 @@ nav:
       - LAMMPS: lammps.md
   - Reference:
       - Performance and diagnostics: advanced.md
+      - Benchmarks: benchmarks.md
       - API reference: api.md
       - Development: development.md
 

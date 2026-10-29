@@ -4,8 +4,9 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "grace-runtime"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast CPU and GPU inference of GRACE and PACE interatomic potentials with ASE, batching and TorchSim"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Academic Software License (ASL); bundled third-party code: see THIRD_PARTY_NOTICES.md" }
 classifiers = ["License :: Other/Proprietary License"]
@@ -19,7 +20,8 @@ Homepage = "https://github.com/ICAMS/grace-runtime"
 Issues = "https://github.com/ICAMS/grace-runtime/issues"
 
 [project.optional-dependencies]
-torchsim = ["torch>=2; python_version >= '3.12'", "torch-sim-atomistic>=0.6; python_version >= '3.12'"]
+torchsim = ["torch>=2; python_version >= '3.12' and sys_platform != 'darwin'",
+            "torch-sim-atomistic>=0.6; python_version >= '3.12' and sys_platform != 'darwin'"]
 phonons = ["phonopy>=2.20"]
 test = ["pytest", "pyyaml"]
 

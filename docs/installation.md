@@ -79,8 +79,13 @@ micromamba install -c conda-forge llvm-openmp
 ```
 
 The macOS wheel ships its OpenMP runtime and shares it with conda-forge packages in the same process (NumPy, PyTorch).
-PyTorch from PyPI ships its own, and the two abort with `OMP: Error #15`: for TorchSim on macOS, use conda-forge
-PyTorch, which shares the environment's OpenMP runtime.
+PyTorch from PyPI ships its own, and the two abort with `OMP: Error #15`. So on macOS the `torchsim` extra installs
+nothing; install PyTorch from conda-forge, which shares the environment's OpenMP runtime, and then TorchSim:
+
+```bash
+micromamba install -c conda-forge pytorch
+pip install grace-runtime torch-sim-atomistic
+```
 
 ### GPU source builds
 
@@ -93,7 +98,7 @@ For editable installs and library tests, see [development](development.md).
 | Feature | Install |
 | --- | --- |
 | Phonons | `pip install "grace-runtime[phonons]"` |
-| TorchSim adapter (Python >= 3.12; on a CUDA 12 driver torch from the CUDA 12 index, see [TorchSim](torchsim.md)) | `pip install "grace-runtime[torchsim]"` |
+| TorchSim adapter (Python >= 3.12; on a CUDA 12 driver torch from the CUDA 12 index, see [TorchSim](torchsim.md); on macOS see [macOS](#macos)) | `pip install "grace-runtime[torchsim]"` |
 | Tests | `pip install "grace-runtime[test]"` |
 | cuBLAS for the NVIDIA package (GRACE-3L up to ~15 % faster, UQ slightly faster) | `pip install "grace-runtime-cuda12[cublas]"` |
 

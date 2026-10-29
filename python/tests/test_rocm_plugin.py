@@ -110,6 +110,7 @@ def amd_node(tmp_path, no_env):
         return real(name, *a, **k)
     no_env.setattr(ctypes, "CDLL", cdll)
     no_env.setattr(_rocm, "plugins", lambda: [])
+    no_env.setattr(sys, "platform", "linux")    # info off Linux skips the GPU probes
     return no_env
 
 
@@ -369,6 +370,16 @@ def test_info_amd_native(amd_node, capsys):
     out = capsys.readouterr().out
     assert "GPU modules installed: gfx90a, gfx942 (gfx942: built, untested)" in out and "native module gfx90a" in out, out
     assert "rocBLAS:" in out
+
+
+def test_info_on_macos_does_not_probe_gpus(no_env, capsys):
+    def probe(*a, **k):
+        raise AssertionError("GPU probed on macOS")
+    no_env.setattr(sys, "platform", "darwin")
+    no_env.setattr(_cuda, "compute_capability", probe)
+    no_env.setattr(_rocm, "kfd_present", probe)
+    assert cli.main(["info"]) == 0
+    assert "GPU: none (GPU modules are Linux-only); device='auto' runs on the CPU" in capsys.readouterr().out
 
 
 def test_info_zero_visible_cuda_devices(amd_node, capsys):

@@ -266,6 +266,10 @@ template<class Member> KOKKOS_INLINE_FUNCTION BondSlot bond_slot(const Member &t
   return {team.team_rank() + ts * (lr % teams_per_slot), lr / teams_per_slot};
 }
 
+// A RangePolicy with 64-bit indices, for ranges that can pass 2^31 (bonds of a whole system). Kokkos >= 5.2 indexes a
+// RangePolicy without IndexType with int on CUDA (before: unsigned int) and aborts the process on a larger bound.
+template<class D, class... P> using Range64 = Kokkos::RangePolicy<D, P..., Kokkos::IndexType<int64_t>>;
+
 // A View whose element access computes the offset in 64 bits. Kokkos 5 View::operator() computes the offset in the
 // common type of the indices (an optimisation of Kokkos 5), so v(i, j, k) with int indices wraps once the view holds
 // more than 2^31 elements: the GRACE-3L [nall][64][50] message rows from nall = 671089. The views with a
