@@ -1,6 +1,8 @@
-# CPU package grace-runtime: libgrace C++ tests, the sdist and the manylinux2014 x86_64 wheels (CPython 3.10, 3.11 and
-# one abi3 wheel for >= 3.12; scripts/build_wheels.sh, conda-forge compilers with the glibc 2.17 sysroot, no Docker),
-# then each wheel in clean environments (scripts/test_wheels.sh). The wheels are kept as the artifact "cpu-wheels".
+# CPU package grace-runtime: libgrace C++ tests, the sdist and the wheels (CPython 3.10, 3.11 and one abi3 wheel for
+# >= 3.12; scripts/build_wheels.sh, no Docker) for manylinux2014 x86_64 and, on GitHub's ARM runner, macOS arm64, then
+# each wheel in clean environments (scripts/test_wheels.sh). The wheels are kept as the artifacts "cpu-wheels" (x86_64
+# and the sdist) and "cpu-wheels-macos-arm64". Linux aarch64 (scripts/build_wheels.sh can build it) is not released
+# until it has been tested: add {artifact: cpu-wheels-linux-aarch64, os: ubuntu-24.04-arm, mamba: linux-aarch64}.
 name: CPU wheels
 
 on:
@@ -44,19 +46,28 @@ jobs:
           cd build-ci && $MAMBA_EXE run -n gn-ctest ctest --output-on-failure
 
   wheels:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - {artifact: cpu-wheels, os: ubuntu-latest, mamba: linux-64}
+          - {artifact: cpu-wheels-macos-arm64, os: macos-14, mamba: osx-arm64}
+    runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: micromamba
         run: |
-          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/${{ matrix.platform.mamba }}/latest | tar -xj -C ~/.mm bin/micromamba
           echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
       - name: build
         run: bash scripts/build_wheels.sh dist/wheelhouse
+      - name: the sdist from the x86_64 runner only
+        if: matrix.platform.artifact != 'cpu-wheels'
+        run: rm -f dist/wheelhouse/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: cpu-wheels
+          name: ${{ matrix.platform.artifact }}
           path: |
             dist/wheelhouse/*.whl
             dist/wheelhouse/*.tar.gz
@@ -64,23 +75,26 @@ jobs:
 
   test-wheels:
     needs: wheels
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
+        platform:
+          - {artifact: cpu-wheels, os: ubuntu-latest, mamba: linux-64}
+          - {artifact: cpu-wheels-macos-arm64, os: macos-14, mamba: osx-arm64}
         python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: micromamba
         run: |
-          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C ~/.mm bin/micromamba
+          mkdir -p ~/.mm && curl -Ls https://micro.mamba.pm/api/micromamba/${{ matrix.platform.mamba }}/latest | tar -xj -C ~/.mm bin/micromamba
           echo "MAMBA_EXE=$HOME/.mm/bin/micromamba" >> "$GITHUB_ENV"
           echo "MAMBA_ROOT_PREFIX=$HOME/micromamba" >> "$GITHUB_ENV"
           echo "GRACE_CACHE=$HOME/grace-cache" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
-          name: cpu-wheels
+          name: ${{ matrix.platform.artifact }}
           path: dist/wheelhouse
       - uses: actions/cache@v4
         with:
