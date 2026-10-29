@@ -3,13 +3,13 @@
 Fast, efficient execution of GRACE-1L, GRACE-2L and GRACE-3L interatomic potentials without TensorFlow, PyTorch or JAX.
 CPU execution is standalone; GPU execution uses Kokkos for NVIDIA CUDA and AMD HIP.
 Use ASE-compatible calculators, batch processing, an optional TorchSim adapter or the shared kernels in LAMMPS with MPI.
-PACE (ACE) potentials fitted with pacemaker run from their `.yaml` ([PACE models](docs/pace.md)).
+PACE (ACE) potentials fitted with pacemaker run from their `.yaml` ([PACE models](https://github.com/ICAMS/grace-runtime/blob/master/docs/pace.md)).
 
-**[Read the manual](docs/index.md)** · [Installation](docs/installation.md) · [API reference](docs/api.md)
+**[Read the manual](https://github.com/ICAMS/grace-runtime/blob/master/docs/index.md)** · [Installation](https://github.com/ICAMS/grace-runtime/blob/master/docs/installation.md) · [API reference](https://github.com/ICAMS/grace-runtime/blob/master/docs/api.md)
 
 ## Install
 
-Install one package from PyPI ([source builds](docs/installation.md#cpu-from-source) for other targets):
+Install one package from PyPI ([source builds](https://github.com/ICAMS/grace-runtime/blob/master/docs/installation.md#cpu-from-source) for other targets):
 
 | Backend | Install |
 | --- | --- |
@@ -18,7 +18,7 @@ Install one package from PyPI ([source builds](docs/installation.md#cpu-from-sou
 | AMD | `pip install grace-runtime-rocm6` |
 
 GPU packages install the matching CPU package automatically.
-See the manual for [GPU requirements](docs/backends.md) and [environment setup](docs/installation.md#python-environment).
+See the manual for [GPU requirements](https://github.com/ICAMS/grace-runtime/blob/master/docs/backends.md) and [environment setup](https://github.com/ICAMS/grace-runtime/blob/master/docs/installation.md#python-environment).
 
 ## First calculation
 
@@ -38,22 +38,22 @@ Named models download on first use; local `kokkos.npz` files work too.
 
 ## Guides
 
-The [manual](docs/index.md#guides) covers [batching and MD](docs/usage.md), [relaxation](docs/relax.md),
-[properties](docs/properties.md), [dispersion](docs/dispersion.md), [PACE models](docs/pace.md), [TorchSim](docs/torchsim.md) and
-[development](docs/development.md). An interactive tour is in the [ASE notebook](python/examples/ase/grace_runtime_ase.ipynb).
+The [manual](https://github.com/ICAMS/grace-runtime/blob/master/docs/index.md#guides) covers [batching and MD](https://github.com/ICAMS/grace-runtime/blob/master/docs/usage.md), [relaxation](https://github.com/ICAMS/grace-runtime/blob/master/docs/relax.md),
+[properties](https://github.com/ICAMS/grace-runtime/blob/master/docs/properties.md), [dispersion](https://github.com/ICAMS/grace-runtime/blob/master/docs/dispersion.md), [PACE models](https://github.com/ICAMS/grace-runtime/blob/master/docs/pace.md), [TorchSim](https://github.com/ICAMS/grace-runtime/blob/master/docs/torchsim.md) and
+[development](https://github.com/ICAMS/grace-runtime/blob/master/docs/development.md). An interactive tour is in the [ASE notebook](https://github.com/ICAMS/grace-runtime/blob/master/python/examples/ase/grace_runtime_ase.ipynb).
 
 ## LAMMPS
 
 The [LAMMPS fork](https://github.com/yury-lysogorskiy/lammps/tree/grace-runtime) supplies pair styles
 `grace/runtime` (CPU) and `grace/runtime/kk` (GPU), which take the GRACE-1L / 2L / 3L model from the `kokkos.npz` given to
 `pair_coeff`, and `pace/runtime(/kk)` for PACE models. Installing the Python package does not install LAMMPS:
-[build and run it](docs/lammps.md).
+[build and run it](https://github.com/ICAMS/grace-runtime/blob/master/docs/lammps.md).
 
 ## Licence
 
-Academic Software Licence (ASL, [LICENSE.md](LICENSE.md)): academic non-commercial use. For commercial use contact
+Academic Software Licence (ASL, [LICENSE.md](https://github.com/ICAMS/grace-runtime/blob/master/LICENSE.md)): academic non-commercial use. For commercial use contact
 ACEworks GmbH, contact@aceworks.works. Bundled third-party code keeps its own licence
-([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Changes: [CHANGELOG.md](CHANGELOG.md).
+([THIRD_PARTY_NOTICES.md](https://github.com/ICAMS/grace-runtime/blob/master/THIRD_PARTY_NOTICES.md)). Changes: [CHANGELOG.md](https://github.com/ICAMS/grace-runtime/blob/master/CHANGELOG.md).
 
 ## Reference
 

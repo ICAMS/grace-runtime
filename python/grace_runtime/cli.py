@@ -98,6 +98,9 @@ def info():
                                         "HSA_OVERRIDE_GFX_VERSION")
              if k in os.environ}
     print("settings:", ", ".join(f"{k}={v}" for k, v in flags.items()) or "defaults")
+    if sys.platform != "linux":
+        print("GPU: none (GPU modules are Linux-only); device='auto' runs on the CPU")
+        return 0
     try:
         _cuda.compute_capability(0)
     except (_cuda.NoGPU, ValueError) as e:

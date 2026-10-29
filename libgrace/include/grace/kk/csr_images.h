@@ -153,11 +153,11 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     auto jj = nl.j;
     auto SS = nl.S;
     // the bonds to images (S != 0) counted first: the sort keys are one per such bond, not one per bond (a large cell
-    // has few: 1L at 33M atoms, 64 bonds per atom, needed 15.75 GiB for keys of all bonds)
-    int bad = 0;
-    int64_t nimg = 0;
-    Kokkos::parallel_reduce("csr:check_S", Kokkos::RangePolicy<DeviceType>(0, nbd),
-        KOKKOS_LAMBDA(const int64_t b, int &v, int64_t &c) {
+    // has few: 1L at 33M atoms, 64 bonds per atom, needed 15.75 GiB for keys of all bonds). Ranges over bonds and
+    // image bonds are Range64: GRACE-1L at 2^25 atoms has 2^31 bonds.
+    int64_t bad = 0, nimg = 0;
+    Kokkos::parallel_reduce("csr:check_S", Range64<DeviceType>(0, nbd),
+        KOKKOS_LAMBDA(const int64_t b, int64_t &v, int64_t &c) {
       for (int k = 0; k < 3; k++)
         if (SS(b, k) <= -512 || SS(b, k) >= 512) v++;
       if (SS(b, 0) != 0 || SS(b, 1) != 0 || SS(b, 2) != 0) c++;
@@ -165,7 +165,7 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     if (bad) throw grace::Error("CSR images: lattice translation beyond +-511 cells");
     Kokkos::View<uint64_t *, DeviceType> keys("csr:keys", std::max<int64_t>(nimg, 1));
     int64_t nk = 0;
-    Kokkos::parallel_scan("csr:keys", Kokkos::RangePolicy<DeviceType>(0, nbd),
+    Kokkos::parallel_scan("csr:keys", Range64<DeviceType>(0, nbd),
         KOKKOS_LAMBDA(const int64_t b, int64_t &acc, const bool fin) {
       if (SS(b, 0) != 0 || SS(b, 1) != 0 || SS(b, 2) != 0) {
         if (fin) keys(acc) = pack_key(jj(b), SS(b, 0), SS(b, 1), SS(b, 2));
@@ -175,13 +175,14 @@ template<class DeviceType, class Traits> struct CsrImagesKK {
     if (nk > 1) Kokkos::sort(Kokkos::subview(keys, std::make_pair((int64_t) 0, nk)));
     Kokkos::View<uint64_t *, DeviceType> uniq("csr:uniq", std::max<int64_t>(nk, 1));
     int64_t ng = 0;
-    Kokkos::parallel_scan("csr:unique", Kokkos::RangePolicy<DeviceType>(0, nk),
+    Kokkos::parallel_scan("csr:unique", Range64<DeviceType>(0, nk),
         KOKKOS_LAMBDA(const int64_t i, int64_t &acc, const bool fin) {
       if (i == 0 || keys(i) != keys(i - 1)) {
         if (fin) uniq(acc) = keys(i);
         acc++;
       }
     }, ng);
+    if (ng > INT32_MAX - n) throw grace::Error("CSR images: more than 2^31 - 1 atoms and images");
     nall = n + (int) ng;
     x = decltype(x)("csr:x", std::max(nall, 1));
     type = typename Traits::t_int_1d("csr:type", std::max(nall, 1));
