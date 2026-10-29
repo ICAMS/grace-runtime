@@ -17,8 +17,10 @@ LAMMPS as described below.
 
 ## 1. Get the source
 
-You need git, CMake 3.22 or newer, a C++ compiler with OpenMP (GCC 11 or newer is recommended) and MPI (without MPI,
-leave out `-D BUILD_MPI=yes` below). Clone only the latest commit of the `grace-runtime` branch:
+You need git, CMake 3.22 or newer, a C++ compiler with OpenMP and MPI (without MPI, leave out `-D BUILD_MPI=yes`
+below). Use GCC 12 or newer: older GCC vectorizes the CPU kernels poorly (one thread, bcc W: with GCC 11 GRACE-3L runs
+about 37 % slower, with GCC 9 GRACE-1L about 4.6x and GRACE-3L about 6.6x slower). Clone only the latest commit of the
+`grace-runtime` branch:
 
 ```bash
 git clone --depth 1 -b grace-runtime https://github.com/yury-lysogorskiy/lammps.git

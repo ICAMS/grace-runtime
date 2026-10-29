@@ -55,7 +55,8 @@ install the driver on Windows only, not inside WSL. `grace-runtime info` shows w
 
 ### CPU from source
 
-If needed, install a compiler with C++17 and OpenMP support:
+If needed, install a compiler with C++17 and OpenMP support. Use GCC 12 or newer: older GCC builds much slower CPU
+kernels (with GCC 11 GRACE-3L about 37 % slower, with GCC 9 up to 6.6x slower).
 
 ```bash
 micromamba install -c conda-forge cxx-compiler
