@@ -89,6 +89,33 @@ On HPE Cray systems (`PrgEnv-amd` with `cray-mpich`), also add `-D GRACE_BLAS=OF
 a BLAS at configure time that `hipcc` does not link, and the link then fails with `undefined symbol: cblas_sgemm`. The
 setting affects only the CPU styles, which then use their built-in matrix product.
 
+Example for [LUMI](https://docs.lumi-supercomputer.eu/) (MI250X, `PrgEnv-amd`). Configure on a login node, because
+the configure step needs network access; build in a batch job and run on a GPU node. On the login node, ROCm's CMake
+files warn that `AMDGPU_TARGETS` is not set and no GPU was detected; the warning is harmless, the binary is built
+for gfx90a:
+
+```bash
+module --force purge
+module load LUMI/25.03 partition/G
+module load rocm/6.3.4 buildtools/25.03 PrgEnv-amd cray-mpich
+
+cmake -S cmake -B build-hip -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=hipcc \
+  -D PKG_KOKKOS=yes -D Kokkos_ENABLE_HIP=yes -D Kokkos_ARCH_AMD_GFX90A=yes \
+  -D GPU_TARGETS=gfx90a -D CMAKE_CXX_FLAGS="-munsafe-fp-atomics" -D BUILD_MPI=yes -D PKG_ML-PACE=yes \
+  -D GRACE_BLAS=OFF
+sbatch -A project_<number> -p small-g -N 1 -n 1 -c 8 --gpus=1 -t 00:30:00 --wrap "cmake --build build-hip -j 8"
+```
+
+The build takes about 12 minutes; its output goes to `slurm-<jobid>.out`.
+
+One GCD (half of an MI250X) per run, with the input of [step 4](#4-run):
+
+```bash
+srun -A project_<number> -p small-g -N 1 -n 1 -c 7 --gpus=1 -t 00:30:00 \
+  build-hip/lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lmp \
+  -var model ~/.cache/grace/GRACE-2L-OMAT-medium-ft-E/kokkos.npz
+```
+
 Other AMD GPUs ([GPU backends](backends.md#amd-rocm)):
 
 | GPU | Flags |
@@ -130,7 +157,8 @@ set).
 ## 4. Run
 
 Save this input as `in.lmp`. It is a bcc W/Mo alloy of 1024 atoms; `pair_coeff` maps LAMMPS atom types 1 and 2 to W
-and Mo, and the model file is given on the command line as the variable `model`:
+and Mo, and the model file is given on the command line as the variable `model`. The input also prints the largest
+extrapolation grade γ of all atoms (the model's uncertainty) and writes γ per atom to `uq.dump`:
 
 ```text
 units        metal
@@ -146,11 +174,22 @@ mass         2 95.95
 pair_style   grace/runtime
 pair_coeff   * * ${model} W Mo
 
+fix          gamma all pair 20 grace/runtime gamma 1
+compute      max_gamma all reduce max f_gamma
+
 velocity     all create 300 4928459
 fix          1 all nvt temp 300 300 0.1
+thermo_style custom step temp pe press c_max_gamma
 thermo       20
+dump         uq all custom 100 uq.dump id type x y z f_gamma
 run          100
 ```
+
+`fix pair` asks the pair style for γ every 20 steps, the same interval as `thermo`. γ needs a model with an
+uncertainty head (GRACE-2L-OMAT-medium-ft-E has one; see [uncertainty quantification](usage.md#uncertainty-quantification)).
+For a model without one, leave out the `fix pair`, `compute` and `dump` lines and `c_max_gamma`. The fields
+`atomic_sigma` and `gmm_cluster` are available in the same way; see the
+[`pair_style grace/runtime` documentation](https://github.com/yury-lysogorskiy/lammps/blob/grace-runtime/doc/src/pair_grace_runtime.rst).
 
 CPU, 4 MPI ranks with 4 OpenMP threads each:
 
@@ -178,9 +217,13 @@ The style prints which model kind it loaded. On the CPU (`grace/runtime`):
 ```text
 [grace/runtime] loading the GRACE-2L model .../GRACE-2L-OMAT-medium-ft-E/kokkos.npz
 [GRACE-2L] lmax 4 | L1 42 ch, A1/AA/AAA/AAAA 25/141/107/378 | I 4x32 | L2 32 / 64 ch, ... | spline N 1024
-   Step          Temp          E_pair         E_mol          TotEng         Press
-         0   300           -12248.756      0             -12209.086      40140.971
+   Step          Temp          PotEng         Press       c_max_gamma
+         0   300           -12248.756      40140.972      0.42767153
+        20   184.01952     -12233.328      43814.062      0.58249744
 ```
+
+γ is the distance of an atom's environment from the training data, divided by a threshold: below 1 the atom is
+inside the region the model was trained on, above 1 it extrapolates. Here all atoms stay below 1.
 
 On the GPU (`grace/runtime/kk`), also the element mapping and the chunk size chosen from the free GPU memory:
 
@@ -189,12 +232,11 @@ On the GPU (`grace/runtime/kk`), also the element mapping and the chunk size cho
 [grace/runtime/kk] LAMMPS type 1 -> W (model index 83)
 [grace/runtime/kk] LAMMPS type 2 -> Mo (model index 43)
 [GRACE-2L/KK] chunksize auto: 1126 atoms per chunk (...)
-   Step          Temp          E_pair         E_mol          TotEng         Press
-         0   300           -12248.756      0             -12209.086      40140.93
 ```
 
-The energy at step 0 is the same on the CPU and the GPU. Both evaluate the network in fp32, in a different order, so
-the last digits and later steps of the trajectory can differ slightly.
+With `fix pair` in the input, LAMMPS also warns that it switches to legacy (host) communication and sorting for
+Kokkos; this is expected and harmless. The thermo output follows, as on the CPU. The energy at step 0 is the same on the CPU and the GPU. Both evaluate the
+network in fp32, in a different order, so the last digits and later steps of the trajectory can differ slightly.
 
 Wrong input stops LAMMPS with an error that names the problem: a PACE `.yaml` in `grace/runtime`, a GRACE model in
 `pace/runtime`, a keyword that does not fit the model, or units other than `metal`.
