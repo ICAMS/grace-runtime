@@ -87,6 +87,9 @@ struct GRACE1LModel {
   // Energy MLP
   std::vector<MLPLayer> energy_mlp_layers;
   int energy_mlp_activation = 0;  // 0=silu, 1=tanh
+  int radial_activation = 0;      // radial MLP: 0=silu, 1=tanh (legacy models)
+  bool AAA_right_A = false;       // legacy models: AAA = AA1 x A (current: AA1 x A1)
+  bool energy_mlp_ln = false;     // legacy models: RMS layer norm of the MLP input, x s / rms(x) (s folded into layer 0)
 
   // Per-element shifts
   std::vector<double> shift_values;
@@ -122,6 +125,10 @@ struct GRACE1LModel {
   void load(const std::string &filepath);
   // load() of an archive already read (key -> array), e.g. a modified copy in a test
   void load_arrays(const std::map<std::string, cnpy::NpyArray> &npz);
+
+  // a copy zero-padded to wider channel widths, with the same results (models without UQ only): radial channels
+  // (A) nr, FC outputs no
+  GRACE1LModel padded(int nr, int no) const;
 
   // throws grace::Error unless the model carries a usable schema-6 UQ head
 

@@ -6,6 +6,7 @@
 #include "grace/kk/grace_1l_kk_impl.h"
 #include "grace/kk/fused_common.h"
 #include "grace/kk/fused_dense.h"
+#include "grace/radial_x.h"
 #include "grace/kk/fused_hip_bonds.h"
 #include "grace/kk/g1l_shape_large.h"
 
@@ -28,8 +29,10 @@ constexpr int G1LF_MAX_ACC = 16;    // per-thread accumulators: nradmax * nlm <=
 constexpr int G1LF_NO = 64;         // FC widths compiled for: 64 (GRACE-1L large) and 32 (medium)
 constexpr int G1LF_NO_M = 32;
 constexpr int G1LF_NIN = 64;        // max channel width of the rho sources
-constexpr int G1LF_NIR = 32;        // max right-input (A) width of the FCs
+constexpr int G1LF_NIR = 32;        // right-input (A) width of the generic reverse FC (32 and 64: fc_bwd_rt)
+constexpr int G1LF_NRMAX = 64;      // max radial width (zero-padded to 32 or 64 when the kernels need it)
 constexpr int G1LF_CC = 8;          // rho connections per thread (forward)
+constexpr int G1LF_RQ = 5;          // rho output quads: rho_n_out <= 20 (17; legacy models 13), weights padded to 20
 
 }    // namespace g1lf_detail
 using namespace g1lf_detail;
@@ -38,6 +41,54 @@ using namespace g1lf_detail;
 
 
 /* ---------------------------------------------------------------------- */
+
+// FC width no / radial width nr (nlm harmonics) runs on the compiled kernels
+inline bool g1lf_fc_ok(int no) { return no == G1LF_NO || no == G1LF_NO_M; }
+inline bool g1lf_radial_ok(int nr, int nlm)
+{
+  return nr <= G1LF_NRMAX && G1LF_TEAM % nr == 0 && nr * nlm <= G1LF_TEAM * G1LF_MAX_ACC;
+}
+
+template<class DeviceType, class Traits>
+std::array<int, 2> Grace1LFusedKK<DeviceType, Traits>::pad_widths(const GRACE1LModel &m)
+{
+  const int nlm = (m.lmax + 1) * (m.lmax + 1), fc = m.fc_A1.n_out;
+  if (m.has_uq || m.lmax > G1LF_MAX_LMAX || m.rho_n_out > 4 * G1LF_RQ ||
+      (g1lf_radial_ok(m.nradmax, nlm) && g1lf_fc_ok(fc)))
+    return {0, 0};
+  // radial and FC widths padded to the compiled FC widths 32 / 64
+  int nr = g1lf_radial_ok(m.nradmax, nlm) ? m.nradmax : m.nradmax <= G1LF_NO_M ? G1LF_NO_M : G1LF_NO;
+  int no = fc <= G1LF_NO_M ? G1LF_NO_M : G1LF_NO;
+  if (m.AAA_right_A) nr = no = std::max(nr, no);    // legacy AAA = AA1 x A: one channel count
+  if (m.nradmax > nr || fc > no || !g1lf_radial_ok(nr, nlm)) return {0, 0};
+  return {nr, no};
+}
+
+template<class DeviceType, class Traits>
+std::shared_ptr<GRACE1LModel> Grace1LFusedKK<DeviceType, Traits>::padded_model(std::shared_ptr<GRACE1LModel> model)
+{
+  const std::array<int, 2> w = model ? pad_widths(*model) : std::array<int, 2>{0, 0};
+  return w[0] ? std::make_shared<GRACE1LModel>(model->padded(w[0], w[1])) : model;
+}
+
+template<class DeviceType, class Traits>
+std::string Grace1LFusedKK<DeviceType, Traits>::slow_notice(const GRACE1LModel &m)
+{
+  const std::array<int, 2> w = pad_widths(m);
+  if (!w[0]) return "";
+  return fmt("this GRACE-1L model (lmax {}, radial channels {}, FC width {}) has no GPU kernels of its own widths: it "
+             "runs zero-padded to {} / {} (the same results, at the cost of the wider model). {}", m.lmax, m.nradmax,
+             m.fc_A1.n_out, w[0], w[1], GRACE_KK_ISSUE);
+}
+
+template<class DeviceType, class Traits>
+void Grace1LFusedKK<DeviceType, Traits>::set_model(std::shared_ptr<GRACE1LModel> model,
+                                                   const std::vector<int> &type2mu)
+{
+  auto p = padded_model(model);
+  if (p != model) this->log.warn("GRACE-1L/KK: " + slow_notice(*model));
+  Base::set_model(std::move(p), type2mu);
+}
 
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::setup()
@@ -55,22 +106,20 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
   const int nlm = (this->lmax + 1) * (this->lmax + 1);
   if (this->lmax > G1LF_MAX_LMAX)
     GRACE_KK_ERROR("GRACE-1L/KK: lmax {} > {} not supported", this->lmax, G1LF_MAX_LMAX);
-  if (this->nradmax * nlm > G1LF_TEAM * G1LF_MAX_ACC || this->nradmax > G1LF_TEAM || G1LF_TEAM % this->nradmax)
+  if (!g1lf_radial_ok(this->nradmax, nlm))
     GRACE_KK_ERROR("GRACE-1L/KK: radial width {} outside the compiled bond kernels", this->nradmax);
-  if (this->fc_n_out != G1LF_NO && this->fc_n_out != G1LF_NO_M)
+  if (!g1lf_fc_ok(this->fc_n_out))
     GRACE_KK_ERROR("GRACE-1L/KK: FC width {} not compiled (must be {} or {})", this->fc_n_out, G1LF_NO,
                      G1LF_NO_M);
-  if (this->rho_n_out != 17) GRACE_KK_ERROR("GRACE-1L/KK: rho width must be 17");
-  if (this->nradmax > G1LF_NIN || this->nradmax > G1LF_NIR)
-    GRACE_KK_ERROR("GRACE-1L/KK: nradmax {} > {}", this->nradmax, G1LF_NIR);
+  if (this->rho_n_out > 4 * G1LF_RQ) GRACE_KK_ERROR("GRACE-1L/KK: rho width {} > {}", this->rho_n_out, 4 * G1LF_RQ);
   auto live = [](const GRACE1LModel::CGProduct &p, bool left, bool right) {
     std::vector<int> v;
     if (left) v.insert(v.end(), p.left_ind.begin(), p.left_ind.end());
     if (right) v.insert(v.end(), p.right_ind.begin(), p.right_ind.end());
     return v;
   };
-  // A1 feeds AA (both operands) and AAA (right operand)
-  std::vector<int> liveA1 = live(m.prod_AA, true, true), r = live(m.prod_AAA, false, true);
+  // A1 feeds AA (both operands) and AAA (right operand; legacy models: A)
+  std::vector<int> liveA1 = live(m.prod_AA, true, true), r = live(m.prod_AAA, false, !m.AAA_right_A);
   liveA1.insert(liveA1.end(), r.begin(), r.end());
   build_fc_meta(fcm_A1, m.fc_A1, liveA1);
   build_fc_meta(fcm_AA1, m.fc_AA1, live(m.prod_AAA, true, false));
@@ -124,7 +173,7 @@ void Grace1LFusedKK<DeviceType, Traits>::build_spline_tables()
   std::vector<double> g, dg, out, dout;
   for (int k = 0; k <= N; k++) {
     radial_basis_x(k * h, p, nrb, g, dg);
-    mlp_x(layers, g, dg, out, dout);
+    mlp_x(layers, g, dg, out, dout, m.radial_activation);
     for (int o = 0; o < nout; o++) { fv[(size_t) k * nout + o] = out[o]; dv[(size_t) k * nout + o] = h * dout[o]; }
   }
   d_splR = V3<F>("g1lf:R", N, nout, 4);
@@ -590,7 +639,7 @@ void Grace1LFusedKK<DeviceType, Traits>::build_red_meta()
   const GRACE1LModel &m = *this->grace_model;
   const GRACE1LModel::ReduceWeights *rws[4] = {&m.reduce_A, &m.reduce_AA, &m.reduce_AAA, &m.reduce_AAAA};
   const int nfi[4] = {(this->lmax + 1) * (this->lmax + 1), this->n_funcs_AA, this->n_funcs_AAA, this->n_funcs_AAAA};
-  const int ntypes = ((int) this->h_type2model.size() - 1), no = this->rho_n_out, nop = (no + 3) / 4 * 4;
+  const int ntypes = ((int) this->h_type2model.size() - 1), no = this->rho_n_out, nop = 4 * G1LF_RQ;
   rm.nx = 4;
   int gtot = 0;
   std::vector<std::array<int, 3>> conns;                        // (x, fi, tile), sorted by x
@@ -808,8 +857,9 @@ void Grace1LFusedKK<DeviceType, Traits>::stage_dense_fwd()
   else prod_fwd(pm_AA, this->d_A1, this->d_A1, this->d_AA);
   if (this->fc_n_out == G1LF_NO) fc_fwd4<G1LF_NO>(fcm_AA1, this->d_AA, this->d_A, this->d_AA1);
   else fc_fwd4<G1LF_NO_M>(fcm_AA1, this->d_AA, this->d_A, this->d_AA1);
-  if (shape_id) G1LF_SHAPE_FWD(AAA, this->d_AA1, this->d_A1, this->d_AAA)
-  else prod_fwd(pm_AAA, this->d_AA1, this->d_A1, this->d_AAA);
+  const auto &right = this->grace_model->AAA_right_A ? this->d_A : this->d_A1;    // AAA = AA1 x A1 (legacy: x A)
+  if (shape_id) G1LF_SHAPE_FWD(AAA, this->d_AA1, right, this->d_AAA)
+  else prod_fwd(pm_AAA, this->d_AA1, right, this->d_AAA);
   if (this->fc_n_out == G1LF_NO) fc_fwd4<G1LF_NO>(fcm_AA2, this->d_AA, this->d_A, this->d_AA2);
   else fc_fwd4<G1LF_NO_M>(fcm_AA2, this->d_AA, this->d_A, this->d_AA2);
   if (shape_id) G1LF_SHAPE_FWD(AAAA, this->d_AA2, this->d_AA2, this->d_AAAA)
@@ -817,7 +867,7 @@ void Grace1LFusedKK<DeviceType, Traits>::stage_dense_fwd()
 }
 
 template<class DeviceType, class Traits>
-void Grace1LFusedKK<DeviceType, Traits>::stage_reduce() { red_fwd<5>(); }
+void Grace1LFusedKK<DeviceType, Traits>::stage_reduce() { red_fwd<G1LF_RQ>(); }
 
 // the reverse reduce assigns A_adj .. AAAA_adj; A1_adj receives AAA (right) before AA (left, accumulated)
 template<class DeviceType, class Traits>
@@ -826,14 +876,16 @@ void Grace1LFusedKK<DeviceType, Traits>::stage_zero_adj() { Kokkos::deep_copy(th
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::stage_dense_bwd()
 {
-  red_bwd<5, G1LF_NIN>();
+  red_bwd<G1LF_RQ, G1LF_NIN>();
   if (shape_id) G1LF_SHAPE_REV(AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj,
                                (int) this->d_AA2_adj.extent(2))
   else prod_rev(pm_AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj, false);
   if (this->fc_n_out == G1LF_NO) fc_bwd<G1LF_NO, G1LF_NIR>(fcm_AA2, this->d_AA2_adj, this->d_AA_adj, this->d_A_adj);
   else fc_bwd<G1LF_NO_M, G1LF_NIR>(fcm_AA2, this->d_AA2_adj, this->d_AA_adj, this->d_A_adj);
-  if (shape_id) G1LF_SHAPE_REV(AAA, this->d_AA1, this->d_A1, this->d_AAA_adj, this->d_AA1_adj, this->d_A1_adj, ng_AAA)
-  else prod_rev(pm_AAA, this->d_AA1, this->d_A1, this->d_AAA_adj, this->d_AA1_adj, this->d_A1_adj, false);
+  const bool aaa_a = this->grace_model->AAA_right_A;
+  const auto &right = aaa_a ? this->d_A : this->d_A1, &right_adj = aaa_a ? this->d_A_adj : this->d_A1_adj;
+  if (shape_id) G1LF_SHAPE_REV(AAA, this->d_AA1, right, this->d_AAA_adj, this->d_AA1_adj, right_adj, ng_AAA)
+  else prod_rev(pm_AAA, this->d_AA1, right, this->d_AAA_adj, this->d_AA1_adj, right_adj, false);
   if (this->fc_n_out == G1LF_NO) fc_bwd<G1LF_NO, G1LF_NIR>(fcm_AA1, this->d_AA1_adj, this->d_AA_adj, this->d_A_adj);
   else fc_bwd<G1LF_NO_M, G1LF_NIR>(fcm_AA1, this->d_AA1_adj, this->d_AA_adj, this->d_A_adj);
   // AA reverse accumulates into A1_adj (generated with --acc AA); nothing to zero beyond the generated range

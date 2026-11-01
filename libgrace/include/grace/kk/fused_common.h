@@ -19,6 +19,11 @@ namespace grace {
 namespace kk {
 namespace GraceFusedKK {
 
+// the last sentence of the warnings for a model without GPU kernels of its own widths
+constexpr const char *GRACE_KK_ISSUE =
+    "Please open an issue at https://github.com/ICAMS/grace-runtime/issues with these numbers so that fast kernels "
+    "can be added";
+
 constexpr int GRACE_FUSED_MAX_LMAX = 4;
 
 struct alignas(16) GF4 { float x, y, z, w; };
@@ -183,50 +188,6 @@ void spline_vd(const View3 &c, const int N, const float x, const int o, float &v
   const float a0 = c(k, o, 0), a1 = c(k, o, 1), a2 = c(k, o, 2), a3 = c(k, o, 3);
   v = a0 + t * (a1 + t * (a2 + t * a3));
   dv = (a1 + t * (2.0f * a2 + t * 3.0f * a3)) * (float) N;
-}
-
-// Host fp64: Chebyshev T_1..T_nrb of (2x-1) times fcut_p(x), and d/dx (x = r / rcut_ij).
-inline void radial_basis_x(double x, int p, int nrb, std::vector<double> &g, std::vector<double> &dg)
-{
-  const double xp = std::pow(x, p), xp1 = xp * x, xp2 = xp1 * x;
-  const double fc = 1.0 - 0.5 * (p + 1) * (p + 2) * xp + p * (p + 2) * xp1 - 0.5 * p * (p + 1) * xp2;
-  const double dfc = 0.5 * p * (p + 1) * (p + 2) * (-std::pow(x, p - 1) + 2.0 * xp - xp1);
-  const double t = 2.0 * x - 1.0;
-  double Tp = 1.0, Tc = t, dTp = 0.0, dTc = 2.0;   // d/dx, chain factor 2
-  g.resize(nrb); dg.resize(nrb);
-  for (int k = 0; k < nrb; k++) {
-    g[k] = Tc * fc;
-    dg[k] = dTc * fc + Tc * dfc;
-    const double Tn = 2.0 * t * Tc - Tp, dTn = 2.0 * (2.0 * Tc + t * dTc) - dTp;
-    Tp = Tc; dTp = dTc; Tc = Tn; dTc = dTn;
-  }
-}
-
-// Host fp64 forward-mode radial MLP (silu hidden layers, linear output), as TagComputeMLPRadial_R.
-template<class Layer>
-void mlp_x(const std::vector<Layer> &layers, std::vector<double> h,
-           std::vector<double> dh, std::vector<double> &out, std::vector<double> &dout)
-{
-  const int n = layers.size();
-  for (int il = 0; il < n; il++) {
-    const auto &L = layers[il];
-    std::vector<double> s(L.n_out, 0.0), ds(L.n_out, 0.0);
-    for (int k = 0; k < L.n_in; k++)
-      for (int j = 0; j < L.n_out; j++) {
-        const double w = L.W[(size_t) k * L.n_out + j];
-        s[j] += w * h[k]; ds[j] += w * dh[k];
-      }
-    for (int j = 0; j < L.n_out; j++) {
-      s[j] *= L.norm; ds[j] *= L.norm;
-      if (il < n - 1) {
-        const double sg = 1.0 / (1.0 + std::exp(-s[j]));
-        ds[j] = sg * (1.0 + s[j] * (1.0 - sg)) * ds[j];
-        s[j] = s[j] * sg;
-      }
-    }
-    h.swap(s); dh.swap(ds);
-  }
-  out.swap(h); dout.swap(dh);
 }
 
 }    // namespace GraceFusedKK

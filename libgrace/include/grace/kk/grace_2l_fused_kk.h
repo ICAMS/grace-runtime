@@ -26,6 +26,23 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
 
   // checks the model against the compiled kernels, builds the dense metadata and the radial tables
   void setup() override;
+  // a model without UQ narrower than a compiled width set runs zero-padded to it (GRACE2LModel::padded: the same
+  // results), with a warning
+  void set_model(std::shared_ptr<GRACE2LModel> model, const std::vector<int> &type2mu) override;
+  // the compiled width set of a model (G2LF_WIDTHS); -1: outside the fused kernels
+  static int width_set(const GRACE2LModel &mm);
+  // the width set set_model pads a model to (the cheapest that fits); -1: none
+  static int pad_set(const GRACE2LModel &mm);
+  // the model zero-padded to its pad_set; the model itself without one
+  static std::shared_ptr<GRACE2LModel> padded_model(std::shared_ptr<GRACE2LModel> model);
+  // the warning for a model outside the compiled widths: zero-padded, or on the generic engine (use_generic);
+  // empty otherwise
+  static std::string slow_notice(const GRACE2LModel &mm);
+  // the model is outside the fused kernels, even padded: on the GPU only the generic engine Grace2LKK runs it
+  static bool needs_generic(const GRACE2LModel &mm) { return width_set(mm) < 0 && pad_set(mm) < 0; }
+  // the engine for a model: false this one, true the generic Grace2LKK<DeviceType, float, float, Traits> (several
+  // times slower; warn with slow_notice): only with GRACE_GENERIC_KERNELS=1, an error (grace::Error) otherwise
+  static bool use_generic(const GRACE2LModel &mm);
   typename Base::RunOutput run(const typename Base::RunInput &in) override;
   void release_buffers() override
   {
@@ -38,6 +55,7 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   int l1_nofit_nch = 0;                // chunks of the run for which it did not fit (decided once per chunk count)
   int no_shape = 0;                    // 'noshape': force the generic CG-product kernels
   int spline_n = 1024;                 // cubic-Hermite intervals on x in [0, 1] ('spline' keyword)
+  int wset = 0;                        // setup: the compiled width set of the model (G2LF_WIDTHS)
 
  protected:
   std::vector<typename Base::t_nn_3d> st_A, st_A1, st_AA1, st_AA2;
@@ -221,3 +239,5 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
 #define GRACE_KK_EXTERN_2L(Device, Traits)                                    \
   extern template class grace::kk::Grace2LKK<Device, float, float, Traits>; \
   extern template class grace::kk::Grace2LFusedKK<Device, Traits>
+// Grace2LFusedKK::use_generic: a model outside the fused kernels runs on the generic engine Grace2LKK<float>
+#define GRACE_KK_2L_GENERIC_ENGINE 1

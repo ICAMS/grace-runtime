@@ -30,7 +30,7 @@ cd lammps
 ## 2. Build
 
 The pair styles are part of the `ML-PACE` package. When CMake configures the build, it downloads grace-runtime
-0.1.1 from GitHub, so the configure step needs network access. It also downloads the ML-PACE library. Pick one of the
+0.1.2 from GitHub, so the configure step needs network access. It also downloads the ML-PACE library. Pick one of the
 three recipes; run each from the `lammps` folder.
 
 ### CPU
@@ -131,10 +131,10 @@ Other AMD GPUs ([GPU backends](backends.md#amd-rocm)):
 
 ### Without network access
 
-Download grace-runtime 0.1.1 on a machine with network access, copy it over and pass its path:
+Download grace-runtime 0.1.2 on a machine with network access, copy it over and pass its path:
 
 ```bash
-git clone --depth 1 -b 0.1.1 https://github.com/ICAMS/grace-runtime.git
+git clone --depth 1 -b 0.1.2 https://github.com/ICAMS/grace-runtime.git
 cmake -S cmake -B build-cpu ... -D LOCAL_GRACE_RUNTIME=$PWD/grace-runtime
 ```
 

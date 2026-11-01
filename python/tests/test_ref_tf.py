@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: LicenseRef-ASL   (Academic Software Licence, see LICENSE.md)
-"""Registry models against independent references: tensorpotential's TPCalculator on their -fp64 SavedModels, on the
-fixture cells (tests/fixtures/ref_tf/registry_tf_fp64.npz). Covers the
-GRACE-2L-SMAX-OMAT-large architecture, which the LAMMPS references (conftest TEST_MODELS) do not; the GPU side is
-python/tests/test_gpu_parity.py::test_against_tf_fp64. Thresholds: fp32 network against fp64 (test_vs_tp.py)."""
+"""Registry models against independent references: tensorpotential's TPCalculator on their -fp64 SavedModels (the
+legacy GRACE-1L/2L models: their fp64 SavedModels), on the fixture cells (tests/fixtures/ref_tf/registry_tf_fp64.npz).
+Covers the GRACE-2L-SMAX-OMAT-large architecture, which the LAMMPS references (conftest TEST_MODELS) do not, and the
+legacy layout (tanh radial MLPs, RMS layer norm of the energy-MLP input, 1L AAA = AA1 x A, 2L without RMSNorms); the
+GPU side is python/tests/test_gpu_parity.py::test_against_tf_fp64. Thresholds: fp32 network against fp64
+(test_vs_tp.py)."""
 import os
 
 import numpy as np
@@ -13,7 +15,8 @@ from grace_runtime import GRACERuntimeCalculator
 
 FX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "fixtures")
 REF = os.path.join(FX, "ref_tf", "registry_tf_fp64.npz")
-MODELS = {"GRACE-2L-SMAX-OMAT-large": "GRACE_TEST_M2L"}
+MODELS = ["GRACE-2L-SMAX-OMAT-large", "GRACE-1L-OAM", "GRACE-1L-OMAT", "GRACE-2L-OAM", "GRACE-2L-OMAT"]
+ENV = {"GRACE-2L-SMAX-OMAT-large": "GRACE_TEST_M2L"}    # name: the environment variable of another file
 CELLS = ["W54", "WMo54", "W2tri"]
 TOL = {"energy": 1e-6, "forces": 2e-5, "energies": 1e-5, "stress": 1e-5}    # eV/atom, eV/A, eV, relative
 TOL_SMALL = 2e-6       # eV/atom below 10 atoms (fp32 floor of the total energy, as test_vs_tp.py)
@@ -24,10 +27,16 @@ def ref():
     return np.load(REF)
 
 
-@pytest.fixture(scope="module", params=list(MODELS))
+@pytest.fixture(scope="module", params=MODELS)
 def model(request):
     from grace_runtime import registry
-    return request.param, os.environ.get(MODELS[request.param]) or registry.resolve(request.param)
+    name = request.param
+    try:
+        return name, os.environ.get(ENV.get(name, "")) or registry.resolve(name)
+    except ValueError as e:    # no export in the registry yet (a user registry in the cache may have one)
+        if name not in registry.load_entries().get("unsupported", {}):
+            raise
+        pytest.skip(str(e))
 
 
 @pytest.mark.parametrize("cell", CELLS)

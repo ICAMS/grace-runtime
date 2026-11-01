@@ -3,6 +3,43 @@
 Notable changes of grace-runtime, grace-runtime-cuda12 and grace-runtime-rocm6 (they share one version). Each
 release has a section "Changed defaults" when a default behaves differently.
 
+## [0.1.2](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.2) (2026-11-01)
+
+The early GRACE-1L/2L models, and fast GPU kernels for more GRACE-1L/2L fits.
+
+### Added
+
+- **Early GRACE-1L/2L models:** GRACE-1L-OAM, GRACE-1L-OMAT, GRACE-2L-OAM and GRACE-2L-OMAT (and their older aliases)
+  are in the registry and run on the CPU, NVIDIA and AMD GPUs, in Python and in LAMMPS, without an uncertainty head.
+  Own fits of the early GRACE-1L/2L presets run as well: tensorpotential exports them as `kokkos.npz` format 2.
+- **More GRACE-1L/2L fits on the fast GPU kernels.** A fit whose layers are narrower than compiled GPU kernels runs
+  zero-padded to them, with the same results and a warning that names the widths (not models with an uncertainty
+  head). GRACE-2L has kernels for the widths of the current registry models, of the early ones, and of fits with 48
+  layer-2 radial channels; GRACE-1L fits run with up to 64 radial channels. The models guide lists the widths.
+- `GRACE_GENERIC_KERNELS=1`: a GRACE-2L fit wider than all compiled GPU kernels runs on generic GPU kernels, several
+  times slower, with a warning. Without the variable such a fit stops with an error that names its widths.
+
+### LAMMPS (`grace-runtime` branch of the LAMMPS fork)
+
+- `grace/runtime` and `grace/runtime/kk` run the early GRACE-1L/2L models and own fits of their presets. The Kokkos
+  style pads narrower fits like Python does, and with `GRACE_GENERIC_KERNELS=1` runs wider GRACE-2L fits on the
+  generic GPU kernels. Warnings appear as LAMMPS `WARNING` lines.
+
+### Documentation
+
+- Benchmarks: H200, MI250X, L40S and CPU charts; the front page shows the execution speed.
+- Models: which fits run on the fast GPU kernels, padded or not, and `GRACE_GENERIC_KERNELS`.
+
+### Changed defaults
+
+- A GRACE-1L/2L model without GPU kernels of its own widths stopped with an error on a GPU. A narrower one now runs
+  zero-padded with a warning; a wider GRACE-2L one still stops, and the error names `GRACE_GENERIC_KERNELS=1`.
+- `device="auto"`: such a wider GRACE-2L model raises instead of running on the CPU.
+- `kokkos.npz` format version 2 for the early GRACE-1L/2L layouts. grace-runtime 0.1.1 and older refuse these files
+  and ask for an update. Files of current models stay format 1.
+- The GPU modules of `grace-runtime-cuda12` / `grace-runtime-rocm6` 0.1.2 have interface version 7; grace-runtime
+  0.1.2 refuses older modules. The packages pin each other, so a normal `pip install` matches them.
+
 ## [0.1.1](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.1) (2026-10-29)
 
 Bug fixes and documentation.

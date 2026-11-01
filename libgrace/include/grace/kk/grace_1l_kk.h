@@ -25,7 +25,7 @@ namespace kk {
 
 // Compile-time max dimensions for stack arrays in CUDA kernels
 static constexpr int GRACE1L_MAX_MLP_DIM = 64;   // max hidden dim for MLP layers
-static constexpr int GRACE1L_MAX_NRADMAX = 32;    // max radial basis functions
+static constexpr int GRACE1L_MAX_NRADMAX = 64;    // max radial basis functions
 static constexpr int GRACE1L_MAX_MLP_LAYERS = 8;  // max MLP depth
 static constexpr int GRACE1L_UQ_MAX_RP_DIM = 132;   // bounds the FULL UQ feature dim D = rp_dim + n_density (z/f/delta stack arrays); 132 = 128 rp_dim + up to 3 density channels + 1 slack; a larger model fails the D > MAX guard at load
 
@@ -71,7 +71,7 @@ class Grace1LKK {
 
   // ---- engine API (the LAMMPS glue and the Python module call these) ----
   // model: loaded GRACE-1L model; type2mu[t] (t = 1..ntypes): model element of atom type t, -1 unmapped
-  void set_model(std::shared_ptr<GRACE1LModel> model, const std::vector<int> &type2mu);
+  virtual void set_model(std::shared_ptr<GRACE1LModel> model, const std::vector<int> &type2mu);
   virtual void setup();                   // scalars, harmonics, device weights (LAMMPS: init_style)
   // another species set on a set-up engine: only the type tables (atom type -> model element, pair cutoffs and the
   // fused engines' per-type packed weights) are rebuilt; weights, spline tables and buffers stay
@@ -421,6 +421,7 @@ class Grace1LKK {
   int energy_n_layers;
   int energy_max_dim;
   int energy_activation;        // 0=silu, 1=tanh (device-side mirror)
+  bool energy_ln = false;       // legacy models: RMS layer norm of the MLP input (scale folded into layer 0)
 
   // Per-element shifts
   t_nn_1d d_shifts;            // [n_elements]

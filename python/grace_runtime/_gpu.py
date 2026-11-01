@@ -15,7 +15,7 @@ import re
 import sys
 import warnings
 
-ABI = 6    # the C++ interface of the GPU modules (kk_api.h); a plug-in must carry the same
+ABI = 7    # the C++ interface of the GPU modules (kk_api.h); a plug-in must carry the same
 # the GPU module in use: platform "cuda" | "rocm", device index, module arch, ptx (CUDA only), cc (CUDA: "8.6"; ROCm:
 # the gfx target), driver (CUDA driver version, set by _cuda.compute_capability)
 _state = {"module": None, "platform": None, "device": None, "arch": None, "ptx": False, "cc": None, "driver": None}
@@ -32,13 +32,18 @@ def strict() -> bool:
     return _flag("GRACE_RUNTIME_STRICT")
 
 
-def notice(msg: str, stacklevel: int = 3):
+def notice(msg: str, stacklevel: int | None = 3):
     """A fallback the user must not miss: a banner on stderr once per process and message, not subject to warning
-    filters (GRACE_RUNTIME_QUIET=1 silences it), then a RuntimeWarning (for warning filters and pytest.warns)."""
+    filters (GRACE_RUNTIME_QUIET=1 silences it), then a RuntimeWarning (for warning filters and pytest.warns).
+    stacklevel None: the warning points at the first caller outside grace_runtime."""
     if msg not in _noticed and not _flag("GRACE_RUNTIME_QUIET"):
         _noticed.add(msg)
         bar = "!" * 100
         print(f"{bar}\ngrace-runtime WARNING: {msg}\n{bar}", file=sys.stderr, flush=True)
+    if stacklevel is None:
+        pkg, f, stacklevel = os.path.dirname(os.path.abspath(__file__)) + os.sep, sys._getframe(), 1
+        while f.f_back is not None and os.path.abspath(f.f_code.co_filename).startswith(pkg):
+            f, stacklevel = f.f_back, stacklevel + 1
     warnings.warn(msg, RuntimeWarning, stacklevel=stacklevel)
 
 
@@ -168,17 +173,18 @@ def info() -> dict | None:
             "native": not _state["ptx"]}
 
 
-_unsupported = {}    # model path -> why the fused GPU kernels refuse it
+_unsupported = {}    # (model path, GRACE_GENERIC_KERNELS) -> why the fused GPU kernels refuse it
 
 
 def unsupported(mod, kk_model, path, spline):
     """None when the fused GPU kernels take the model, else the reason; probed once per path (the engine of the first
     probe's spline is set up then, so it costs nothing later)"""
-    if path not in _unsupported:
+    key = (path, os.environ.get("GRACE_GENERIC_KERNELS"))
+    if key not in _unsupported:
         try:
             mod.System(kk_model, [kk_model.element_names[0]], spline=spline)
-            _unsupported[path] = None
+            _unsupported[key] = None
         except ValueError as e:
-            _unsupported[path] = str(e)
-    return _unsupported[path]
+            _unsupported[key] = str(e)
+    return _unsupported[key]
 

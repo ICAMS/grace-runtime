@@ -54,6 +54,8 @@ class Model {
   ~Model();
   int layers() const;    // 1, 2 or 3 (GRACE); 0: a PACE model
   bool has_uq() const;
+  std::string slow_notice() const;    // non-empty: the GPU runs the model zero-padded or on the generic kernels
+  bool needs_generic() const;         // GRACE-2L outside the fused kernels: GPU only with GRACE_GENERIC_KERNELS=1
   void validate_uq() const;    // throws std::invalid_argument unless the UQ head is usable
   std::vector<std::string> element_names() const;
   int64_t engine_setups() const;    // full GPU engine setups so far (one per spline / chunksize, any species)

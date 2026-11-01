@@ -25,7 +25,7 @@ namespace kk {
 
 static constexpr int GRACE2L_MAX_MLP_DIM = 210;      // max hidden/output dim for MLP layers
 static constexpr int GRACE2L_MAX_MLP_HIDDEN = 128;    // max input/hidden dim for MLP radial buffers (NOT output)
-static constexpr int GRACE2L_MAX_NRADMAX = 42;        // max radial basis functions
+static constexpr int GRACE2L_MAX_NRADMAX = 64;        // max radial basis functions (the fused engine: its width sets)
 static constexpr int GRACE2L_MAX_MLP_LAYERS = 8;      // max MLP depth
 static constexpr int GRACE2L_MAX_YI_OUT_FUNCS = 200;  // max YI output functions
 static constexpr int GRACE2L_MAX_I1_FUNCS = 16;       // max I1 equivariant channels (I1_n_funcs)
@@ -80,7 +80,7 @@ class Grace2LKK {
 
   // ---- engine API (the LAMMPS glue and the Python module call these) ----
   // model: loaded GRACE-2L model; type2mu[t] (t = 1..ntypes): model element of atom type t, -1 unmapped
-  void set_model(std::shared_ptr<GRACE2LModel> model, const std::vector<int> &type2mu);
+  virtual void set_model(std::shared_ptr<GRACE2LModel> model, const std::vector<int> &type2mu);
   virtual void setup();                   // scalars, harmonics, device weights, cuBLAS (LAMMPS: init_style)
   // another species set on a set-up engine: only the type tables (atom type -> model element, pair cutoffs and the
   // fused engines' per-type packed weights) are rebuilt; weights, spline tables and buffers stay
@@ -722,6 +722,10 @@ class Grace2LKK {
   int energy_n_layers;
   int energy_max_dim;
   int energy_activation;        // 0=silu, 1=tanh
+  int rms_n1 = 0, rms_n0 = 0;   // the RMS means of rho[1:] / I2 divide by these (padded model: the unpadded widths)
+  bool energy_rms = true;       // the RMSNorms I_nl_LN, I_0_LN (off: legacy models, unit scales)
+  int radial_activation = 0;   // radial MLPs R, R1: 0=silu, 1=tanh (legacy models)
+  bool energy_ln = false;       // legacy models: RMS layer norm of the MLP input (scale folded into layer 0)
 
   // Per-element shifts
   t_nn_1d d_shifts;
@@ -876,6 +880,20 @@ class Grace2LKK {
   KOKKOS_INLINE_FUNCTION
   static NNScalar tanh_act(NNScalar x) {
     return Kokkos::tanh(x);
+  }
+
+  // a hidden unit of the radial MLPs in forward mode: h = act(s), dh = act'(s) ds (act 0 silu, 1 tanh: legacy models)
+  KOKKOS_INLINE_FUNCTION
+  static void radial_act(int act, NNScalar s, NNScalar ds, NNScalar &h, NNScalar &dh) {
+    const NNScalar one(1);
+    if (act == 1) {
+      h = Kokkos::tanh(s);
+      dh = (one - h * h) * ds;
+      return;
+    }
+    const NNScalar sig = one / (one + Kokkos::exp(-s));
+    h = s * sig;
+    dh = sig * (one + s * (one - sig)) * ds;
   }
 
 

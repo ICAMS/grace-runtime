@@ -28,6 +28,15 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
 
   // checks the model against the compiled kernels, builds the dense metadata and the radial tables
   void setup() override;
+  // a model without UQ whose radial or FC width has no compiled kernels runs zero-padded (GRACE1LModel::padded: the
+  // same results), with a warning
+  void set_model(std::shared_ptr<GRACE1LModel> model, const std::vector<int> &type2mu) override;
+  // the widths {radial channels, FC outputs} set_model pads a model to; {0, 0}: none
+  static std::array<int, 2> pad_widths(const GRACE1LModel &m);
+  // the model zero-padded to its pad_widths; the model itself without them
+  static std::shared_ptr<GRACE1LModel> padded_model(std::shared_ptr<GRACE1LModel> model);
+  // the warning for a model that runs zero-padded; empty otherwise
+  static std::string slow_notice(const GRACE1LModel &m);
   typename Base::RunOutput run(const typename Base::RunInput &in) override;
   void release_buffers() override
   {

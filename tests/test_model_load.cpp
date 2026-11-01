@@ -116,7 +116,9 @@ int main()
     grace::GRACE1LModel ok;
     ok.load_arrays(npz);
     CHECK(ok.n_elements == m1.n_elements);
-    set("GRACE-1L", 2);
+    set("GRACE-1L", 2);    // format 2: legacy GRACE-1L/2L keys (absent here: the defaults)
+    ok.load_arrays(npz);
+    set("GRACE-1L", 3);
     CHECK(refused("update grace-runtime"));
     set("GRACE-2L", 1);
     CHECK(refused("holds a GRACE-2L model"));

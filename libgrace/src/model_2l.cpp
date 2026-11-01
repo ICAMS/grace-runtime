@@ -4,6 +4,7 @@
 #include "grace/error.h"
 
 #include "npz3.h"
+#include "zero_pad.h"
 
 #include <algorithm>
 #include <cmath>
@@ -186,9 +187,15 @@ void GRACE2LModel::load_arrays(const cnpy::npz_t &npz) {
   load_reduce("rho", "AAAA", rho_reduce_AAAA);
 
   // I_nl_LN RMSNorm
-  I_nl_LN_scale = npz_require_double(npz, "I_nl_LN_scale");
-  I_nl_LN_type = npz_get_int_scalar(npz, "I_nl_LN_type", 1);
-  I_nl_LN_n_out = npz_get_int_scalar(npz, "I_nl_LN_n_out", 17);
+  energy_rms_norm = npz_get_flag(npz, "energy_rms_norm", 1);
+  if (energy_rms_norm) {
+    I_nl_LN_scale = npz_require_double(npz, "I_nl_LN_scale");
+    I_nl_LN_type = npz_get_int_scalar(npz, "I_nl_LN_type", 1);
+    I_nl_LN_n_out = npz_get_int_scalar(npz, "I_nl_LN_n_out", 17);
+  } else {
+    I_nl_LN_scale.assign(rho_n_out - 1, 1.0);
+    I_nl_LN_n_out = rho_n_out;
+  }
 
   // YI coupling
   {
@@ -218,9 +225,14 @@ void GRACE2LModel::load_arrays(const cnpy::npz_t &npz) {
   load_reduce("I2", "BBBB", I2_reduce_BBBB);
 
   // I_0_LN RMSNorm
-  I_0_LN_scale = npz_require_double(npz, "I_0_LN_scale");
-  I_0_LN_type = npz_get_int_scalar(npz, "I_0_LN_type", 0);
-  I_0_LN_n_out = npz_get_int_scalar(npz, "I_0_LN_n_out", 17);
+  if (energy_rms_norm) {
+    I_0_LN_scale = npz_require_double(npz, "I_0_LN_scale");
+    I_0_LN_type = npz_get_int_scalar(npz, "I_0_LN_type", 0);
+    I_0_LN_n_out = npz_get_int_scalar(npz, "I_0_LN_n_out", 17);
+  } else {
+    I_0_LN_scale.assign(I2_n_out, 1.0);
+    I_0_LN_n_out = I2_n_out;
+  }
 
   // Source names of the reduces (I2 / rho: kept for the UQ basis order)
   I2_instruction_names = npz_names(npz, "I2_instruction_names");
@@ -366,6 +378,8 @@ void GRACE2LModel::load_arrays(const cnpy::npz_t &npz) {
   // Energy MLP: rho[1:] + I2[1:] -> one energy
   load_mlp("energy_mlp", 2, rho_n_out - 1, 1, "rho_n_out - 1", "one energy", energy_mlp_layers);
   energy_mlp_activation = npz_get_int_in(npz, "energy_mlp_activation", 1, 0, 1);    // 0 = silu, 1 = tanh
+  radial_activation = npz_get_int_in(npz, "radial_activation", 0, 0, 1);
+  energy_mlp_ln = fold_ln_scale(npz, energy_mlp_layers[0]);
 
   // Shifts
   shift_values = npz_get_double(npz, "shift_values");
@@ -455,6 +469,46 @@ void GRACE2LModel::validate_uq() const
   if (!uq_error.empty()) throw Error(uq_error);
   check_uq_layout("GRACE-2L", uq_layout(), uq_d_basis, uq_n_density, uq_n_elements, n_elements,
                   {I2_instruction_names, rho_instruction_names});
+}
+
+// Zero channels stay zero through every FC, CG product and reduce, so the results do not change. The RMSNorms of rho
+// and I2 keep their unpadded counts (I_nl_LN_n_out, I_0_LN_n_out); the legacy RMS layer norm of the energy-MLP input
+// divides by the input count: its folded scale (layer 0) takes sqrt(n / n')
+GRACE2LModel GRACE2LModel::padded(const Widths &w) const
+{
+  const auto [no1, no2, i1, rho, nr2] = w;
+  if (has_uq) throw Error("GRACE-2L: only models without UQ are padded");
+  if (no1 < L1_nradmax || no2 < B_n_out || i1 < I1_n_out || rho < rho_n_out || nr2 < L2_nradmax)
+    throw Error("GRACE-2L: padding to narrower widths");
+  GRACE2LModel m = *this;
+  const int nl = lmax + 1;
+  pad_radial_out(m.L1_mlp_rad_layers.back(), L1_nradmax, no1, nl);
+  pad_radial_out(m.L2_mlp_rad_layers.back(), L2_nradmax, nr2, nl);
+  m.A_lin_transform_W = zero_pad(A_lin_transform_W, {embedding_size, L1_nradmax}, {embedding_size, no1});
+  m.B0_lin_transform_W = zero_pad(B0_lin_transform_W, {embedding_size, L2_nradmax}, {embedding_size, nr2});
+  for (FCWeights *w : {&m.fc_A1, &m.fc_AA1, &m.fc_AA2}) pad_fc(*w, no1, no1, no1);
+  for (FCWeights *w : {&m.fc_B1, &m.fc_BB1, &m.fc_BB2}) pad_fc(*w, no2, no2, no2);
+  for (ReduceWeights *w : {&m.I1_reduce_A, &m.I1_reduce_AA, &m.I1_reduce_AAA, &m.I1_reduce_AAAA})
+    pad_reduce(*w, n_elements, I1_n_out, i1, no1);
+  for (ReduceWeights *w : {&m.rho_reduce_A, &m.rho_reduce_AA, &m.rho_reduce_AAA, &m.rho_reduce_AAAA})
+    pad_reduce(*w, n_elements, rho_n_out, rho, no1);
+  pad_reduce(m.I_reduce_I1, 1, I_n_out, nr2, i1);
+  for (ReduceWeights *w : {&m.B_reduce_YI, &m.B_reduce_B0}) pad_reduce(*w, 1, B_n_out, no2, nr2);
+  for (ReduceWeights *w : {&m.I2_reduce_B, &m.I2_reduce_BB, &m.I2_reduce_BBB, &m.I2_reduce_BBBB})
+    pad_reduce(*w, n_elements, I2_n_out, rho, no2);
+  m.L1_nradmax = m.L1_fc_n_out = no1;
+  m.L2_nradmax = m.I_n_out = m.yi.n_rad_max = nr2;
+  m.B_n_out = m.L2_fc_n_out = no2;
+  m.I1_n_out = i1;
+  m.rho_n_out = m.I2_n_out = rho;
+  m.I_nl_LN_scale = zero_pad(I_nl_LN_scale, {rho_n_out - 1}, {rho - 1});
+  m.I_0_LN_scale = zero_pad(I_0_LN_scale, {I2_n_out}, {rho});
+  MLPLayer &e0 = m.energy_mlp_layers[0];    // input rho[1:] + I2[1:]
+  e0.W = zero_pad(e0.W, {e0.n_in, e0.n_out}, {rho - 1, e0.n_out});
+  if (energy_mlp_ln)
+    for (double &v : e0.W) v *= std::sqrt((double) e0.n_in / (rho - 1));
+  e0.n_in = rho - 1;
+  return m;
 }
 
 std::vector<UqBlock> GRACE2LModel::uq_layout() const

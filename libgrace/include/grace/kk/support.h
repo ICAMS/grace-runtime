@@ -266,6 +266,22 @@ template<class Member> KOKKOS_INLINE_FUNCTION BondSlot bond_slot(const Member &t
   return {team.team_rank() + ts * (lr % teams_per_slot), lr / teams_per_slot};
 }
 
+// Legacy GRACE-1L/2L: the RMS layer norm z = x q of the energy-MLP input (its scale folded into the first layer), q =
+// 1 / sqrt(mean x^2 + 1e-16) as tensorpotential's scalar_rms_ln. inv_rms: q of x(0..n); ln_bwd: g(k) = dE/dz_k -> dE/dx_k.
+template<class T, class X> KOKKOS_INLINE_FUNCTION T inv_rms(const X &x, int n)
+{
+  T ms = 0;
+  for (int k = 0; k < n; k++) ms += x(k) * x(k);
+  return T(1) / Kokkos::sqrt(ms / n + T(1e-16));
+}
+
+template<class T, class G, class X> KOKKOS_INLINE_FUNCTION void ln_bwd(const G &g, const X &x, int n, T q)
+{
+  T t = 0;
+  for (int k = 0; k < n; k++) t += g(k) * x(k);
+  for (int k = 0; k < n; k++) g(k) = q * (g(k) - x(k) * q * q * t / n);
+}
+
 // A RangePolicy with 64-bit indices, for ranges that can pass 2^31 (bonds of a whole system). Kokkos >= 5.2 indexes a
 // RangePolicy without IndexType with int on CUDA (before: unsigned int) and aborts the process on a larger bound.
 template<class D, class... P> using Range64 = Kokkos::RangePolicy<D, P..., Kokkos::IndexType<int64_t>>;

@@ -117,10 +117,13 @@ class Grace2LFused {
 
   // RMSNorms + energy MLP (double)
   std::vector<double> lnI_scale, ln0_scale;
+  bool rms = true;    // the RMSNorms (off: legacy models, unit scales)
+  int nrms1 = 0, nrms0 = 0;    // the RMS means of rho[1:] / I2 divide by these (padded model: the unpadded widths)
   std::vector<std::vector<double>> eW;
   std::vector<double> e_norm;
   std::vector<int> e_nin, e_nout;
   int e_act = 1;
+  bool e_ln = false;               // legacy models: RMS layer norm of the MLP input (ln_fwd)
   double out_scale = 1.0;
 
   // per-atom globals
