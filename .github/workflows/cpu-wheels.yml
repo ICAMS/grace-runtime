@@ -52,7 +52,7 @@ jobs:
       matrix:
         platform:
           - {artifact: cpu-wheels, os: ubuntu-latest, mamba: linux-64}
-          - {artifact: cpu-wheels-macos-arm64, os: macos-14, mamba: osx-arm64}
+          - {artifact: cpu-wheels-macos-arm64, os: macos-15, mamba: osx-arm64}
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 120
     steps:
@@ -81,7 +81,7 @@ jobs:
       matrix:
         platform:
           - {artifact: cpu-wheels, os: ubuntu-latest, mamba: linux-64}
-          - {artifact: cpu-wheels-macos-arm64, os: macos-14, mamba: osx-arm64}
+          - {artifact: cpu-wheels-macos-arm64, os: macos-15, mamba: osx-arm64}
         python: ["3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 120
