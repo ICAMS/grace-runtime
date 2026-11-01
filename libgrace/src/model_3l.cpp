@@ -166,6 +166,8 @@ void GRACE3LModel::load_arrays(const cnpy::npz_t &npz) {
   // a second load into the same object must keep nothing of the previous model
   *this = GRACE3LModel();
   check_grace_format(npz, "GRACE-3L");
+  for (const char *k : {"energy_mlp_scale", "radial_activation", "energy_rms_norm", "AAA_right_A"})    // format 2: 1L / 2L only
+    if (npz.count(k)) throw bad_array(k, "is a legacy GRACE-1L/2L key, not supported in GRACE-3L");
 
   // ---- Global metadata ----
   n_elements = get_size(npz, "n_elements");

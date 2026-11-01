@@ -3,8 +3,10 @@
 tests/fixtures/ref_gpu/<cell>_<1l|2l>_fused.{dump,thermo} from LAMMPS runs of the fused kk styles. fp32 parity: energy
 2e-6 eV/atom, per-atom energy 1e-5 eV, forces 2e-5 eV/A, pressure 1e-5 relative."""
 import os
+import shutil
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -67,11 +69,13 @@ def test_against_lammps_fused_kk(mod, layer, cell):
 TF_REF = FX / "ref_tf" / "registry_tf_fp64.npz"    # TPCalculator, -fp64 SavedModels; CPU side: test_ref_tf.py
 
 
-@pytest.mark.parametrize("model", ["GRACE-2L-SMAX-OMAT-large"])    # its own 2L shape on the GPU (g2l_shape_smaxl.h)
+# GRACE-2L-SMAX-OMAT-large: its own 2L shape on the GPU (g2l_shape_smaxl.h); the legacy models: the legacy layout (the
+# fused engines; 2L at its own compiled widths)
+@pytest.mark.parametrize("model", ["GRACE-2L-SMAX-OMAT-large", "GRACE-1L-OAM", "GRACE-1L-OMAT", "GRACE-2L-OAM", "GRACE-2L-OMAT"])
 @pytest.mark.parametrize("cell", ["W54", "WMo54", "W2tri"])
 def test_against_tf_fp64(mod, model, cell):
     """independent references: TPCalculator on the -fp64 SavedModel"""
-    path = Path(os.environ.get("GRACE_TEST_M2L") or CACHE / model / "kokkos.npz")
+    path = Path(model == "GRACE-2L-SMAX-OMAT-large" and os.environ.get("GRACE_TEST_M2L") or CACHE / model / "kokkos.npz")
     if not path.exists():
         pytest.skip(f"registry model {model} not in the test cache")
     types, pos, h = load_cell(cell)
@@ -89,6 +93,44 @@ def test_against_tf_fp64(mod, model, cell):
     assert np.abs(r["forces"] - ref[f"{k}/forces"]).max() <= 2e-5
     assert np.abs(r["energies"] - ref[f"{k}/energies"]).max() <= 1e-5
     assert np.abs(stress - ref[f"{k}/stress"]).max() / np.abs(ref[f"{k}/stress"]).max() <= 1e-5
+
+
+@pytest.mark.parametrize("name, path_kind", [("legacy_2l_small", "zero-padded"), ("legacy_2l_wide", "generic"),
+                                             ("grace_2l_small", "zero-padded"), ("legacy_1l_wide", "zero-padded"),
+                                             ("grace_1l_small", "zero-padded")])
+def test_outside_compiled_widths(mod, name, path_kind, monkeypatch, tmp_path):
+    """GRACE-1L/2L models with widths outside the compiled kernels (tests/fixtures/{name}.npz, random weights):
+    legacy_2l_small, grace_2l_small (the RMSNorms of the current models), legacy_1l_wide (42 radial channels) and
+    grace_1l_small (radial 20, FC 40) run zero-padded to compiled widths; legacy_2l_wide, wider than every set, is
+    refused (device="auto" too: no CPU fallback) unless GRACE_GENERIC_KERNELS=1, then runs on the generic GPU engine.
+    Either way a warning (slow_notice) says so, and the results are the CPU engine's."""
+    pytest.importorskip("grace_runtime._core")
+    from grace_runtime import GRACERuntimeCalculator
+    from ase.io import read
+    path = str(FX / f"{name}.npz")
+    at = read(FX / "WMo54.data", format="lammps-data", atom_style="atomic", Z_of_type={1: 74, 2: 42})
+    monkeypatch.delenv("GRACE_GENERIC_KERNELS", raising=False)
+    note = "zero-padded" if path_kind == "zero-padded" else "generic GPU kernels"
+    assert mod.Model(path).needs_generic == (path_kind == "generic")
+    if path_kind == "generic":
+        assert mod.Model(path).slow_notice == ""
+        monkeypatch.setenv("GRACE_RUNTIME_DEVICE", GPU)    # device="auto" picks the GPU (conftest pins the CPU)
+        for dev in (GPU, "auto"):
+            with pytest.raises(ValueError, match="GRACE_GENERIC_KERNELS=1"):
+                at.calc = GRACERuntimeCalculator(path, device=dev)
+                at.get_potential_energy()
+        monkeypatch.setenv("GRACE_GENERIC_KERNELS", "1")
+        path = shutil.copy(path, tmp_path)    # another path: the calculator caches the GPU model (and its notice)
+    assert note in mod.Model(path).slow_notice
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        at.calc = GRACERuntimeCalculator(path, device=GPU)
+    assert any(note in str(w.message) for w in caught)
+    e, f, ei = at.get_potential_energy(), at.get_forces(), at.get_potential_energies()
+    at.calc = GRACERuntimeCalculator(path, device="cpu", num_threads=4)
+    assert abs(e - at.get_potential_energy()) / len(at) <= 2e-6
+    assert np.abs(f - at.get_forces()).max() <= 2e-5
+    assert np.abs(ei - at.get_potential_energies()).max() <= 1e-5
 
 
 def test_permuted_input_same_result(mod):

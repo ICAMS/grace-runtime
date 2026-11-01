@@ -8,7 +8,8 @@
 #      path); WITH_CUBLAS=0 none (steps 1 and 2 set GRACE_RUNTIME_NO_CUBLAS=1, since the host may have a toolkit);
 #   2. the GPU test files (parity with the CPU calculator, batches, auto device, plug-in logic,
 #      memory, allocation failures, chunks, several calculators; TorchSim and device batches with WITH_TORCH=1, which
-#      installs the [torchsim] extra),
+#      installs the [torchsim] extra, with torch from the PyTorch CUDA 12 index on a CUDA 12 driver, and requires
+#      that torch sees the GPU),
 #      a release gate: only the skips GRACE_TEST_ALLOW_SKIP matches pass (card sizes, timings, the PTX path without an
 #      older module, the unsupported-model check without that model), so a missing model or package is a failure;
 #   3. an architecture without a module (GRACE_RUNTIME_CUDA_ARCH=sm61): auto -> CPU with a warning, cuda -> ImportError;
@@ -47,7 +48,19 @@ check $? "install wheels"
 if [ "$WITH_CUBLAS" = 1 ]; then
   "$P" -m pip install -q "nvidia-cublas-cu12>=12.4,<13"; check $? "install nvidia-cublas-cu12"
 fi
-if [ "${WITH_TORCH:-0}" = 1 ]; then "$P" -m pip install -q "$CPU_WHL[torchsim]"; check $? "install [torchsim]"; fi
+if [ "${WITH_TORCH:-0}" = 1 ]; then
+  # PyPI's newest torch is built for CUDA 13 and sees no GPU on a CUDA 12 driver: torch first, from the matching index
+  CU=$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9]*\).*/\1/p' | head -1)
+  if [ "${CU:-0}" -lt 13 ]; then
+    "$P" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu129
+    check $? "install torch (CUDA 12 driver: cu129 index)"
+  fi
+  "$P" -m pip install -q "$CPU_WHL[torchsim]"; check $? "install [torchsim]"
+  # numpy first, as in the tests: the env's libstdc++ (conda-forge numpy) before torch can load an older system one
+  "$P" -c "import numpy, torch; print('torch', torch.__version__, 'CUDA', torch.version.cuda)
+assert torch.cuda.is_available(), 'torch sees no GPU (driver CUDA $CU)'"
+  check $? "torch sees the GPU"
+fi
 W=$(mktemp -d /tmp/gn-cuda-test.XXXX)
 mkdir -p "$W/python" "$W/tests"
 cp -r "$ROOT/python/tests" "$W/python/"

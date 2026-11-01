@@ -430,6 +430,7 @@ void Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
       GRACE_KK_ERROR("GRACE-1L/KK: energy_mlp_activation={} not supported "
                         "(only 0=silu, 1=tanh)", m.energy_mlp_activation);
     energy_activation = m.energy_mlp_activation;
+    energy_ln = m.energy_mlp_ln;
     int emax_in = 0, emax_out = 0;
     for (int i = 0; i < energy_n_layers; i++) {
       if (m.energy_mlp_layers[i].n_in > emax_in) emax_in = m.energy_mlp_layers[i].n_in;
@@ -1898,6 +1899,10 @@ void Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
   const int nin0 = d_energy_dims(0);
   for (int k = 0; k < nin0; k++)
     h_cur[k] = d_rho(ii, k + 1);
+  if (energy_ln) {    // legacy models: RMS layer norm of the MLP input
+    const NNScalar q = inv_rms<NNScalar>([&](int k) { return h_cur[k]; }, nin0);
+    for (int k = 0; k < nin0; k++) h_cur[k] *= q;
+  }
 
   // Hidden layers: 0 .. energy_n_layers-2 (silu or tanh activation)
   for (int layer = 0; layer < energy_n_layers - 1; layer++) {
@@ -2780,6 +2785,9 @@ double Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::cutoff(int mu_i, i
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 void Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::setup()
 {
+  // the base stages evaluate the radial MLP with silu and AAA = AA1 x A1: legacy models run in the fused engine only
+  if (need_bond_buffers() && (grace_model->radial_activation || grace_model->AAA_right_A))
+    GRACE_KK_ERROR("GRACE-1L/KK: legacy GRACE-1L model: the fused engine only");
   // Copy scalar architecture params
   nelements = grace_model->n_elements;
   lmax = grace_model->lmax;
@@ -2998,8 +3006,12 @@ Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       int cs = chunk_size;
       int eact = energy_activation;
       const NNScalar os = output_scale;
+      const bool ln = energy_ln;
       Kokkos::parallel_for("ReverseMLPEnergy", Kokkos::RangePolicy<DeviceType>(0, cs),
         KOKKOS_LAMBDA(const int ii) {
+          // legacy models: RMS layer norm z = x q of the MLP input x = rho[1:]
+          auto x = [&](int k) { return rho_in(ii, k + 1); };
+          const NNScalar q = ln ? inv_rms<NNScalar>(x, edims(0)) : NNScalar(1);
           // Stack arrays: pre_act for hidden layers, adj ping-pong
           NNScalar pre_act_buf[GRACE1L_MAX_MLP_LAYERS * GRACE1L_MAX_MLP_DIM];
           NNScalar adj_a[GRACE1L_MAX_MLP_DIM], adj_b[GRACE1L_MAX_MLP_DIM];
@@ -3019,7 +3031,7 @@ Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
               NNScalar sum = 0.0;
               for (int k = 0; k < nin; k++)
                 sum += eW(0, k, j) * rho_in(ii, k + 1);
-              pre_act[0 * emax + j] = sum * enorms(0);
+              pre_act[0 * emax + j] = (ln ? sum * q : sum) * enorms(0);
             }
           }
           // Hidden layers 1..en_layers-2: pre_act[layer] = norm * W @ act(pre_act[layer-1])
@@ -3088,8 +3100,9 @@ Grace1LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
             // Swap for next iteration
             NNScalar* tmp = adj_cur; adj_cur = adj_nxt; adj_nxt = tmp;
           }
-          // adj_cur now holds d_output/d_rho[k+1] for k=0..edims(0)-1
+          // adj_cur now holds d_output/d_rho[k+1] for k=0..edims(0)-1 (legacy models: after the layer norm)
           const int nin0 = edims(0);
+          if (ln) ln_bwd([&](int k) -> NNScalar & { return adj_cur[k]; }, x, nin0, q);
           for (int k = 0; k < nin0; k++)
             rho_adj(ii, k + 1) = adj_cur[k];
         });

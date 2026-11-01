@@ -137,8 +137,9 @@ def test_yaml_and_npz_same(model_files, tmp_path):
         b = at.copy()
         b.calc = GRACERuntimeCalculator(p, device="cpu", num_threads=2)
         r.append((b.get_potential_energy(), b.get_forces()))
-    assert r[0][0] == r[1][0]
-    np.testing.assert_array_equal(r[0][1], r[1][1])
+    # two OpenMP threads sum in a run-dependent order: equal to round-off, not bit for bit
+    np.testing.assert_allclose(r[0][0], r[1][0], atol=1e-9, rtol=0)
+    np.testing.assert_allclose(r[0][1], r[1][1], atol=1e-9, rtol=0)
 
 
 def test_yaml_converted_on_the_fly_without_cache(tmp_path, monkeypatch):

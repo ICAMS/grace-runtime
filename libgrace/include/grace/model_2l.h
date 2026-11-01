@@ -101,7 +101,7 @@ struct GRACE2LModel {
   // RMSNorm: I_nl_LN (only_nonlin: scale has n_out-1 elements, rho[0] passed through)
   std::vector<double> I_nl_LN_scale;  // [rho_n_out - 1] = [16]
   int I_nl_LN_type = 1;  // 1 = only_nonlin
-  int I_nl_LN_n_out = 17;
+  int I_nl_LN_n_out = 17;    // the RMS mean runs over rho[1:I_nl_LN_n_out] (padded(): the unpadded rho width)
 
   // ---- Layer 2 ----
   int L2_nradmax = 32;
@@ -141,11 +141,15 @@ struct GRACE2LModel {
   // RMSNorm: I_0_LN (full: scale has n_out elements, all scaled)
   std::vector<double> I_0_LN_scale;  // [I2_n_out] = [17]
   int I_0_LN_type = 0;  // 0 = full
-  int I_0_LN_n_out = 17;
+  int I_0_LN_n_out = 17;     // the RMS mean runs over I2[:I_0_LN_n_out] (padded(): the unpadded I2 width)
 
   // Energy MLP (input=16, tanh activation)
   std::vector<MLPLayer> energy_mlp_layers;
   int energy_mlp_activation = 1;  // 0=silu, 1=tanh
+  int radial_activation = 0;      // radial MLPs R, R1: 0=silu, 1=tanh (legacy models)
+  bool energy_mlp_ln = false;     // legacy models: RMS layer norm of the MLP input, x s / rms(x) (s folded into layer 0)
+  // false (legacy models): rho and I2 enter the energy MLP as they are (unit scales, the engines skip the 1/rms)
+  bool energy_rms_norm = true;
 
   // Per-element shifts
   std::vector<double> shift_values;
@@ -181,6 +185,15 @@ struct GRACE2LModel {
   void load(const std::string &filepath);
   // load() of an archive already read (key -> array), e.g. a modified copy in a test
   void load_arrays(const std::map<std::string, cnpy::NpyArray> &npz);
+
+  // channel widths: layer-1 radial and FC channels no1, layer-2 FC and B channels no2, I1, rho = I2, layer-2 radial
+  // channels = I nr2
+  struct Widths {
+    int no1, no2, i1, rho, nr2;
+  };
+  Widths widths() const { return {L1_nradmax, B_n_out, I1_n_out, rho_n_out, L2_nradmax}; }
+  // a copy zero-padded to wider channel widths, with the same results (models without UQ only)
+  GRACE2LModel padded(const Widths &w) const;
 
   // throws grace::Error unless the model carries a usable schema-6 UQ head
 

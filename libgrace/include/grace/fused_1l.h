@@ -77,6 +77,8 @@ class Grace1LFused {
   std::vector<double> e_norm;
   std::vector<int> e_nin, e_nout;
   int e_act = 0;
+  bool e_ln = false;               // legacy models: RMS layer norm of the MLP input (ln_fwd)
+  bool aaa_a = false;             // legacy models: AAA = AA1 x A (else AA1 x A1)
   double out_scale = 1.0;
 
   std::vector<int> order, bstart, bcount;

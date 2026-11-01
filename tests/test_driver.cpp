@@ -23,6 +23,8 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -271,6 +273,42 @@ int main()
     for (int q = 0; q < 3 * c.n; q++) df = std::max(df, std::fabs(a.f[q] - b.f[q]));
     std::printf("3L fc_fold vs unfolded: dE %.3e  max|dF| %.3e\n", std::fabs(a.e - b.e), df);
     CHECK(std::fabs(a.e - b.e) / c.n <= 1e-6 && df <= 1e-5);
+  }
+  // test_2l_padded / test_1l_padded: a model zero-padded to wider channels (GRACE2LModel / GRACE1LModel::padded, how
+  // the GPU engines run it on compiled widths) gives the original's results. tests/fixtures: legacy_2l_small (radial
+  // channels 16 / 8), grace_2l_small (16 / 8, the RMSNorms of the current models), legacy_1l_wide (radial and FC
+  // 42 -> 64), grace_1l_small (radial 20 -> 32, FC 40 -> 64)
+  {
+    const Cell c = load_cell(fx + "/WMo54.npz");
+    auto same = [&](auto &a, auto &b, const std::string &name) {
+      const Result ra = run(a, c, 1, true), rb = run(b, c, 1, true);
+      double df = 0, dpe = 0;
+      for (int q = 0; q < 3 * c.n; q++) df = std::max(df, std::fabs(ra.f[q] - rb.f[q]));
+      for (int i = 0; i < c.n; i++) dpe = std::max(dpe, std::fabs(ra.eatom[i] - rb.eatom[i]));
+      std::printf("padded vs original (%s): dE %.3e  max|de_i| %.3e  max|dF| %.3e\n", name.c_str(),
+                  std::fabs(ra.e - rb.e), dpe, df);
+      CHECK(std::fabs(ra.e - rb.e) / c.n <= 1e-9 && dpe <= 1e-9 && df <= 1e-6);
+    };
+    for (const auto &[name, w] : std::vector<std::pair<std::string, grace::GRACE2LModel::Widths>>{
+             {"legacy_2l_small", {32, 32, 16, 13, 32}}, {"grace_2l_small", {42, 64, 12, 17, 32}}}) {
+      auto ms = std::make_shared<grace::GRACE2LModel>();
+      ms->load(fx + "/" + name + ".npz");
+      auto mp = std::make_shared<grace::GRACE2LModel>(ms->padded(w));
+      grace::Grace2LFused a(ms, {}, {}), b(mp, {}, {});
+      a.setup_types(2, type2mu_for(ms->element_names));
+      b.setup_types(2, type2mu_for(mp->element_names));
+      same(a, b, name);
+    }
+    for (const auto &[name, nr, no] : std::vector<std::tuple<std::string, int, int>>{{"legacy_1l_wide", 64, 64},
+                                                                                     {"grace_1l_small", 32, 64}}) {
+      auto ms = std::make_shared<grace::GRACE1LModel>();
+      ms->load(fx + "/" + name + ".npz");
+      auto mp = std::make_shared<grace::GRACE1LModel>(ms->padded(nr, no));
+      grace::Grace1LFused a(ms, {}, {}), b(mp, {}, {});
+      a.setup_types(2, type2mu_for(ms->element_names));
+      b.setup_types(2, type2mu_for(mp->element_names));
+      same(a, b, name);
+    }
   }
   // thread count changes the summation order only (document the size, require it to be tiny)
   {

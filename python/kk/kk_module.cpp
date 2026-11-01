@@ -226,6 +226,8 @@ NB_MODULE(GRACE_KK_MODULE, m)
       .def(nb::init<const std::string &, int, const std::string &>(), "path"_a, "spline"_a = 1024, "asi"_a = "")
       .def_prop_ro("layers", &gk::Model::layers)
       .def_prop_ro("has_uq", &gk::Model::has_uq)
+      .def_prop_ro("slow_notice", &gk::Model::slow_notice)
+      .def_prop_ro("needs_generic", &gk::Model::needs_generic)
       .def_prop_ro("element_names", &gk::Model::element_names)
       .def_prop_ro("engine_setups", &gk::Model::engine_setups)
       .def("validate_uq", &gk::Model::validate_uq);

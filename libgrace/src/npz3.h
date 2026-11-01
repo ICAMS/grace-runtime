@@ -260,7 +260,7 @@ inline int npz_get_int_in(const cnpy::npz_t &npz, const std::string &key, int de
 }
 
 // the newest grace_format_version of a GRACE kokkos.npz this build reads
-constexpr int kGraceFormatVersion = 1;
+constexpr int kGraceFormatVersion = 2;    // 2: radial_activation / energy_rms_norm (legacy GRACE-1L/2L)
 
 // grace_model_kind / grace_format_version of a GRACE kokkos.npz (written by tensorpotential exports; older exports have
 // neither and load as before): the kind must be the loader's, the format one this build reads
@@ -323,6 +323,18 @@ template<class V> inline void require_size(const std::string &key, const V &v, s
 {
   if (v.size() != n)
     throw bad_array(key, "has " + std::to_string(v.size()) + " values, expected " + std::to_string(n));
+}
+
+// legacy GRACE-1L/2L: the scale s of the RMS layer norm x s / rms(x) of the energy-MLP input (energy_mlp_scale) folded
+// into the rows of its first layer L (W [n_in][n_out]); true if the model has the norm
+template<class Layer> inline bool fold_ln_scale(const cnpy::npz_t &npz, Layer &L)
+{
+  const auto s = npz_get_double(npz, "energy_mlp_scale");
+  if (s.empty()) return false;
+  require_size("energy_mlp_scale", s, L.n_in);
+  for (int k = 0; k < L.n_in; k++)
+    for (int j = 0; j < L.n_out; j++) L.W[(size_t) k * L.n_out + j] *= s[k];
+  return true;
 }
 
 // got == want (why: where want comes from); noun: "has <got> <noun>" (a dimension of the array), else "is <got>"

@@ -3,6 +3,24 @@
  "generated_by": "tensorpotential",
  "models": [
   {
+   "name": "GRACE-1L-OAM",
+   "aliases": [
+    "GRACE-1L-OAM_2Feb25"
+   ],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-legacy-v1/kokkos/GRACE-1L-OAM-kokkos.npz",
+   "sha256": "81f3c70fb17a9533194069f253879ceb56730ee142e249473b0dbbb15b3c037f",
+   "uq": false
+  },
+  {
+   "name": "GRACE-1L-OMAT",
+   "aliases": [],
+   "arch": "1L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-legacy-v1/kokkos/GRACE-1L-OMAT-kokkos.npz",
+   "sha256": "1255e74d9851cb4a8543b58e75499d9b5d0b99236ad9f65abfcebad1b7c8950b",
+   "uq": false
+  },
+  {
    "name": "GRACE-1L-OMAT-large-base",
    "aliases": [
     "GRACE-1L-OMAT-large-base-fp64"
@@ -85,6 +103,24 @@
    "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-v3-uq-v6/kokkos/GRACE-1L-SMAX-large-kokkos.npz",
    "sha256": "97a7f56dec6a00bfc042f463228efd2c15baa020b66f41a4e5e67fcd826c850c",
    "uq": true
+  },
+  {
+   "name": "GRACE-2L-OAM",
+   "aliases": [
+    "GRACE_2L_OAM_28Jan25"
+   ],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-legacy-v1/kokkos/GRACE-2L-OAM-kokkos.npz",
+   "sha256": "86ea29271df85f8955c89d6f376e335781b5423957617b550b1a5ca38e69c261",
+   "uq": false
+  },
+  {
+   "name": "GRACE-2L-OMAT",
+   "aliases": [],
+   "arch": "2L",
+   "url": "https://huggingface.co/AMS-ICAMS-RUB/grace-foundation-models/resolve/kk-legacy-v1/kokkos/GRACE-2L-OMAT-kokkos.npz",
+   "sha256": "37501f76d03d61293a43a3c4a756977271391ad54d58105aecb7662e0ae051e9",
+   "uq": false
   },
   {
    "name": "GRACE-2L-OMAT-large-base",
@@ -208,13 +244,7 @@
   }
  ],
  "unsupported": {
-  "GRACE-1L-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE-1L-OAM_2Feb25": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE-1L-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE-2L-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE-2L-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
   "GRACE-FS-OAM": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE-FS-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator",
-  "GRACE_2L_OAM_28Jan25": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator"
+  "GRACE-FS-OMAT": "no kokkos.npz export (legacy model); use tensorpotential's TPCalculator"
  }
 }

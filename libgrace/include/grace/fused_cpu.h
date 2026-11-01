@@ -243,57 +243,6 @@ inline float dot3(const float *__restrict x, const float *__restrict y, const fl
 
 inline void vzero(float *y, const size_t n) { std::memset(y, 0, n * sizeof(float)); }
 
-// fp64: Chebyshev T_1..T_nrb of (2x-1) times fcut_p(x), and d/dx
-inline void radial_basis_x(double x, int p, int nrb, std::vector<double> &g, std::vector<double> &dg)
-{
-  const double xp = std::pow(x, p), xp1 = xp * x, xp2 = xp1 * x;
-  const double fc = 1.0 - 0.5 * (p + 1) * (p + 2) * xp + p * (p + 2) * xp1 - 0.5 * p * (p + 1) * xp2;
-  const double dfc = 0.5 * p * (p + 1) * (p + 2) * (-std::pow(x, p - 1) + 2.0 * xp - xp1);
-  const double t = 2.0 * x - 1.0;
-  double Tp = 1.0, Tc = t, dTp = 0.0, dTc = 2.0;
-  g.resize(nrb);
-  dg.resize(nrb);
-  for (int k = 0; k < nrb; k++) {
-    g[k] = Tc * fc;
-    dg[k] = dTc * fc + Tc * dfc;
-    const double Tn = 2.0 * t * Tc - Tp, dTn = 2.0 * (2.0 * Tc + t * dTc) - dTp;
-    Tp = Tc; dTp = dTc; Tc = Tn; dTc = dTn;
-  }
-}
-
-// fp64 forward-mode radial MLP (silu hidden layers, linear output)
-template<class Layers>
-void mlp_x(const Layers &layers, std::vector<double> h, std::vector<double> dh,
-           std::vector<double> &out, std::vector<double> &dout)
-{
-  const int n = layers.size();
-  for (int il = 0; il < n; il++) {
-    const auto &L = layers[il];
-    std::vector<double> s(L.n_out, 0.0), ds(L.n_out, 0.0);
-    for (int k = 0; k < L.n_in; k++)
-      for (int j = 0; j < L.n_out; j++) {
-        const double w = L.W[(size_t) k * L.n_out + j];
-        s[j] += w * h[k];
-        ds[j] += w * dh[k];
-      }
-    for (int j = 0; j < L.n_out; j++) {
-      s[j] *= L.norm;
-      ds[j] *= L.norm;
-      if (il < n - 1) {
-        const double sg = 1.0 / (1.0 + std::exp(-s[j]));
-        ds[j] = sg * (1.0 + s[j] * (1.0 - sg)) * ds[j];
-        s[j] = s[j] * sg;
-      }
-    }
-    h.swap(s);
-    dh.swap(ds);
-  }
-  out.swap(h);
-  dout.swap(dh);
-}
-
-
-
 // 16-float vectors (one AVX-512 register, two halves on AVX2: grace_cpu_simd.h). Unaligned access.
 typedef simd::f16 v16;
 inline v16 ld(const float *p) { return simd::load(p); }
@@ -711,6 +660,25 @@ inline void red_bwd(const Red &R, int ty, const float *gOut, float *const *gX)
     case 8: { constexpr int NV = 8; __VA_ARGS__; } break;                  \
     default: break;                                                        \
   }
+
+// legacy GRACE-1L/2L: the RMS layer norm z = x q of the energy-MLP input x[0..n) in place (its scale folded into the
+// first layer), q = 1 / sqrt(mean x^2 + 1e-16) as tensorpotential's scalar_rms_ln; x0 keeps the input. Returns q.
+inline double ln_fwd(double *x, double *x0, int n)
+{
+  double ms = 0.0;
+  for (int k = 0; k < n; k++) ms += (x0[k] = x[k]) * x[k];
+  const double q = 1.0 / std::sqrt(ms / n + 1e-16);
+  for (int k = 0; k < n; k++) x[k] *= q;
+  return q;
+}
+
+// its reverse in place: g = dE/dz -> dE/dx
+inline void ln_bwd(double *g, const double *x0, int n, double q)
+{
+  double t = 0.0;
+  for (int k = 0; k < n; k++) t += g[k] * x0[k];
+  for (int k = 0; k < n; k++) g[k] = q * (g[k] - x0[k] * t * q * q / n);
+}
 
 // ---- bond geometry: neighbours within the cutoff, unit vectors, real spherical harmonics Y[lm] and the
 // gradient G[lm][3] of their polynomial extension (dual numbers). Shared by the CPU GRACE-1L and 2L drivers.

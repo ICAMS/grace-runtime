@@ -4,6 +4,7 @@
 #include "grace/error.h"
 
 #include "npz3.h"
+#include "zero_pad.h"
 
 #include <cstdint>
 
@@ -186,6 +187,10 @@ void GRACE1LModel::load_arrays(const cnpy::npz_t &npz) {
   load_mlp("energy_mlp", npz_get_int_in(npz, "energy_mlp_n_layers", 2, 1, kMaxDim), energy_mlp_layers, rho_n_out - 1,
            1, "rho_n_out - 1", "one energy");
   energy_mlp_activation = npz_get_int_in(npz, "energy_mlp_activation", 0, 0, 1);    // 0=silu, 1=tanh
+  radial_activation = npz_get_int_in(npz, "radial_activation", 0, 0, 1);
+  AAA_right_A = npz_get_flag(npz, "AAA_right_A", 0);
+  if (AAA_right_A) require_eq("fc_AA1_n_out", fc_AA1.n_out, nradmax, "nradmax (AAA = AA1 x A)");
+  energy_mlp_ln = fold_ln_scale(npz, energy_mlp_layers[0]);
 
   // Shifts
   shift_values = npz_get_double(npz, "shift_values");
@@ -272,6 +277,25 @@ void GRACE1LModel::validate_uq() const
                 "with a current grace_utils.");
   if (!uq_error.empty()) throw Error(uq_error);
   check_uq_layout("GRACE-1L", uq_layout(), uq_d_basis, uq_n_density, uq_n_elements, n_elements, {rho_instruction_names});
+}
+
+// Zero channels stay zero through every FC, CG product and reduce, so the results do not change (rho keeps its width)
+GRACE1LModel GRACE1LModel::padded(int nr, int no) const
+{
+  if (has_uq) throw Error("GRACE-1L: only models without UQ are padded");
+  if (nr < nradmax || no < fc_A1.n_out) throw Error("GRACE-1L: padding to narrower widths");
+  GRACE1LModel m = *this;
+  const int nl = lmax + 1;
+  pad_radial_out(m.mlp_rad_layers.back(), nradmax, nr, nl);
+  m.A_lin_transform_W = zero_pad(A_lin_transform_W, {embedding_size, nradmax}, {embedding_size, nr});
+  pad_fc(m.fc_A1, no, nr, nr);     // A1 = FC(A, A)
+  pad_fc(m.fc_AA1, no, no, nr);    // AA1, AA2 = FC(AA, A)
+  pad_fc(m.fc_AA2, no, no, nr);
+  pad_reduce(m.reduce_A, n_elements, rho_n_out, rho_n_out, nr);
+  for (ReduceWeights *w : {&m.reduce_AA, &m.reduce_AAA, &m.reduce_AAAA})
+    pad_reduce(*w, n_elements, rho_n_out, rho_n_out, no);
+  m.nradmax = nr;
+  return m;
 }
 
 std::vector<UqBlock> GRACE1LModel::uq_layout() const

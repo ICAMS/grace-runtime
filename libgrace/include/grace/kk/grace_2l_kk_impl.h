@@ -718,6 +718,11 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::copy_weights_to_devi
     GRACE_KK_ERROR("GRACE-2L/KK: energy_mlp_activation={} not supported "
                       "(only 0=silu, 1=tanh)", m.energy_mlp_activation);
   energy_activation = m.energy_mlp_activation;
+  energy_rms = m.energy_rms_norm;
+  rms_n1 = m.I_nl_LN_n_out - 1;
+  rms_n0 = m.I_0_LN_n_out;
+  radial_activation = m.radial_activation;
+  energy_ln = m.energy_mlp_ln;
   copy_mlp(m.energy_mlp_layers, energy_n_layers,
            d_energy_W, d_energy_norms, d_energy_dims, energy_max_dim, "g2l:energy");
   if (energy_n_layers > GRACE2L_MAX_MLP_LAYERS)
@@ -1312,7 +1317,8 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         auto lnout = d_I_nl_LN;
         auto scale = d_I_nl_LN_scale;
         auto I_nl_glob = d_I_nl_LN_global;
-        int n_out_ln = rho_n_out;
+        int n_out_ln = rho_n_out, nrms = rms_n1;
+        const bool rms = energy_rms;
 
         Kokkos::parallel_for("RMSNorm_I_nl_LN", Kokkos::RangePolicy<DeviceType>(0, cs),
           KOKKOS_LAMBDA(const int ii) {
@@ -1324,7 +1330,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
             NNScalar sq_sum = 0.0;
             for (int k = 1; k < n_out_ln; k++)
               sq_sum += rho_in(ii, k) * rho_in(ii, k);
-            NNScalar rms_inv = 1.0 / Kokkos::sqrt(sq_sum / (n_out_ln - 1) + 1e-8);
+            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
             for (int k = 1; k < n_out_ln; k++) {
               NNScalar val = rho_in(ii, k) * rms_inv * scale(k - 1);
               lnout(ii, k) = val;
@@ -1493,14 +1499,15 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       auto I2_in = d_I2;
       auto lnout = d_I_0_LN;
       auto scale = d_I_0_LN_scale;
-      int n_out_ln = I2_n_out, cs = chunk_size;
+      int n_out_ln = I2_n_out, nrms = rms_n0, cs = chunk_size;
+      const bool rms = energy_rms;
 
       Kokkos::parallel_for("RMSNorm_I_0_LN", Kokkos::RangePolicy<DeviceType>(0, cs),
         KOKKOS_LAMBDA(const int ii) {
           NNScalar sq_sum = 0.0;
           for (int k = 0; k < n_out_ln; k++)
             sq_sum += I2_in(ii, k) * I2_in(ii, k);
-          NNScalar rms_inv = 1.0 / Kokkos::sqrt(sq_sum / n_out_ln + 1e-8);
+          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
           for (int k = 0; k < n_out_ln; k++)
             lnout(ii, k) = I2_in(ii, k) * rms_inv * scale(k);
         });
@@ -1577,6 +1584,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       auto il = d_ilist; int co = chunk_offset;
       const NNScalar os = output_scale;
       auto wk = d_emlp_work;    // per atom: pre-activations [en_layers - 1][emax], then two adjoint rows [emax]
+      const bool ln = energy_ln;
 
       Kokkos::parallel_for("ReverseMLPEnergy", Kokkos::RangePolicy<DeviceType>(0, cs),
         KOKKOS_LAMBDA(const int ii) {
@@ -1584,18 +1592,20 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           // as in the interleaved local memory it replaces)
           int adj_cur = (en_layers - 1) * emax, adj_nxt = adj_cur + emax;    // column offsets of the two rows
 
-          // Input: I_nl_LN[:,1:] + I_0_LN[:,1:]
+          // Input x = I_nl_LN[:,1:] + I_0_LN[:,1:] (legacy models: its RMS layer norm z = x q)
           const int nin0 = edims(0);
+          const int i = il[ii + co];
+          auto x = [&](int k) { return I_nl_in(i, k + 1) + I_0_in(ii, k + 1); };
+          const NNScalar q = ln ? inv_rms<NNScalar>(x, nin0) : NNScalar(1);
 
           // Forward pass: recompute hidden pre-activations
           {
             const int nout = edims(1);
             for (int j = 0; j < nout; j++) {
               NNScalar sum = 0.0;
-              const int i = il[ii + co];
               for (int k = 0; k < nin0; k++)
                 sum += eW(0, k, j) * (I_nl_in(i, k + 1) + I_0_in(ii, k + 1));
-              wk(ii, 0 * emax + j) = sum * enorms(0);
+              wk(ii, 0 * emax + j) = (ln ? sum * q : sum) * enorms(0);
             }
           }
           for (int layer = 1; layer < en_layers - 1; layer++) {
@@ -1647,7 +1657,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           // adj_cur now holds d_output/d_input[k] for k=0..nin0-1
           // Both I_nl_LN and I_0_LN get the same gradient (sum rule).
           // Linear skip seeds scaled by output_scale (chain rule for E*output_scale).
-          const int i = il[ii + co];
+          if (ln) ln_bwd([&](int k) -> NNScalar & { return wk(ii, adj_cur + k); }, x, nin0, q);
           nl_adj(ii, 0) = os;   // linear skip term, scaled
           i0_adj(ii, 0) = os;
           nl_adj_glob(i, 0) = os;
@@ -1664,7 +1674,8 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
       auto I2_in = d_I2; auto ln_adj = d_I_0_LN_adj; auto ln_out = d_I_0_LN;
       auto I2_adj_out = d_I2_adj;
       auto scale = d_I_0_LN_scale;
-      int n_out_ln = I2_n_out, cs = chunk_size;
+      int n_out_ln = I2_n_out, nrms = rms_n0, cs = chunk_size;
+      const bool rms = energy_rms;
 
       Kokkos::parallel_for("ReverseRMSNorm_I_0_LN", Kokkos::RangePolicy<DeviceType>(0, cs),
         KOKKOS_LAMBDA(const int ii) {
@@ -1672,16 +1683,17 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           NNScalar sq_sum = 0.0;
           for (int k = 0; k < n_out_ln; k++)
             sq_sum += I2_in(ii, k) * I2_in(ii, k);
-          NNScalar rms_inv = 1.0 / Kokkos::sqrt(sq_sum / n_out_ln + 1e-8);
+          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
 
-          // dot = Σ_k d_ln[k] * ln_out[k]
+          // dot = Σ_k d_ln[k] * ln_out[k] (without the RMSNorm: 0, the identity)
           NNScalar dot = 0.0;
-          for (int k = 0; k < n_out_ln; k++)
-            dot += ln_adj(ii, k) * ln_out(ii, k);
+          if (rms)
+            for (int k = 0; k < n_out_ln; k++)
+              dot += ln_adj(ii, k) * ln_out(ii, k);
 
           // dx[k] = rms_inv * (d_ln[k] * scale[k] - x[k] * dot * rms_inv / N)
           for (int k = 0; k < n_out_ln; k++)
-            I2_adj_out(ii, k) = rms_inv * (ln_adj(ii, k) * scale(k) - I2_in(ii, k) * dot * rms_inv / n_out_ln);
+            I2_adj_out(ii, k) = rms_inv * (ln_adj(ii, k) * scale(k) - I2_in(ii, k) * dot * rms_inv / nrms);
         });
     }
 
@@ -1840,8 +1852,9 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
         auto I_nl_out = d_I_nl_LN_global;
         auto rho_adj_out = d_rho_adj;
         auto scale = d_I_nl_LN_scale;
-        int n_out_ln = rho_n_out, cs = chunk_size;
+        int n_out_ln = rho_n_out, nrms = rms_n1, cs = chunk_size;
         auto il = d_ilist; int co = chunk_offset;
+        const bool rms = energy_rms;
 
         Kokkos::parallel_for("ReverseRMSNorm_I_nl_LN", Kokkos::RangePolicy<DeviceType>(0, cs),
           KOKKOS_LAMBDA(const int ii) {
@@ -1853,15 +1866,16 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
             NNScalar sq_sum = 0.0;
             for (int k = 1; k < n_out_ln; k++)
               sq_sum += rho_in(ii, k) * rho_in(ii, k);
-            NNScalar rms_inv = 1.0 / Kokkos::sqrt(sq_sum / (n_out_ln - 1) + 1e-8);
+            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
 
-            // dot = Σ_{k=1}^{n-1} d_ln[k] * ln_out[k]
+            // dot = Σ_{k=1}^{n-1} d_ln[k] * ln_out[k] (without the RMSNorm: 0, the identity)
             NNScalar dot = 0.0;
-            for (int k = 1; k < n_out_ln; k++)
-              dot += nl_adj(i, k) * I_nl_out(i, k);
+            if (rms)
+              for (int k = 1; k < n_out_ln; k++)
+                dot += nl_adj(i, k) * I_nl_out(i, k);
 
             for (int k = 1; k < n_out_ln; k++)
-              rho_adj_out(ii, k) = rms_inv * (nl_adj(i, k) * scale(k - 1) - rho_in(ii, k) * dot * rms_inv / (n_out_ln - 1));
+              rho_adj_out(ii, k) = rms_inv * (nl_adj(i, k) * scale(k - 1) - rho_in(ii, k) * dot * rms_inv / nrms);
           });
       }
 
@@ -2051,10 +2065,7 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
         NNScalar w = d_mlp_rad_R_W(layer, k, j);
         s += w * h_cur[k]; ds += w * dh_cur[k];
       }
-      s *= norm; ds *= norm;
-      NNScalar sig = 1.0 / (1.0 + Kokkos::exp(-s));
-      h_nxt[j] = s * sig;
-      dh_nxt[j] = sig * (1.0 + s * (1.0 - sig)) * ds;
+      radial_act(radial_activation, s * norm, ds * norm, h_nxt[j], dh_nxt[j]);
     }
     NNScalar* tmp;
     tmp = h_cur; h_cur = h_nxt; h_nxt = tmp;
@@ -2139,10 +2150,7 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
         NNScalar w = d_mlp_rad_R1_W(layer, k, j);
         s += w * h_cur[k]; ds += w * dh_cur[k];
       }
-      s *= norm; ds *= norm;
-      NNScalar sig = 1.0 / (1.0 + Kokkos::exp(-s));
-      h_nxt[j] = s * sig;
-      dh_nxt[j] = sig * (1.0 + s * (1.0 - sig)) * ds;
+      radial_act(radial_activation, s * norm, ds * norm, h_nxt[j], dh_nxt[j]);
     }
     NNScalar* tmp;
     tmp = h_cur; h_cur = h_nxt; h_nxt = tmp;
@@ -2218,8 +2226,8 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAs
 // TagMLPActDeriv: fused value+deriv silu applied in place between GEMMs. Reads
 // the raw value GEMM output (d_mlp_h{0,1}) and raw deriv GEMM output
 // (d_mlp_dh{0,1}); forms s = raw*norm (2L MLP has NO bias) and ds = raw_deriv*norm,
-// then writes silu(s) and silu'(s)*ds. silu'(s) = sig*(1 + s*(1-sig)) -- identical
-// to the hand kernel TagComputeMLPRadial_R{,1}.
+// then writes silu(s) and silu'(s)*ds (legacy models: tanh), as the hand kernel TagComputeMLPRadial_R{,1}
+// (radial_act).
 template<class DeviceType, typename NNScalarT, typename GeomScalarT, class Traits>
 KOKKOS_INLINE_FUNCTION
 void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPActDeriv,
@@ -2229,19 +2237,12 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagMLPAc
   const int b = (int) (idx / nout);
   const int j = (int) (idx - (int64_t) b * nout);
   const NNScalar norm = mlp_act_norm;
-  if (mlp_act_layer == 0) {
-    const NNScalar s   = d_mlp_h0(b, j) * norm;
-    const NNScalar ds  = d_mlp_dh0(b, j) * norm;
-    const NNScalar sig = NNScalar(1.0) / (NNScalar(1.0) + Kokkos::exp(-s));
-    d_mlp_h0(b, j)  = s * sig;
-    d_mlp_dh0(b, j) = sig * (NNScalar(1.0) + s * (NNScalar(1.0) - sig)) * ds;
-  } else {
-    const NNScalar s   = d_mlp_h1(b, j) * norm;
-    const NNScalar ds  = d_mlp_dh1(b, j) * norm;
-    const NNScalar sig = NNScalar(1.0) / (NNScalar(1.0) + Kokkos::exp(-s));
-    d_mlp_h1(b, j)  = s * sig;
-    d_mlp_dh1(b, j) = sig * (NNScalar(1.0) + s * (NNScalar(1.0) - sig)) * ds;
-  }
+  const auto &h = mlp_act_layer == 0 ? d_mlp_h0 : d_mlp_h1;
+  const auto &dh = mlp_act_layer == 0 ? d_mlp_dh0 : d_mlp_dh1;
+  NNScalar hv, dhv;
+  radial_act(radial_activation, h(b, j) * norm, dh(b, j) * norm, hv, dhv);
+  h(b, j) = hv;
+  dh(b, j) = dhv;
 }
 
 // TagMLPScatterR: write the LayoutRight output-GEMM result d_mlp_R[b, j] (already
@@ -3150,6 +3151,10 @@ void Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::operator() (TagCompu
   const int nin0 = d_energy_dims(0);
   for (int k = 0; k < nin0; k++)
     h_cur[k] = d_I_nl_LN_global(i, k + 1) + d_I_0_LN(ii, k + 1);
+  if (energy_ln) {    // legacy models: RMS layer norm of the MLP input
+    const NNScalar q = inv_rms<NNScalar>([&](int k) { return h_cur[k]; }, nin0);
+    for (int k = 0; k < nin0; k++) h_cur[k] *= q;
+  }
 
   // Hidden layers with activation
   for (int layer = 0; layer < energy_n_layers - 1; layer++) {

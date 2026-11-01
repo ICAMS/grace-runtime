@@ -6,6 +6,7 @@
 
 #include "grace/bonds.h"
 #include "grace/fused_cpu.h"
+#include "grace/radial_x.h"
 #include "grace/type_map.h"
 
 #include <algorithm>
@@ -109,7 +110,7 @@ void Grace1LFused::build_splines()
   std::vector<double> fv((size_t) (N + 1) * nout), dv((size_t) (N + 1) * nout), g, dg, out, dout;
   for (int k = 0; k <= N; k++) {
     radial_basis_x(k * h, m.radial_basis_p, m.nradbase, g, dg);
-    mlp_x(layers, g, dg, out, dout);
+    mlp_x(layers, g, dg, out, dout, m.radial_activation);
     for (int o = 0; o < nout; o++) {
       fv[(size_t) k * nout + o] = out[o];
       dv[(size_t) k * nout + o] = h * dout[o];
@@ -162,6 +163,7 @@ void Grace1LFused::build_model()
   sh_coefs(lmax, sh_a, sh_b, sh_c, sh_d);
   build_splines();
 
+  aaa_a = m.AAA_right_A;
   build_prod(pAA, m.prod_AA);
   build_prod(pAAA, m.prod_AAA);
   build_prod(pAAAA, m.prod_AAAA);
@@ -205,7 +207,7 @@ void Grace1LFused::build_model()
   ci_of(rRho, 1, nAAv);
   prune(pAA, nAAv);
   auto liveA1 = operands(pAA, nlm, true, true);
-  const auto liveA1r = operands(pAAA, nlm, false, true);
+  const auto liveA1r = operands(pAAA, nlm, false, !aaa_a);
   for (int q = 0; q < nlm; q++) liveA1[q] = liveA1[q] || liveA1r[q];
   build_fc(fcA1, m.fc_A1, CA, CA, PA, PA, PF, liveA1, cx);
   build_fc(fcAA1, m.fc_AA1, CF, CA, PF, PA, PF, liveAA1, cx);
@@ -236,6 +238,7 @@ void Grace1LFused::build_model()
       throw Error(braces("GRACE-1L: energy MLP layer {} is {} x {} (widths 1..256, consecutive layers must match)",
                          L, e_nin[L], e_nout[L]));
   e_act = m.energy_mlp_activation;
+  e_ln = m.energy_mlp_ln;
   out_scale = m.output_scale;
   log.info(braces("[GRACE-1L] lmax {} | A {} ch, FC {} ch | live A1 {}/{} AA {}/{} AA1 {}/{} AAA {}/{} AA2 {}/{} "
                    "AAAA {}/{} | rho {} | spline N {}",
@@ -278,17 +281,18 @@ void Grace1LFused::forward(Work &w)
   { PROF(T_PROD1); prod_fwd(pAA, w.A1.data(), w.A1.data(), w.AA.data(), PF); }
   { PROF(T_FC1); fc_fwd(fcAA1, w.AA.data(), A, w.AA1.data()); }
   { PROF(T_FC1); fc_fwd(fcAA2, w.AA.data(), A, w.AA2.data()); }
+  const float *Ar = aaa_a ? A : w.A1.data();    // AAA = AA1 x A1 (legacy: x A)
   if (rowred) {
     const float *X[4] = {A, w.AA.data(), nullptr, nullptr};
     { PROF(T_RED1); red_fwd(rRho, ty, X, w.Rho.data()); }
     const Red *reds[1] = {&rRho};
     float *outs[1] = {w.Rho.data()};
     { const RowRed *rrs[1] = {&rrRho_3};
-      PROF(T_PROD1); prod_red_fwd(pAAA, w.AA1.data(), w.A1.data(), PF, ty, reds, rrs, 1, outs, w.row.data()); }
+      PROF(T_PROD1); prod_red_fwd(pAAA, w.AA1.data(), Ar, PF, ty, reds, rrs, 1, outs, w.row.data()); }
     { const RowRed *rrs[1] = {&rrRho_4};
       PROF(T_PROD1); prod_red_fwd(pAAAA, w.AA2.data(), w.AA2.data(), PF, ty, reds, rrs, 1, outs, w.row.data()); }
   } else {
-    { PROF(T_PROD1); prod_fwd(pAAA, w.AA1.data(), w.A1.data(), w.AAA.data(), PF); }
+    { PROF(T_PROD1); prod_fwd(pAAA, w.AA1.data(), Ar, w.AAA.data(), PF); }
     { PROF(T_PROD1); prod_fwd(pAAAA, w.AA2.data(), w.AA2.data(), w.AAAA.data(), PF); }
     const float *X[4] = {A, w.AA.data(), w.AAA.data(), w.AAAA.data()};
     { PROF(T_RED1); red_fwd(rRho, ty, X, w.Rho.data()); }
@@ -320,6 +324,8 @@ void Grace1LFused::backward(Work &w)
   }
   const Red *reds[1] = {&rRho};
   const float *gouts[1] = {w.gRho.data()};
+  const float *Ar = aaa_a ? w.A.data() : w.A1.data();    // AAA = AA1 x A1 (legacy: x A)
+  float *gAr = aaa_a ? gA : gA1;
   if (rowred) {
     const RowRed *rrs[1] = {&rrRho_4};
     PROF(T_PROD1B);
@@ -333,10 +339,10 @@ void Grace1LFused::backward(Work &w)
   if (rowred) {
     const RowRed *rrs[1] = {&rrRho_3};
     PROF(T_PROD1B);
-    prod_red_bwd(pAAA, w.AA1.data(), w.A1.data(), PF, ty, reds, rrs, 1, gouts, w.gAA1.data(), gA1, w.row.data());
+    prod_red_bwd(pAAA, w.AA1.data(), Ar, PF, ty, reds, rrs, 1, gouts, w.gAA1.data(), gAr, w.row.data());
   } else {
     PROF(T_PROD1B);
-    prod_bwd(pAAA, w.AA1.data(), w.A1.data(), gAAA, w.gAA1.data(), gA1, PF);
+    prod_bwd(pAAA, w.AA1.data(), Ar, gAAA, w.gAA1.data(), gAr, PF);
   }
   { PROF(T_FC1B); fc_bwd(fcAA1, w.gAA1.data(), gAA, gA); }
   { PROF(T_PROD1B); prod_bwd(pAA, w.A1.data(), w.A1.data(), gAA, gA1, gA1, PF); }
@@ -375,6 +381,8 @@ double Grace1LFused::energy_atom(const float *rho, int ty, float *grho) const
   const int nlay = eW.size();
   double act[8][MAXW], pre[8][MAXW];
   for (int k = 1; k < nrho; k++) act[0][k - 1] = rho[k];
+  double x0[MAXW], q = 0.0;
+  if (e_ln) q = ln_fwd(act[0], x0, nrho - 1);
   for (int L = 0; L < nlay; L++) {
     for (int c = 0; c < e_nout[L]; c++) pre[L][c] = 0.0;
     for (int a = 0; a < e_nin[L]; a++) {
@@ -412,6 +420,7 @@ double Grace1LFused::energy_atom(const float *rho, int ty, float *grho) const
     }
     for (int a = 0; a < e_nin[L]; a++) g[a] = gn[a];
   }
+  if (e_ln) ln_bwd(g, x0, nrho - 1, q);
   grho[0] = (float) out_scale;
   for (int k = 1; k < nrho; k++) grho[k] = (float) g[k - 1];
   return Ei;

@@ -77,14 +77,18 @@ def _kk_model_key(model) -> str:
 
 def _load_kk_model(kk, model):
     asi = getattr(model, "asi", None)
-    return kk.Model(model.path, asi=asi) if asi else kk.Model(model.path)
+    m = kk.Model(model.path, asi=asi) if asi else kk.Model(model.path)
+    if note := m.slow_notice:
+        _gpu.notice(note, stacklevel=None)    # from the calculator or the batch functions
+    return m
 
 
 def _select_device(device: str, model):
     """(resolved device, (GPU module, its model) or None, backend info) for a CPU Model. device="auto" falls back to the
     CPU (announced by _gpu.notice; an error with GRACE_RUNTIME_STRICT=1) when a GPU is there but has no module, the
-    module predates the GRACE-3L engine, the fused kernels refuse the model or the GPU fails to start / set up the model
-    (e.g. its memory held by another process; not remembered); an explicit GPU device ("cuda", "rocm", "gpu") raises.
+    module predates the GRACE-3L engine, the fused kernels refuse the model (not one the generic GPU kernels can run,
+    GRACE_GENERIC_KERNELS: that raises) or the GPU fails to start / set up the model (e.g. its memory held by another
+    process; not remembered); an explicit GPU device ("cuda", "rocm", "gpu") raises.
     Backend info: {"device", "platform", "arch", "cc", "native", "fallback", "store"} (fallback: None, "ptx" or the reason
     of a CPU fallback; store: see _store_info, set by the calculator's CPU calls)."""
     path = model.path
@@ -112,6 +116,8 @@ def _select_device(device: str, model):
             kk_model = _KK_MODELS[mkey]
         if auto:
             why = _gpu.unsupported(kk, kk_model, path, model.spline)
+            if why and kk_model.needs_generic:    # the generic GPU kernels can run it (GRACE_GENERIC_KERNELS=1)
+                raise ValueError(why)
             if why:
                 return _cpu_fallback(why)
     except RuntimeError as e:

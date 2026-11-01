@@ -45,7 +45,8 @@ namespace grace_runtime_kk {
 using Dev = Kokkos::DefaultExecutionSpace;
 using T = grace::kk::DefaultTraits<Dev>;
 using E1 = grace::kk::Grace1LFusedKK<Dev, T>;
-using E2 = grace::kk::Grace2LFusedKK<Dev, T>;
+using E2F = grace::kk::Grace2LFusedKK<Dev, T>;
+using E2 = grace::kk::Grace2LKK<Dev, float, float, T>;    // E2F, or the generic engine (E2F::use_generic)
 using E3 = grace::kk::Grace3LFusedKK<Dev, T>;    // as LAMMPS grace/runtime/kk (fp32 with fp64 bonds / envelope)
 using EP = grace::kk::PaceKK<Dev, T>;             // PACE (fp64)
 }    // namespace grace_runtime_kk
@@ -222,7 +223,9 @@ struct SharedEngine {
 struct Model::Impl : DeviceState {
   std::string layers;
   std::shared_ptr<grace::GRACE1LModel> m1;
+  std::shared_ptr<grace::GRACE1LModel> m1run;    // m1 zero-padded to compiled widths, once (E1::padded_model)
   std::shared_ptr<grace::GRACE2LModel> m2;
+  std::shared_ptr<grace::GRACE2LModel> m2run;    // m2 zero-padded to a compiled width set, once (E2F::padded_model)
   std::shared_ptr<grace::GRACE3LModel> m3;
   std::shared_ptr<grace::PaceModel> mp;
   std::mutex emu;
@@ -279,7 +282,7 @@ struct Model::Impl : DeviceState {
         e->e1 = std::make_unique<E1>();
         e->e1->spline_n = spline;
         e->e1->chunksize = chunksize;
-        e->e1->set_model(m1, type2mu);
+        e->e1->set_model(m1run, type2mu);
         e->e1->setup();
       } else if (m3) {
         e->e3 = std::make_unique<E3>();
@@ -288,10 +291,15 @@ struct Model::Impl : DeviceState {
         e->e3->set_model(m3, type2mu);
         e->e3->setup();
       } else {
-        e->e2 = std::make_unique<E2>();
-        e->e2->spline_n = spline;
+        if (E2F::use_generic(*m2)) {
+          e->e2 = std::make_unique<E2>();
+        } else {
+          auto f = std::make_unique<E2F>();
+          f->spline_n = spline;
+          e->e2 = std::move(f);
+        }
         e->e2->chunksize = chunksize;
-        e->e2->set_model(m2, type2mu);
+        e->e2->set_model(m2run, type2mu);
         e->e2->setup();
       }
     } catch (const grace::Error &err) {
@@ -320,12 +328,14 @@ Model::Model(const std::string &path, int /*spline*/, const std::string &asi) : 
     } else if (impl->layers == "1l") {
       impl->m1 = std::make_shared<grace::GRACE1LModel>();
       impl->m1->load(path);
+      impl->m1run = E1::padded_model(impl->m1);
     } else if (impl->layers == "3l") {
       impl->m3 = std::make_shared<grace::GRACE3LModel>();
       impl->m3->load(path);
     } else {
       impl->m2 = std::make_shared<grace::GRACE2LModel>();
       impl->m2->load(path);
+      impl->m2run = E2F::padded_model(impl->m2);
     }
   } catch (const std::exception &e) {
     throw std::invalid_argument(std::string("cannot load ") + path + ": " + e.what());
@@ -337,6 +347,11 @@ bool Model::has_uq() const
 {
   return impl->mp ? impl->mp->has_uq : impl->m1 ? impl->m1->has_uq : impl->m3 ? impl->m3->has_uq : impl->m2->has_uq;
 }
+std::string Model::slow_notice() const
+{
+  return impl->m2 ? E2F::slow_notice(*impl->m2) : impl->m1 ? E1::slow_notice(*impl->m1) : "";
+}
+bool Model::needs_generic() const { return impl->m2 && E2F::needs_generic(*impl->m2); }
 void Model::validate_uq() const
 {
   try {

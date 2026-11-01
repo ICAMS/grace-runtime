@@ -6,6 +6,7 @@
 
 #include "grace/bonds.h"
 #include "grace/fused_cpu.h"
+#include "grace/radial_x.h"
 #include "grace/type_map.h"
 
 #include <algorithm>
@@ -126,7 +127,7 @@ void Grace2LFused::build_splines()
     std::vector<double> fv((size_t) (N + 1) * nout), dv((size_t) (N + 1) * nout), g, dg, out, dout;
     for (int k = 0; k <= N; k++) {
       radial_basis_x(k * h, m.radial_basis_p, m.nradbase, g, dg);
-      mlp_x(layers, g, dg, out, dout);
+      mlp_x(layers, g, dg, out, dout, m.radial_activation);
       for (int o = 0; o < nout; o++) {
         fv[(size_t) k * nout + o] = out[o];
         dv[(size_t) k * nout + o] = h * dout[o];
@@ -359,6 +360,9 @@ void Grace2LFused::build_model()
   // norms + energy MLP
   lnI_scale = m.I_nl_LN_scale;
   ln0_scale = m.I_0_LN_scale;
+  rms = m.energy_rms_norm;
+  nrms1 = m.I_nl_LN_n_out - 1;
+  nrms0 = m.I_0_LN_n_out;
   if ((int) lnI_scale.size() != nrho - 1 || (int) ln0_scale.size() != nI2 || nrho != nI2)
     throw Error("GRACE-2L: unexpected RMSNorm widths");
   eW.clear(); e_norm.clear(); e_nin.clear(); e_nout.clear();
@@ -379,6 +383,7 @@ void Grace2LFused::build_model()
       throw Error(braces("GRACE-2L: energy MLP layer {} is {} x {} (widths 1..256, consecutive layers must match)",
                          L, e_nin[L], e_nout[L]));
   e_act = m.energy_mlp_activation;
+  e_ln = m.energy_mlp_ln;
   out_scale = m.output_scale;
 
   log.info(braces("[GRACE-2L] lmax {} | L1 {} ch, A1/AA/AAA/AAAA {}/{}/{}/{} | I {}x{} | L2 {} / {} ch, "
@@ -546,11 +551,13 @@ double Grace2LFused::energy_atom(const float *rho, const float *I2, int ty, doub
   double ms1 = 0.0, ms0 = 0.0;
   for (int k = 1; k < nr; k++) ms1 += (double) rho[k] * rho[k];
   for (int k = 0; k < nr; k++) ms0 += (double) I2[k] * I2[k];
-  const double s1 = std::sqrt(ms1 / (nr - 1) + 1e-8), s0 = std::sqrt(ms0 / nr + 1e-8);
+  const double s1 = rms ? std::sqrt(ms1 / nrms1 + 1e-8) : 1.0, s0 = rms ? std::sqrt(ms0 / nrms0 + 1e-8) : 1.0;
   constexpr int MAXW = 256;
   const int nlay = eW.size();
   double act[8][MAXW], pre[8][MAXW];
   for (int k = 1; k < nr; k++) act[0][k - 1] = rho[k] / s1 * lnI_scale[k - 1] + I2[k] / s0 * ln0_scale[k];
+  double x0[MAXW], q = 0.0;
+  if (e_ln) q = ln_fwd(act[0], x0, nr - 1);
   for (int L = 0; L < nlay; L++) {
     for (int c = 0; c < e_nout[L]; c++) pre[L][c] = 0.0;
     for (int a = 0; a < e_nin[L]; a++) {
@@ -589,17 +596,20 @@ double Grace2LFused::energy_atom(const float *rho, const float *I2, int ty, doub
     }
     for (int a = 0; a < e_nin[L]; a++) g[a] = gn[a];
   }
-  // g = dE/dx_in; RMSNorm reverses (y_k = x_k s_k / sigma)
+  if (e_ln) ln_bwd(g, x0, nr - 1, q);
+  // g = dE/dx_in; RMSNorm reverses (y_k = x_k s_k / sigma; without the RMSNorms t1 = t0 = 0, sigma = 1)
   grho[0] = out_scale;
   double t1 = 0.0;
-  for (int k = 1; k < nr; k++) t1 += g[k - 1] * lnI_scale[k - 1] * rho[k];
-  for (int k = 1; k < nr; k++) grho[k] = g[k - 1] * lnI_scale[k - 1] / s1 - rho[k] * t1 / ((nr - 1) * s1 * s1 * s1);
+  if (rms)
+    for (int k = 1; k < nr; k++) t1 += g[k - 1] * lnI_scale[k - 1] * rho[k];
+  for (int k = 1; k < nr; k++) grho[k] = g[k - 1] * lnI_scale[k - 1] / s1 - rho[k] * t1 / (nrms1 * s1 * s1 * s1);
   double gy[MAXW];
   gy[0] = out_scale;
   for (int k = 1; k < nr; k++) gy[k] = g[k - 1];
   double t0 = 0.0;
-  for (int k = 0; k < nr; k++) t0 += gy[k] * ln0_scale[k] * I2[k];
-  for (int k = 0; k < nr; k++) gI2[k] = (float) (gy[k] * ln0_scale[k] / s0 - I2[k] * t0 / (nr * s0 * s0 * s0));
+  if (rms)
+    for (int k = 0; k < nr; k++) t0 += gy[k] * ln0_scale[k] * I2[k];
+  for (int k = 0; k < nr; k++) gI2[k] = (float) (gy[k] * ln0_scale[k] / s0 - I2[k] * t0 / (nrms0 * s0 * s0 * s0));
   return Ei;
 }
 
