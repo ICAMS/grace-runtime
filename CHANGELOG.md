@@ -3,6 +3,37 @@
 Notable changes of grace-runtime, grace-runtime-cuda12 and grace-runtime-rocm6 (they share one version). Each
 release has a section "Changed defaults" when a default behaves differently.
 
+## [0.1.3](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.3) (2026-11-03)
+
+Fixes, and the LAMMPS fork on the current stable LAMMPS.
+
+### Fixed
+
+- macOS: when PyTorch from PyPI is loaded in the same process, two OpenMP runtimes are present and the process used to
+  abort with `OMP: Error #15`. grace-runtime now raises a `RuntimeError` that explains the conflict and how to install
+  PyTorch from conda-forge instead. (Not when `KMP_DUPLICATE_LIB_OK` is set, as with scikit-learn.)
+- Python: setting or unsetting `GRACE_GENERIC_KERNELS` in a running process now takes effect with the next model
+  load on the GPU, with the warning. Before, a GPU model loaded earlier was reused and ran the generic kernels without
+  a warning, or kept them after the variable was unset.
+
+### LAMMPS (`grace-runtime` branch of the LAMMPS fork)
+
+- Based on the stable LAMMPS release of 30 September 2026 (update 1, with Kokkos 5.2.1).
+- `grace/runtime/kk`: GRACE-2L and GRACE-3L with `comm_style tiled` work with the device-side communication of this
+  LAMMPS version.
+- `pace/kk`, `pace/extrapolation/kk`: the keyword `neigh` (`auto`, `shared`, `global`) selects where the short neighbor
+  list is kept on the GPU; with `auto` a list too large for on-chip memory uses global memory with a warning instead
+  of stopping the run. On a CPU backend, the styles no longer leak their per-atom energy and stress arrays.
+- AMD GPUs: the bundled Kokkos is built with `Kokkos_ENABLE_IMPL_HIP_MALLOC_ASYNC=OFF`, so that `chunksize auto` sees
+  the freed GPU memory (with it on, GRACE-3L ran about 10 % slower on MI250X).
+- With Kokkos 5.2.1, GRACE-1L and GRACE-2L-medium run about 2 % slower on an H200 than with the earlier Kokkos.
+
+### Changed defaults
+
+- macOS: two OpenMP runtimes in one process raise a `RuntimeError` (see above).
+- LAMMPS `pace/kk`: a short neighbor list that does not fit on-chip memory runs in global memory with a warning.
+- LAMMPS, AMD GPUs: `Kokkos_ENABLE_IMPL_HIP_MALLOC_ASYNC` is OFF for the bundled Kokkos.
+
 ## [0.1.2](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.2) (2026-11-01)
 
 The early GRACE-1L/2L models, and fast GPU kernels for more GRACE-1L/2L fits.

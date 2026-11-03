@@ -30,7 +30,7 @@ cd lammps
 ## 2. Build
 
 The pair styles are part of the `ML-PACE` package. When CMake configures the build, it downloads grace-runtime
-0.1.2 from GitHub, so the configure step needs network access. It also downloads the ML-PACE library. Pick one of the
+0.1.3 from GitHub, so the configure step needs network access. It also downloads the ML-PACE library. Pick one of the
 three recipes; run each from the `lammps` folder.
 
 ### CPU
@@ -91,6 +91,11 @@ cmake --build build-hip -j 8
 `GPU_TARGETS` names the same target as `Kokkos_ARCH_...` for ROCm's own CMake files, which otherwise warn and choose
 a default target when no GPU is visible (for example on a login node).
 
+The fork builds its bundled Kokkos for HIP with `Kokkos_ENABLE_IMPL_HIP_MALLOC_ASYNC=OFF`. With that option on, memory
+freed by Kokkos stays reserved and is not reported as free, and `chunksize auto` then chooses smaller chunks
+(GRACE-3L runs about 10 % slower). If you build against your own Kokkos (`-D EXTERNAL_KOKKOS=yes`), configure it with
+`-D Kokkos_ENABLE_IMPL_HIP_MALLOC_ASYNC=OFF` too.
+
 On HPE Cray systems (`PrgEnv-amd` with `cray-mpich`), also add `-D GRACE_BLAS=OFF`: the Cray compiler wrappers find
 a BLAS at configure time that `hipcc` does not link, and the link then fails with `undefined symbol: cblas_sgemm`. The
 setting affects only the CPU styles, which then use their built-in matrix product.
@@ -131,10 +136,10 @@ Other AMD GPUs ([GPU backends](backends.md#amd-rocm)):
 
 ### Without network access
 
-Download grace-runtime 0.1.2 on a machine with network access, copy it over and pass its path:
+Download grace-runtime 0.1.3 on a machine with network access, copy it over and pass its path:
 
 ```bash
-git clone --depth 1 -b 0.1.2 https://github.com/ICAMS/grace-runtime.git
+git clone --depth 1 -b 0.1.3 https://github.com/ICAMS/grace-runtime.git
 cmake -S cmake -B build-cpu ... -D LOCAL_GRACE_RUNTIME=$PWD/grace-runtime
 ```
 
