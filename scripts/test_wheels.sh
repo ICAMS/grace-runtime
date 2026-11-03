@@ -21,6 +21,7 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "test_wheels.sh: no wheels for $(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac
 if [ -z "$V3" ]; then ALLOW+="|both ISA modules"; fi    # ARM: one CPU module, no v3 / v4 parity test
+[ "$(uname -s)" = Darwin ] || ALLOW+="|macOS only"    # the OpenMP-runtime check (test_openmp_check.py) runs on macOS
 export GRACE_TEST_ALLOW_SKIP=${GRACE_TEST_ALLOW_SKIP-$ALLOW}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WH=${1:-$ROOT/dist/wheelhouse}

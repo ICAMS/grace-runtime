@@ -50,16 +50,25 @@ def test_environment_overrides_auto(monkeypatch):
 
 
 @pytest.mark.skipif(not UNSUPPORTED.exists(), reason="unsupported test model absent")
-def test_auto_falls_back_for_a_model_outside_the_fused_kernels(monkeypatch):
+def test_auto_stays_on_the_gpu_for_a_model_outside_the_compiled_kernels(monkeypatch):
+    """a GRACE-2L model wider than every compiled width set: "auto" raises (naming GRACE_GENERIC_KERNELS=1) instead of
+    taking the CPU; with the variable it runs the model on the generic GPU kernels, with a warning, as the CPU"""
     monkeypatch.delenv("GRACE_RUNTIME_DEVICE", raising=False)
-    with pytest.warns(RuntimeWarning, match="fused GPU kernels"):
-        calc = GRACERuntimeCalculator(str(UNSUPPORTED))
-    assert calc.backend == "cpu"
-    with pytest.raises(ValueError, match=f"not supported on device='{PLATFORM}'"):
+    monkeypatch.delenv("GRACE_GENERIC_KERNELS", raising=False)
+    with pytest.raises(ValueError, match="GRACE_GENERIC_KERNELS=1"):
+        GRACERuntimeCalculator(str(UNSUPPORTED))
+    with pytest.raises(ValueError, match="GRACE_GENERIC_KERNELS=1"):
         GRACERuntimeCalculator(str(UNSUPPORTED), device=GPU).get_potential_energy(wmo54())
-    with pytest.warns(RuntimeWarning, match="fused GPU kernels"):
-        r = compute_batch(str(UNSUPPORTED), [wmo54()])
-    assert "energy" in r[0]
+    with pytest.raises(ValueError, match="GRACE_GENERIC_KERNELS=1"):
+        compute_batch(str(UNSUPPORTED), [wmo54()])
+    monkeypatch.setenv("GRACE_GENERIC_KERNELS", "1")
+    at, ref = wmo54(), wmo54()
+    with pytest.warns(RuntimeWarning, match="generic GPU kernels"):
+        at.calc = GRACERuntimeCalculator(str(UNSUPPORTED))
+    assert at.calc.backend.startswith(PLATFORM + ":"), at.calc.backend
+    ref.calc = GRACERuntimeCalculator(str(UNSUPPORTED), device="cpu")
+    assert abs(at.get_potential_energy() - ref.get_potential_energy()) <= 1e-5 * len(at)
+    assert np.abs(at.get_forces() - ref.get_forces()).max() <= 1e-4
 
 
 def test_auto_falls_back_without_a_module_for_the_gpu():

@@ -16,7 +16,7 @@ from ._core import Model
 from .dispersion import resolve as _resolve_dispersion
 from .neighbors import NeighborList, _padded_cell, check_skin
 
-_KK_MODELS = {}    # path -> GPU model (weights loaded once per process)
+_KK_MODELS = {}    # _kk_model_key -> GPU model (weights loaded once per process)
 _KK_LOCK = threading.Lock()    # guards _KK_MODELS and grace_runtime.batch's Batch cache
 _KK_CALCS = weakref.WeakSet()    # live GPU calculators (grace_runtime.free_gpu_memory() returns their buffers)
 _STORE_WARNED = set()    # model paths whose CPU reverse pass recomputes instead of storing (warned once per model)
@@ -71,8 +71,11 @@ def _cpu_fallback(why: str):
 
 
 def _kk_model_key(model) -> str:
+    """GRACE_GENERIC_KERNELS is part of the key: a GPU model sets up its engine (and warns) for the value at its load"""
     asi = getattr(model, "asi", None)
-    return f"{model.path}\0{asi}" if asi else model.path
+    key = f"{model.path}\0{asi}" if asi else model.path
+    generic = os.environ.get("GRACE_GENERIC_KERNELS")
+    return f"{key}\0{generic}" if generic is not None else key
 
 
 def _load_kk_model(kk, model):

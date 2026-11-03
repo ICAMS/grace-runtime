@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "grace-runtime"
-version = "0.1.2"
+version = "0.1.3"
 description = "Fast CPU and GPU inference of GRACE and PACE interatomic potentials with ASE, batching and TorchSim"
 readme = "README.md"
 requires-python = ">=3.10"
