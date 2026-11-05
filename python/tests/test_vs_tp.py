@@ -3,9 +3,9 @@
 there is no -fp64 one, so both sides are fp32 and the thresholds are wider).
 
 Skipped without tensorpotential / the cached models. Run on CPU: CUDA_VISIBLE_DEVICES= pytest -s.
-Energy <= 1e-6 eV/atom (2e-6 below 10 atoms: fp32 floor), forces <= 2e-5 eV/A, stress <= 2e-5 relative to
-max(|stress|, 1e-3 eV/A^3), per-atom energies <= 1e-5 eV. Measured worst (CPU, 2026-10-20): stress 6.8e-6 (1L, W1),
-per-atom energy 3.1e-6 eV (1L, W54).
+Energy <= 1e-6 eV/atom (2e-6 below 10 atoms: fp32 floor), forces <= 2e-5 eV/A, stress (zero without a cell) <= 2e-5
+relative to max(|stress|, 1e-3 eV/A^3), per-atom energies <= 1e-5 eV. Measured worst (CPU, 2026-10-20): stress 6.8e-6
+(1L, W1), per-atom energy 3.1e-6 eV (1L, W54).
 """
 import os
 
@@ -41,8 +41,9 @@ def test_parity(name, npz, saved):
         n = len(at)
         dE = abs(a.get_potential_energy() - b.get_potential_energy()) / n
         dF = np.abs(a.get_forces() - b.get_forces()).max()
-        sa, sb = a.get_stress(), b.get_stress()
-        dS = np.abs(sa - sb).max() / max(np.abs(sa).max(), 1e-3)
+        # no cell (the H2O molecule), no stress: TPCalculator returns that of a placeholder cell, so the reference is 0
+        sa = a.get_stress() if at.cell.rank == 3 else np.zeros(6)
+        dS = np.abs(sa - b.get_stress()).max() / max(np.abs(sa).max(), 1e-3)
         de = np.abs(np.asarray(ref.results["atomic_energy"]).reshape(-1)[:n] - b.get_potential_energies()).max()
         print(f"{name:22s} {sname:10s} dE/n {dE:.2e}  dF {dF:.2e}  dS rel {dS:.2e}  de_i {de:.2e}")
         for k, v in (("dE", dE), ("dF", dF), ("dS", dS), ("de", de)):

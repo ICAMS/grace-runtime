@@ -46,7 +46,7 @@ if(GRACE_WITH_KOKKOS)
   include(cmake/GraceHipAtomics.cmake)
   set(GRACE_KK_TESTS test_kk_1l_compile test_kk_2l_compile test_kk_3l_compile test_kk_csr test_kk_csr_3l
                      test_kk_2l_large test_kk_neighbors test_kk_coupling test_kk_large test_kk_gemm test_kk_device
-                     test_kk_launch_check test_kk_d3)
+                     test_kk_launch_check test_kk_d3 test_kk_order3 test_kk_cg_tables)
   foreach(t ${GRACE_KK_TESTS})
     add_executable(${t} tests/kk/${t}.cpp)
     target_link_libraries(${t} PRIVATE grace::libgrace Kokkos::kokkos)

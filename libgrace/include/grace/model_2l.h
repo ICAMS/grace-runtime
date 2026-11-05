@@ -24,6 +24,7 @@ struct GRACE2LModel {
   int n_elements = 0;
   int embedding_size = 0;
   int lmax = 0;
+  int max_order = 4;          // 3: the file has no AAAA / BBBB stage; the loader added dead ones (zero reduce weights)
   int nradbase = 0;
   int radial_basis_p = 0;
   double rcut = 0.0;
@@ -150,6 +151,9 @@ struct GRACE2LModel {
   bool energy_mlp_ln = false;     // legacy models: RMS layer norm of the MLP input, x s / rms(x) (s folded into layer 0)
   // false (legacy models): rho and I2 enter the energy MLP as they are (unit scales, the engines skip the 1/rms)
   bool energy_rms_norm = true;
+  // epsilon of both RMSNorms, x / sqrt(mean x^2 + eps): tensorpotential's InvariantLayerRMSNorm hardcodes it (not in
+  // the npz)
+  static constexpr double rms_norm_eps = 1e-10;
 
   // Per-element shifts
   std::vector<double> shift_values;

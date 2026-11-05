@@ -4,6 +4,7 @@
 #include "grace/error.h"
 
 #include "npz3.h"
+#include "max_order3.h"
 #include "zero_pad.h"
 
 #include <algorithm>
@@ -24,11 +25,15 @@ using namespace npz;
 
 void GRACE2LModel::load(const std::string &filepath) { load_arrays(npz_open(filepath)); }
 
-void GRACE2LModel::load_arrays(const cnpy::npz_t &npz) {
+void GRACE2LModel::load_arrays(const cnpy::npz_t &npz_in) {
   // a second load into the same object (LAMMPS pair_coeff twice) must keep nothing of the previous model: arrays
   // read only when present (UQ head, optional blocks) would otherwise survive
   *this = GRACE2LModel();
+  cnpy::npz_t npz = npz_in;    // the arrays are shared, not copied
   check_grace_format(npz, "GRACE-2L");
+  // max_order 3: the file has no AAAA and BBBB stages; dead ones are added (max_order3.h)
+  max_order = complete_to_order4(npz, {{"AAA", "AAAA", "fc_AA1", "fc_AA2", {"I1", "rho"}},
+                                       {"BBB", "BBBB", "fc_BB1", "fc_BB2", {"I2"}}});
 
   // Every array is checked against the declared sizes before anything is sized from it: a count is tied to the
   // stored shape of an array it describes (so a corrupt count cannot ask for a huge allocation), every index lies in
@@ -462,6 +467,7 @@ void GRACE2LModel::load_arrays(const cnpy::npz_t &npz) {
 void GRACE2LModel::validate_uq() const
 {
   if (!has_uq) throw Error("GRACE-2L: the model has no UQ head");
+  if (max_order == 3) throw Error("GRACE-2L: UQ is not supported for max_order 3 models");
   if (uq_schema_version != 6)
     throw Error("GRACE-2L: UQ schema v" + std::to_string(uq_schema_version) +
                 " unsupported (expects v6, uqv6 basis-RP normalize+density). Re-export the UQ artifacts at schema v6 "

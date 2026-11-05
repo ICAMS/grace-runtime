@@ -2,8 +2,10 @@
 """OpenMP runtimes in one process: grace-runtime's libgomp (vendored by auditwheel under a mangled name)
 next to scikit-learn's libgomp, an MKL numpy (libiomp5) and TensorFlow (TPCalculator). Every scenario runs in a fresh
 subprocess: the energy and forces must equal those of a process with grace-runtime alone, after the other library has
-used its threads, and threadpoolctl must list the runtimes. Scenarios whose library is not installed are skipped, so
-running this file in different environments (plain, MKL numpy, TF) covers the combinations."""
+used its threads (forces to 1e-5 eV/A: with several threads the 2L CPU engine adds dE/dI under row locks in a varying
+order, so its fp32 forces differ between runs by ~5e-7 eV/A), and threadpoolctl must list the runtimes. Scenarios
+whose library is not installed are skipped, so running this file in different environments (plain, MKL numpy, TF)
+covers the combinations."""
 import json
 import os
 import subprocess
@@ -45,7 +47,7 @@ def alone(models):
 
 def _same(a, b):
     assert abs(a["e"] - b["e"]) <= 1e-9 * abs(b["e"])
-    assert np.abs(np.array(a["f"]) - np.array(b["f"])).max() <= 1e-9
+    assert np.abs(np.array(a["f"]) - np.array(b["f"])).max() <= 1e-5
 
 
 def test_alone_lists_grace_runtime_openmp(alone):

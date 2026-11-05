@@ -571,7 +571,7 @@ void Grace1LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
 #endif
   }
   throw_zero_bond(work);
-  if (nall > 0 && !eonly) fthr.reduce(out.f, nall);
+  if (!eonly) fthr.reduce(out.f, nall);
   out.energy += eng;
   if (g_prof_on) g_prof[T_P3] += now_s() - t0;
   if (fl.virial && !eonly)

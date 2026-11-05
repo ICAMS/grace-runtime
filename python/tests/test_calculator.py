@@ -94,6 +94,21 @@ def test_system_change(mdl, fixtures):
         assert np.array_equal(f, fresh.get_forces())
 
 
+@pytest.mark.parametrize("arch", ["1l", "2l", "3l"])
+def test_forces_after_a_zero_bond_error(mdl, fixtures, arch):
+    """the zero-bond error comes after the backward pass: the failed call leaves no forces in the engine, and the
+    next call gives the forces of the call before it (before: it added the forces of the failed call)"""
+    good = fixture_atoms(fixtures, "W54")
+    good.rattle(0.01, seed=4)
+    bad = good.copy()
+    bad.append(bad[0])    # an atom on top of atom 0; one atom more, so the next call keeps the engine's force rows
+    calc = GRACERuntimeCalculator(mdl[arch], num_threads=1, device="cpu")
+    ref = calc.get_forces(good)
+    with pytest.raises(ValueError, match="same position"):
+        calc.get_forces(bad)
+    assert np.array_equal(calc.get_forces(good.copy()), ref)
+
+
 def test_failed_gpu_system_is_not_kept(mdl):
     """A GPU System that cannot be built (an engine self-test, device memory) raises its own error on every
     calculation; the calculator keeps no species setup without it (before: AttributeError _kk_cellkey on the next)."""

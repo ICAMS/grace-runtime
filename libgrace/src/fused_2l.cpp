@@ -551,7 +551,8 @@ double Grace2LFused::energy_atom(const float *rho, const float *I2, int ty, doub
   double ms1 = 0.0, ms0 = 0.0;
   for (int k = 1; k < nr; k++) ms1 += (double) rho[k] * rho[k];
   for (int k = 0; k < nr; k++) ms0 += (double) I2[k] * I2[k];
-  const double s1 = rms ? std::sqrt(ms1 / nrms1 + 1e-8) : 1.0, s0 = rms ? std::sqrt(ms0 / nrms0 + 1e-8) : 1.0;
+  constexpr double eps = GRACE2LModel::rms_norm_eps;
+  const double s1 = rms ? std::sqrt(ms1 / nrms1 + eps) : 1.0, s0 = rms ? std::sqrt(ms0 / nrms0 + eps) : 1.0;
   constexpr int MAXW = 256;
   const int nlay = eW.size();
   double act[8][MAXW], pre[8][MAXW];
@@ -1087,7 +1088,7 @@ void Grace2LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   }
   if (g_prof_on) { g_prof[T_P5] += now_s() - tph; tph = now_s(); }
   throw_zero_bond(work);
-  if (nall > 0) fthr.reduce(out.f, nall);
+  fthr.reduce(out.f, nall);
   if (g_prof_on) g_prof[T_P6] += now_s() - tph;
 
   if (fl.virial)
