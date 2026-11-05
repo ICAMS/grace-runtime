@@ -87,15 +87,11 @@ class Grace1LFusedKK : public Grace1LKK<DeviceType, float, float, Traits> {
   template<int NO> void fc_fwd(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   template<int NO, int NIR> void fc_bwd(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   template<int NO> void fc_fwd4(const FCMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
-  void prod_fwd(const ProdMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
-  void prod_rev(const ProdMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &,
-                bool acc_left);
   template<int NQ> void red_fwd();
   template<int NQ, int NIN> void red_bwd();
 
  protected:
-  int shape_id = 0;                     // 1: generated GRACE-1L large shape
-  int ng_AAA = 0;
+  int cgt_AA = -1, cgt_AAA = -1, cgt_AAAA = -1;    // per CG product the compiled table (cg_tables.h), -1: generic
   V3<F> d_splR;                         // [N][nradmax * (lmax+1)][4] cubic coefficients in t
   V1<int> d_lfrom;                      // l of lm
   V2<double> d_vir;                     // [inum][6]

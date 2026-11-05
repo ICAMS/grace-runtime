@@ -109,6 +109,18 @@ def test_coincident_atoms_are_an_error(model_files):
         evaluate(model_files["carbon_zbl"], at)
 
 
+def test_forces_after_a_zero_bond_error(model_files):
+    """the failed call leaves no forces in the engine: the next call on the same calculator equals a fresh one"""
+    good = cell("carbon_zbl/bulk")
+    bad = good.copy()
+    bad.append(bad[0])    # an atom on top of atom 0; one atom more, so the next call keeps the engine's force rows
+    calc = GRACERuntimeCalculator(Model(model_files["carbon_zbl"]), device="cpu", num_threads=1)
+    with pytest.raises(ValueError, match="same position"):
+        calc.get_forces(bad)
+    fresh = GRACERuntimeCalculator(Model(model_files["carbon_zbl"]), device="cpu", num_threads=1)
+    assert np.array_equal(calc.get_forces(good), fresh.get_forces(good.copy()))
+
+
 def test_self_images(model_files):
     """Review focus 4: a 2-atom cell that sees its images equals its 2x2x2 supercell per atom"""
     at = cell("carbon_zbl/pair2")

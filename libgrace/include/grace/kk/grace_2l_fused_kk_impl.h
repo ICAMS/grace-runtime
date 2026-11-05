@@ -8,8 +8,7 @@
 #include "grace/kk/fused_dense.h"
 #include "grace/radial_x.h"
 #include "grace/kk/fused_hip_bonds.h"
-#include "grace/kk/g2l_shape_smaxl.h"
-#include "grace/kk/g2l_shape_smaxm.h"
+#include "grace/kk/cg_tables.h"
 
 #include <algorithm>
 #include <array>
@@ -62,9 +61,10 @@ inline size_t g2lf_fwd_t_shmem(bool gpu, int nim, int NI, int nl, int CB)
 // its 32 KB M allows; MI250X 31k: 86.3 -> 73.6 ms per call; else 256)
 constexpr int g2lf_bwd_team(bool hip, int nim) { return hip && nim > 4 ? 512 : G2LF_TEAM; }
 // Layer-2 backward, teams per SM (shared memory) with 3 geometry rounds / with one: one round when it turns one team
-// into two (CUDA, 100 KB per SM, 2L-large: 1.3-2.1 % faster on L40S, 4-5 % on RTX 3060, 3 % on RTX 4070 SUPER); not
-// generally the round count with more teams (A100, 164 KB: two teams with 3 rounds are 1-2 % faster than more with
-// one). 0 teams (not known, e.g. HIP): the 3 rounds.
+// into two (CUDA, 100 KB per SM, 2L-large: 1.3-2.1 % faster on L40S, 4-5 % on RTX 3060, 3 % on RTX 4070 SUPER; HIP,
+// 64 KB per CU, GRACE-OFF-2L-large CB 16: one team -> three, MI250X 5k water 9.5 -> 7.5 ms per call); not generally
+// the round count with more teams (A100, 164 KB: two teams with 3 rounds are 1-2 % faster than more with one;
+// MI250X, 2L-medium CB 32, two teams either way: 2.4 -> 3.2 ms with one). 0 teams (not known): the 3 rounds.
 constexpr bool g2lf_one_round_better(int teams3, int teams1) { return teams3 == 1 && teams1 >= 2; }
 // M [channel][y][I], Ba, the geometry (Y, G, 8 values) of NBG = rounds NBR bonds, the force partials of the team
 // (TB threads); ints
@@ -261,35 +261,14 @@ void Grace2LFusedKK<DeviceType, Traits>::setup()
   build_prod_meta(pm_AA, mm.prod_AA, true); build_prod_meta(pm_AAA, mm.prod_AAA, false);
   build_prod_meta(pm_AAAA, mm.prod_AAAA, true); build_prod_meta(pm_BB, mm.prod_BB, true);
   build_prod_meta(pm_BBB, mm.prod_BBB, false); build_prod_meta(pm_BBBB, mm.prod_BBBB, true);
-  {   // shape-specialised CG products (generated per architecture): table match up to fp32 rounding
-    auto same = [](const GRACE2LModel::CGProduct &p, int nt, const int (*tab)[3], const double *cg) {
-      if ((int) p.cg_coeff.size() != nt) return false;
-      for (int t = 0; t < nt; t++)
-        if (p.left_ind[t] != tab[t][0] || p.right_ind[t] != tab[t][1] || p.m_sum_ind[t] != tab[t][2] ||
-            std::fabs(p.cg_coeff[t] - cg[t]) > 1e-6 * std::max(1.0, std::fabs(cg[t]))) return false;   // fp32 literals
-      return true;
-    };
-#define G2LF_SHAPE_MATCH(NS)                                                                         \
-    (same(mm.prod_AA, NS::nt_AA, NS::tab_AA, NS::cg_AA) && same(mm.prod_AAA, NS::nt_AAA, NS::tab_AAA, NS::cg_AAA) && \
-     same(mm.prod_AAAA, NS::nt_AAAA, NS::tab_AAAA, NS::cg_AAAA) && same(mm.prod_BB, NS::nt_BB, NS::tab_BB, NS::cg_BB) && \
-     same(mm.prod_BBB, NS::nt_BBB, NS::tab_BBB, NS::cg_BBB) && same(mm.prod_BBBB, NS::nt_BBBB, NS::tab_BBBB, NS::cg_BBBB))
-    shape_id = 0;
-    if (G2LF_SHAPE_MATCH(G2LShape_SMAXM)) shape_id = 1;
-    else if (G2LF_SHAPE_MATCH(G2LShape_SMAXL)) shape_id = 2;
-#undef G2LF_SHAPE_MATCH
-    if (no_shape) shape_id = 0;
-    auto ngen = [](const GRACE2LModel::CGProduct &p, bool self) {
-      int m = 0;
-      for (size_t t = 0; t < p.left_ind.size(); t++) m = std::max(m, p.left_ind[t] + 1);
-      if (self) for (size_t t = 0; t < p.right_ind.size(); t++) m = std::max(m, p.right_ind[t] + 1);
-      return m;
-    };
-    ng_AA = ngen(mm.prod_AA, true); ng_AAA = ngen(mm.prod_AAA, false); ng_AAAA = ngen(mm.prod_AAAA, true);
-    ng_BB = ngen(mm.prod_BB, true); ng_BBB = ngen(mm.prod_BBB, false); ng_BBBB = ngen(mm.prod_BBBB, true);
+  {   // shape-specialised CG products (cg_tables.h), product by product
+    cgt_AA = cgt_match(cgt::G2L_AA{}, mm.prod_AA); cgt_AAA = cgt_match(cgt::G2L_AAA{}, mm.prod_AAA);
+    cgt_AAAA = cgt_match(cgt::G2L_AAAA{}, mm.prod_AAAA); cgt_BB = cgt_match(cgt::G2L_BB{}, mm.prod_BB);
+    cgt_BBB = cgt_match(cgt::G2L_BBB{}, mm.prod_BBB); cgt_BBBB = cgt_match(cgt::G2L_BBBB{}, mm.prod_BBBB);
+    if (no_shape) cgt_AA = cgt_AAA = cgt_AAAA = cgt_BB = cgt_BBB = cgt_BBBB = -1;
     this->log.info(fmt("[GRACE-2L/KK] CG products {}\n",
-                     shape_id == 1 ? "specialised: medium shape (GRACE-2L-(SMAX-)OMAT-medium)" :
-                     shape_id == 2 ? "specialised: large shape (GRACE-2L-(SMAX-)OMAT-large)" :
-                     "generic (model tables differ from the compiled shapes)"));
+                     cgt_summary({{"AA", cgt_AA}, {"AAA", cgt_AAA}, {"AAAA", cgt_AAAA},
+                                  {"BB", cgt_BB}, {"BBB", cgt_BBB}, {"BBBB", cgt_BBBB}})));
   }
   {   // YI pairs grouped by (I channel, l) so the backward loops index registers statically
     const int P = this->n_yi_pairs, NG = G2LF_MAX_I * (G2LF_MAX_LMAX + 1);
@@ -439,8 +418,8 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer1_A()
     if (a_mfma) {    // CDNA: matrix-core basis (begin_run)
       auto run = [&](auto cpl) {
         GraceFusedKK::a_fwd_mfma<DeviceType, Traits, decltype(cpl)::value>(
-            "g2lf:L1_A", this->chunk_size, this->chunk_offset, this->L1_nradmax, this->L1_inv_avg_n_neigh, spline_n,
-            this->d_A, this->x, this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff,
+            "g2lf:L1_A", this->lmax, this->chunk_size, this->chunk_offset, this->L1_nradmax, this->L1_inv_avg_n_neigh,
+            spline_n, this->d_A, this->x, this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff,
             this->d_z_tr_A, this->couple_eq, this->couple_bit1, this->couple_bit2, this->couple_lambda, this->d_mask,
             this->d_idx_sph, this->alm, this->blm, this->cl, this->dl, d_splR);
       };
@@ -762,8 +741,8 @@ int Grace2LFusedKK<DeviceType, Traits>::l2_channel_block(bool bwd, int *rounds) 
     return 0;
   };
   // backward, GPU teams of 256: the geometry of 3 rounds per step; one round where no channel block fits with 3
-  // (CUDA with Kokkos 5.1, 48 KB: 2L-large CB 16 with 43 KB instead of 58 KB) or where it doubles the teams per SM
-  // (g2lf_one_round_better)
+  // (CUDA with Kokkos 5.1, 48 KB: 2L-large CB 16 with 43 KB instead of 58 KB) or where it turns one team per SM / CU
+  // into two or more (g2lf_one_round_better)
   int r = (bwd && gpu && team <= 256) ? 3 : 1, CB = widest(r);
   if (r == 3) {
     const int CB1 = widest(1);
@@ -1310,8 +1289,8 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer2_bwd_t()
   using member = typename team_policy::member_type;
   // scratch (g2lf_bwd_t_shmem): M [NMS][CB], Ba [nlm][CB], Y [NBG][nlm], G [NBG][3 nlm], geo [NBG][8], Fs [TB][3]; ints.
   // GPU, teams of 256: the bond geometry of NBG = 3 NBR bonds per step, then three rounds of NBR (fewer geometry steps
-  // and barriers; 7 KB more scratch: still two teams per CU for the 4-function message) where it fits
-  // (l2_channel_block); teams of 512: NBG = NBR
+  // and barriers; more scratch) where it fits and does not cost teams per SM / CU (l2_channel_block); teams of 512:
+  // NBG = NBR
   const int NBG = rounds * NBR;
   const int nf = NMS * CB + nlm * CB + NBG * (4 * nlm + 8) + 3 * TB;
   team_policy pol(cs * nblk, TB);
@@ -1834,8 +1813,8 @@ void Grace2LFusedKK<DeviceType, Traits>::fused_layer1_bwd()
     if (bwd_wave) {    // GPU: one 64-thread team per atom, thread = bond (begin_run)
       auto run = [&](auto cpl) {
         GraceFusedKK::bond_bwd_wave<DeviceType, Traits, decltype(cpl)::value>(
-            "g2lf:L1_bwd", this->chunk_size, this->chunk_offset, this->L1_nradmax, this->L1_inv_avg_n_neigh, spline_n,
-            this->d_A_adj, this->f, d_vir, this->x, this->type, this->d_map, bond_list(), this->d_ilist,
+            "g2lf:L1_bwd", this->lmax, this->chunk_size, this->chunk_offset, this->L1_nradmax, this->L1_inv_avg_n_neigh,
+            spline_n, this->d_A_adj, this->f, d_vir, this->x, this->type, this->d_map, bond_list(), this->d_ilist,
             this->d_bond_cutoff, this->d_z_tr_A, this->couple_eq, this->couple_bit1, this->couple_bit2,
             this->couple_lambda, this->d_mask, this->d_dedl, this->d_idx_sph, this->alm, this->blm, this->cl, this->dl,
             d_splR, this->vflag_global != 0, this->vflag_atom != 0, this->cvflag_atom != 0, this->d_vatom,
@@ -2098,19 +2077,6 @@ void Grace2LFusedKK<DeviceType, Traits>::fc_bwd(const FCMeta &m, const t_nn3 &do
   GraceFusedKK::fc_bwd<DeviceType, NO, NO>(m, this->chunk_size, dout, din_l, din_r);
 }
 
-template<class DeviceType, class Traits>
-void Grace2LFusedKK<DeviceType, Traits>::prod_fwd(const ProdMeta &m, const t_nn3 &L, const t_nn3 &R, const t_nn3 &out)
-{
-  GraceFusedKK::prod_fwd(m, this->chunk_size, L, R, out);
-}
-
-template<class DeviceType, class Traits>
-void Grace2LFusedKK<DeviceType, Traits>::prod_rev(const ProdMeta &m, const t_nn3 &L, const t_nn3 &R, const t_nn3 &D, const t_nn3 &dL,
-                                                  const t_nn3 &dR)
-{
-  GraceFusedKK::prod_rev(m, this->chunk_size, L, R, D, dL, dR);
-}
-
 // GPU (CUDA and HIP): the fused FC kernels (no BLAS) through the backend-neutral hook of the base engine; host
 // backends keep the plain FC kernels of the base engine
 template<class DeviceType, class Traits>
@@ -2147,52 +2113,42 @@ void Grace2LFusedKK<DeviceType, Traits>::stage_rev_fc_B1() { G2LF_W(fc_bwd<W.no2
    Thread per (atom, channel); the CG product is channel-diagonal.
 ------------------------------------------------------------------------- */
 
-#define G2LF_SHAPE_FWD(NS, P, Lv, Rv, Ov)                                                              \
-  {                                                                                                 \
-    auto L_ = Lv; auto R_ = Rv; auto O_ = Ov;                                                       \
-    const int cs = this->chunk_size, nc = (int) O_.extent(1);                                       \
-    Kokkos::parallel_for("g2lf:ShapeProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),         \
-      KOKKOS_LAMBDA(const int q) {                                                                  \
-        const int k = q / cs, ii = q - k * cs;                                                      \
-        NS::fwd_##P(L_, R_, O_, ii, k);                                                 \
-      });                                                                                           \
-  }
-#define G2LF_SHAPE_REV(NS, P, Lv, Rv, Dv, dLv, dRv, NG)                                                 \
-  {                                                                                                 \
-    auto L_ = Lv; auto R_ = Rv; auto D_ = Dv; auto dL_ = dLv; auto dR_ = dRv;                       \
-    const int cs = this->chunk_size, nc = (int) D_.extent(1), nx = (int) dL_.extent(2), ng = NG;    \
-    Kokkos::parallel_for("g2lf:ShapeRevProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),      \
-      KOKKOS_LAMBDA(const int q) {                                                                  \
-        const int k = q / cs, ii = q - k * cs;                                                      \
-        NS::rev_##P(L_, R_, D_, dL_, dR_, ii, k);                                       \
-        for (int x = ng; x < nx; x++) dL_(ii, k, x) = 0.0f;                                         \
-      });                                                                                           \
-  }
-
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_AA()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, AA, this->d_A1, this->d_A1, this->d_AA) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, AA, this->d_A1, this->d_A1, this->d_AA) else prod_fwd(pm_AA, this->d_A1, this->d_A1, this->d_AA); }
+{ cg_prod_fwd(cgt::G2L_AA{}, cgt_AA, pm_AA, "g2lf:ShapeProd_AA", this->chunk_size,
+              this->d_A1, this->d_A1, this->d_AA); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_AAA()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, AAA, this->d_AA1, this->d_A, this->d_AAA) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, AAA, this->d_AA1, this->d_A, this->d_AAA) else prod_fwd(pm_AAA, this->d_AA1, this->d_A, this->d_AAA); }
+{ cg_prod_fwd(cgt::G2L_AAA{}, cgt_AAA, pm_AAA, "g2lf:ShapeProd_AAA", this->chunk_size,
+              this->d_AA1, this->d_A, this->d_AAA); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_AAAA()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, AAAA, this->d_AA2, this->d_AA2, this->d_AAAA) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, AAAA, this->d_AA2, this->d_AA2, this->d_AAAA) else prod_fwd(pm_AAAA, this->d_AA2, this->d_AA2, this->d_AAAA); }
+{ cg_prod_fwd(cgt::G2L_AAAA{}, cgt_AAAA, pm_AAAA, "g2lf:ShapeProd_AAAA", this->chunk_size,
+              this->d_AA2, this->d_AA2, this->d_AAAA); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_BB()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, BB, this->d_B1, this->d_B1, this->d_BB) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, BB, this->d_B1, this->d_B1, this->d_BB) else prod_fwd(pm_BB, this->d_B1, this->d_B1, this->d_BB); }
+{ cg_prod_fwd(cgt::G2L_BB{}, cgt_BB, pm_BB, "g2lf:ShapeProd_BB", this->chunk_size,
+              this->d_B1, this->d_B1, this->d_BB); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_BBB()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, BBB, this->d_BB1, this->d_B, this->d_BBB) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, BBB, this->d_BB1, this->d_B, this->d_BBB) else prod_fwd(pm_BBB, this->d_BB1, this->d_B, this->d_BBB); }
+{ cg_prod_fwd(cgt::G2L_BBB{}, cgt_BBB, pm_BBB, "g2lf:ShapeProd_BBB", this->chunk_size,
+              this->d_BB1, this->d_B, this->d_BBB); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_prod_BBBB()
-{ if (shape_id == 1) G2LF_SHAPE_FWD(G2LShape_SMAXM, BBBB, this->d_BB2, this->d_BB2, this->d_BBBB) else if (shape_id == 2) G2LF_SHAPE_FWD(G2LShape_SMAXL, BBBB, this->d_BB2, this->d_BB2, this->d_BBBB) else prod_fwd(pm_BBBB, this->d_BB2, this->d_BB2, this->d_BBBB); }
+{ cg_prod_fwd(cgt::G2L_BBBB{}, cgt_BBBB, pm_BBBB, "g2lf:ShapeProd_BBBB", this->chunk_size,
+              this->d_BB2, this->d_BB2, this->d_BBBB); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_AA()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, AA, this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj, ng_AA) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, AA, this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj, ng_AA) else prod_rev(pm_AA, this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj); }
+{ cg_prod_rev<false>(cgt::G2L_AA{}, cgt_AA, pm_AA, "g2lf:ShapeRevProd_AA", this->chunk_size,
+                     this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_AAA()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, AAA, this->d_AA1, this->d_A, this->d_AAA_adj, this->d_AA1_adj, this->d_A_adj, ng_AAA) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, AAA, this->d_AA1, this->d_A, this->d_AAA_adj, this->d_AA1_adj, this->d_A_adj, ng_AAA) else prod_rev(pm_AAA, this->d_AA1, this->d_A, this->d_AAA_adj, this->d_AA1_adj, this->d_A_adj); }
+{ cg_prod_rev<false>(cgt::G2L_AAA{}, cgt_AAA, pm_AAA, "g2lf:ShapeRevProd_AAA", this->chunk_size,
+                     this->d_AA1, this->d_A, this->d_AAA_adj, this->d_AA1_adj, this->d_A_adj); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_AAAA()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj, ng_AAAA) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj, ng_AAAA) else prod_rev(pm_AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj); }
+{ cg_prod_rev<false>(cgt::G2L_AAAA{}, cgt_AAAA, pm_AAAA, "g2lf:ShapeRevProd_AAAA", this->chunk_size,
+                     this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_BB()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, BB, this->d_B1, this->d_B1, this->d_BB_adj, this->d_B1_adj, this->d_B1_adj, ng_BB) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, BB, this->d_B1, this->d_B1, this->d_BB_adj, this->d_B1_adj, this->d_B1_adj, ng_BB) else prod_rev(pm_BB, this->d_B1, this->d_B1, this->d_BB_adj, this->d_B1_adj, this->d_B1_adj); }
+{ cg_prod_rev<false>(cgt::G2L_BB{}, cgt_BB, pm_BB, "g2lf:ShapeRevProd_BB", this->chunk_size,
+                     this->d_B1, this->d_B1, this->d_BB_adj, this->d_B1_adj, this->d_B1_adj); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_BBB()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, BBB, this->d_BB1, this->d_B, this->d_BBB_adj, this->d_BB1_adj, this->d_B_adj, ng_BBB) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, BBB, this->d_BB1, this->d_B, this->d_BBB_adj, this->d_BB1_adj, this->d_B_adj, ng_BBB) else prod_rev(pm_BBB, this->d_BB1, this->d_B, this->d_BBB_adj, this->d_BB1_adj, this->d_B_adj); }
+{ cg_prod_rev<false>(cgt::G2L_BBB{}, cgt_BBB, pm_BBB, "g2lf:ShapeRevProd_BBB", this->chunk_size,
+                     this->d_BB1, this->d_B, this->d_BBB_adj, this->d_BB1_adj, this->d_B_adj); }
 template<class DeviceType, class Traits> void Grace2LFusedKK<DeviceType, Traits>::stage_rev_prod_BBBB()
-{ if (shape_id == 1) G2LF_SHAPE_REV(G2LShape_SMAXM, BBBB, this->d_BB2, this->d_BB2, this->d_BBBB_adj, this->d_BB2_adj, this->d_BB2_adj, ng_BBBB) else if (shape_id == 2) G2LF_SHAPE_REV(G2LShape_SMAXL, BBBB, this->d_BB2, this->d_BB2, this->d_BBBB_adj, this->d_BB2_adj, this->d_BB2_adj, ng_BBBB) else prod_rev(pm_BBBB, this->d_BB2, this->d_BB2, this->d_BBBB_adj, this->d_BB2_adj, this->d_BB2_adj); }
+{ cg_prod_rev<false>(cgt::G2L_BBBB{}, cgt_BBBB, pm_BBBB, "g2lf:ShapeRevProd_BBBB", this->chunk_size,
+                     this->d_BB2, this->d_BB2, this->d_BBBB_adj, this->d_BB2_adj, this->d_BB2_adj); }
 
 /* ----------------------------------------------------------------------
    ReduceN without atomics, several reducers sharing input tensors in one pass:

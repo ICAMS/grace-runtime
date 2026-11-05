@@ -1330,7 +1330,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
             NNScalar sq_sum = 0.0;
             for (int k = 1; k < n_out_ln; k++)
               sq_sum += rho_in(ii, k) * rho_in(ii, k);
-            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
+            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + GRACE2LModel::rms_norm_eps) : 1.0;
             for (int k = 1; k < n_out_ln; k++) {
               NNScalar val = rho_in(ii, k) * rms_inv * scale(k - 1);
               lnout(ii, k) = val;
@@ -1507,7 +1507,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           NNScalar sq_sum = 0.0;
           for (int k = 0; k < n_out_ln; k++)
             sq_sum += I2_in(ii, k) * I2_in(ii, k);
-          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
+          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + GRACE2LModel::rms_norm_eps) : 1.0;
           for (int k = 0; k < n_out_ln; k++)
             lnout(ii, k) = I2_in(ii, k) * rms_inv * scale(k);
         });
@@ -1683,7 +1683,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
           NNScalar sq_sum = 0.0;
           for (int k = 0; k < n_out_ln; k++)
             sq_sum += I2_in(ii, k) * I2_in(ii, k);
-          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
+          NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + GRACE2LModel::rms_norm_eps) : 1.0;
 
           // dot = Σ_k d_ln[k] * ln_out[k] (without the RMSNorm: 0, the identity)
           NNScalar dot = 0.0;
@@ -1866,7 +1866,7 @@ Grace2LKK<DeviceType, NNScalarT, GeomScalarT, Traits>::run(const RunInput &in)
             NNScalar sq_sum = 0.0;
             for (int k = 1; k < n_out_ln; k++)
               sq_sum += rho_in(ii, k) * rho_in(ii, k);
-            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + 1e-8) : 1.0;
+            NNScalar rms_inv = rms ? 1.0 / Kokkos::sqrt(sq_sum / nrms + GRACE2LModel::rms_norm_eps) : 1.0;
 
             // dot = Σ_{k=1}^{n-1} d_ln[k] * ln_out[k] (without the RMSNorm: 0, the identity)
             NNScalar dot = 0.0;

@@ -90,10 +90,17 @@ template<class D> size_t team_scratch_max(int team)
 }
 // CUDA: teams of `team` threads with `shmem` bytes of team scratch each that the shared memory of an SM holds: per
 // block the scratch, Kokkos' team-reduction doubles and its static 8-byte team id, rounded to the 128-byte allocation
-// unit, plus the driver's reservation per block. Shared memory only (the caller's kernel must not be limited by
-// registers first). 0: not known (other backends, a failed query) or not even one team.
+// unit, plus the driver's reservation per block. HIP: per CU the LDS, per team the scratch and the (team + 2) doubles
+// (the kernel's own static LDS, a few hundred bytes, and the allocation unit not counted; measured on CDNA, 64 KB per
+// CU; RDNA in WGP mode not measured). Shared memory only (the caller's kernel must not be limited by registers
+// first). 0: not known (other backends, a failed query) or not even one team.
 template<class D> int teams_per_sm_by_scratch(size_t shmem, int team)
 {
+#if defined(KOKKOS_ENABLE_HIP)
+  if constexpr (is_hip_v<D>)
+    return (int) ((size_t) Kokkos::HIP::hip_device_prop().maxSharedMemoryPerMultiProcessor /
+                  (shmem + (size_t) (team + 2) * sizeof(double)));
+#endif
 #if defined(KOKKOS_ENABLE_CUDA)
   if constexpr (is_cuda_v<D>) {
     static const std::pair<int, int> sm = [] {

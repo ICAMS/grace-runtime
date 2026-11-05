@@ -24,6 +24,7 @@ struct GRACE1LModel {
   int n_elements = 0;
   int embedding_size = 0;
   int lmax = 0;
+  int max_order = 4;          // 3: the file has no AAAA stage; a dead one (zero rho weights) is added by the loader
   int nradbase = 0;
   int nradmax = 0;
   int radial_basis_p = 0;

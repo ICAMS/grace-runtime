@@ -60,8 +60,8 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
  protected:
   std::vector<typename Base::t_nn_3d> st_A, st_A1, st_AA1, st_AA2;
   std::vector<typename Base::t_nn_2d> st_rho;
-  int shape_id = 0;                    // compiled CG shape matching the model: 0 generic, 1 medium, 2 large
-  int ng_AA = 0, ng_AAA = 0, ng_AAAA = 0, ng_BB = 0, ng_BBB = 0, ng_BBBB = 0;
+  // per CG product the compiled table (cg_tables.h) equal to the model's, -1: generic kernels
+  int cgt_AA = -1, cgt_AAA = -1, cgt_AAAA = -1, cgt_BB = -1, cgt_BBB = -1, cgt_BBBB = -1;
 
   // Radial tables: per interval k the cubic coefficients in t = N x - k, outputs o = n * (lmax+1) + l.
   V3<F> d_splR;                        // [N, L1_nradmax*(lmax+1), 4]
@@ -194,8 +194,6 @@ class Grace2LFusedKK : public Grace2LKK<DeviceType, float, float, Traits> {
   void stage_rev_fc_BB1() override;
   void stage_rev_fc_B1() override;
   void build_prod_meta(ProdMeta &, const GRACE2LModel::CGProduct &, bool self);
-  void prod_fwd(const ProdMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
-  void prod_rev(const ProdMeta &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &, const t_nn3 &);
   void stage_prod_AA() override;
   void stage_prod_AAA() override;
   void stage_prod_AAAA() override;

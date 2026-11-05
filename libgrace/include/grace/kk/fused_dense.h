@@ -18,6 +18,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <initializer_list>
+#include <string>
+#include <utility>
 #include <type_traits>
 #include <vector>
 
@@ -436,6 +440,10 @@ void fc_fwd(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in
 template<class DeviceType, int NO, class V3T>
 void fc_fwd4(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &in_r, const V3T &out)
 {
+  // halves of whole float4: NO a multiple of 8, else the two-atom kernel (this one is then not compiled)
+  if constexpr (NO % 8 != 0) {
+    fc_fwd<DeviceType, NO>(m, cs, in_l, in_r, out);
+  } else {
   using F = float;
   if (fc_fwd_on_mfma<DeviceType, NO>(m, cs, in_l, in_r, out)) return;
   constexpr int NH = NO / 2, NQ = NH / 4;
@@ -483,6 +491,7 @@ void fc_fwd4(const FCMetaT<DeviceType> &m, int cs, const V3T &in_l, const V3T &i
       }
     }
   });
+  }
 }
 
 // reverse FC, right part, from the transposed weights: thread = (two atoms, source, 1/H of the inputs);
@@ -561,7 +570,9 @@ void fc_bwd(const FCMetaT<DeviceType> &m, int cs, const V3T &dout, const V3T &di
   if (fc_bwd_on_mfma<DeviceType, NO, true>(m, cs, dout, din_r)) return;
   if (m.hr == 1 && m.nirp == 32) { fc_bwd_rt<DeviceType, NO, 32, 1>(m, cs, dout, din_r); return; }
   if (m.hr == 1 && m.nirp == 44) { fc_bwd_rt<DeviceType, NO, 44, 1>(m, cs, dout, din_r); return; }
+  if (m.hr == 1 && m.nirp == 48) { fc_bwd_rt<DeviceType, NO, 48, 1>(m, cs, dout, din_r); return; }
   if (m.hr == 2 && m.nirp == 64) { fc_bwd_rt<DeviceType, NO, 64, 2>(m, cs, dout, din_r); return; }
+  if (nir > NIRMAX) GRACE_KK_ERROR("reverse FC: {} right inputs, compiled for up to {}", nir, NIRMAX);
   Kokkos::parallel_for("gfused:RevFC_R", Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nsrc), KOKKOS_LAMBDA(const int q) {
     const int sidx = q / cs, ii = q - sidx * cs;
     if (soff(sidx) == soff(sidx + 1)) return;
@@ -641,6 +652,76 @@ void prod_rev(const ProdMetaT<DeviceType> &m, int cs, const V3T &L, const V3T &R
       }
     });
   }
+}
+
+/* ----------------------------------------------------------------------
+   Shape-specialised CG products (cg_tables.h): one struct per compiled CG table, a list of them per engine product.
+   Each product of a model is matched on its own: cgt_match gives the index of the compiled table equal to it (indices,
+   and coefficients up to the fp32 literals), -1 for none. cg_prod_fwd / cg_prod_rev run that table's kernel, or
+   prod_fwd / prod_rev for -1, with the same results: dL assigned (zero beyond the table) or, ACC, accumulated.
+------------------------------------------------------------------------- */
+
+template<template<class...> class List, class... T, class P>
+int cgt_match(List<T...>, const P &p)
+{
+  auto same = [&](const int nt, const int (*tab)[3], const double *cg) {
+    if ((int) p.cg_coeff.size() != nt) return false;
+    for (int t = 0; t < nt; t++)
+      if (p.left_ind[t] != tab[t][0] || p.right_ind[t] != tab[t][1] || p.m_sum_ind[t] != tab[t][2] ||
+          std::fabs(p.cg_coeff[t] - cg[t]) > 1e-6 * std::max(1.0, std::fabs(cg[t]))) return false;   // fp32 literals
+    return true;
+  };
+  int i = 0, id = -1;
+  auto one = [&](const int nt, const int (*tab)[3], const double *cg) { if (id < 0 && same(nt, tab, cg)) id = i; i++; };
+  (one(T::nt, T::tab, T::cg), ...);
+  return id;
+}
+
+// log line: "specialised: AA AAA, generic: AAAA" (names[k] with ids[k] >= 0, the others)
+inline std::string cgt_summary(std::initializer_list<std::pair<const char *, int>> prods)
+{
+  std::string sp, gen;
+  for (const auto &[name, id] : prods) (id >= 0 ? sp : gen) += std::string(" ") + name;
+  return "specialised:" + (sp.empty() ? std::string(" none") : sp) + ", generic:" +
+         (gen.empty() ? std::string(" none") : gen);
+}
+
+template<class DeviceType, class T, class V3T>
+void cgt_fwd_t(const char *label, int cs, const V3T &L, const V3T &R, const V3T &out)
+{
+  const int nc = (int) out.extent(1);
+  Kokkos::parallel_for(label, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
+    const int k = q / cs, ii = q - k * cs;
+    T::fwd(L, R, out, ii, k);
+  });
+}
+
+template<class DeviceType, class T, bool ACC, class V3T>
+void cgt_rev_t(const char *label, int cs, const V3T &L, const V3T &R, const V3T &D, const V3T &dL, const V3T &dR)
+{
+  const int nc = (int) D.extent(1), nx = ACC ? 0 : (int) dL.extent(2);
+  Kokkos::parallel_for(label, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc), KOKKOS_LAMBDA(const int q) {
+    const int k = q / cs, ii = q - k * cs;
+    T::template rev<ACC>(L, R, D, dL, dR, ii, k);
+    for (int x = T::nl; x < nx; x++) dL(ii, k, x) = 0.0f;
+  });
+}
+
+template<template<class...> class List, class... T, class DeviceType, class V3T>
+void cg_prod_fwd(List<T...>, const int id, const ProdMetaT<DeviceType> &m, const char *label, int cs, const V3T &L,
+                 const V3T &R, const V3T &out)
+{
+  int i = 0;
+  if (!((id == i++ && (cgt_fwd_t<DeviceType, T>(label, cs, L, R, out), true)) || ...)) prod_fwd(m, cs, L, R, out);
+}
+
+template<bool ACC, template<class...> class List, class... T, class DeviceType, class V3T>
+void cg_prod_rev(List<T...>, const int id, const ProdMetaT<DeviceType> &m, const char *label, int cs, const V3T &L,
+                 const V3T &R, const V3T &D, const V3T &dL, const V3T &dR)
+{
+  int i = 0;
+  if (!((id == i++ && (cgt_rev_t<DeviceType, T, ACC>(label, cs, L, R, D, dL, dR), true)) || ...))
+    prod_rev(m, cs, L, R, D, dL, dR, ACC);
 }
 
 }    // namespace GraceFusedKK

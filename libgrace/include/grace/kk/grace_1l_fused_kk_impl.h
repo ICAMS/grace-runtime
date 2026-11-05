@@ -8,7 +8,7 @@
 #include "grace/kk/fused_dense.h"
 #include "grace/radial_x.h"
 #include "grace/kk/fused_hip_bonds.h"
-#include "grace/kk/g1l_shape_large.h"
+#include "grace/kk/cg_tables.h"
 
 #include <algorithm>
 #include <array>
@@ -26,11 +26,12 @@ constexpr int G1LF_MAX_LMAX = GRACE_FUSED_MAX_LMAX;
 constexpr int G1LF_TEAM = 256;      // threads per atom in the bond kernels
 constexpr int G1LF_NB = 32;         // neighbours staged per batch (forward)
 constexpr int G1LF_MAX_ACC = 16;    // per-thread accumulators: nradmax * nlm <= TEAM * MAX_ACC
-constexpr int G1LF_NO = 64;         // FC widths compiled for: 64 (GRACE-1L large) and 32 (medium)
+constexpr int G1LF_NO = 64;         // FC widths compiled for: 64 (GRACE-1L large), 48 (GRACE-OFF large), 32 (medium),
+constexpr int G1LF_NO_OFF = 48;     // 20 (GRACE-OFF small)
 constexpr int G1LF_NO_M = 32;
+constexpr int G1LF_NO_S = 20;
 constexpr int G1LF_NIN = 64;        // max channel width of the rho sources
-constexpr int G1LF_NIR = 32;        // right-input (A) width of the generic reverse FC (32 and 64: fc_bwd_rt)
-constexpr int G1LF_NRMAX = 64;      // max radial width (zero-padded to 32 or 64 when the kernels need it)
+constexpr int G1LF_NIR = 32;        // right-input (A) width of the generic reverse FC (32, 48 and 64: fc_bwd_rt)
 constexpr int G1LF_CC = 8;          // rho connections per thread (forward)
 constexpr int G1LF_RQ = 5;          // rho output quads: rho_n_out <= 20 (17; legacy models 13), weights padded to 20
 
@@ -42,12 +43,27 @@ using namespace g1lf_detail;
 
 /* ---------------------------------------------------------------------- */
 
-// FC width no / radial width nr (nlm harmonics) runs on the compiled kernels
-inline bool g1lf_fc_ok(int no) { return no == G1LF_NO || no == G1LF_NO_M; }
+// FC width no / radial width nr (nlm harmonics) runs on the compiled kernels. Radial: any width up to G1LF_NIR (the
+// generic reverse FC takes it as right input), 48 or 64 (fc_bwd_rt); the bond kernels take any width (the team-of-256
+// backward leaves TEAM % nr threads idle)
+inline bool g1lf_fc_ok(int no) { return no == G1LF_NO || no == G1LF_NO_OFF || no == G1LF_NO_M || no == G1LF_NO_S; }
 inline bool g1lf_radial_ok(int nr, int nlm)
 {
-  return nr <= G1LF_NRMAX && G1LF_TEAM % nr == 0 && nr * nlm <= G1LF_TEAM * G1LF_MAX_ACC;
+  return (nr <= G1LF_NIR || nr == G1LF_NO_OFF || nr == G1LF_NO) && nr * nlm <= G1LF_TEAM * G1LF_MAX_ACC;
 }
+// the narrowest compiled FC width >= w
+inline int g1lf_pad_width(int w)
+{
+  return w <= G1LF_NO_S ? G1LF_NO_S : w <= G1LF_NO_M ? G1LF_NO_M : w <= G1LF_NO_OFF ? G1LF_NO_OFF : G1LF_NO;
+}
+
+// the statement with NO the model's compiled FC width
+#define G1LF_FC(...) do { switch (this->fc_n_out) {                                               \
+                            case G1LF_NO: { constexpr int NO = G1LF_NO; __VA_ARGS__; break; }         \
+                            case G1LF_NO_OFF: { constexpr int NO = G1LF_NO_OFF; __VA_ARGS__; break; } \
+                            case G1LF_NO_M: { constexpr int NO = G1LF_NO_M; __VA_ARGS__; break; }     \
+                            case G1LF_NO_S: { constexpr int NO = G1LF_NO_S; __VA_ARGS__; break; }     \
+                            default: GRACE_KK_ERROR("GRACE-1L/KK: FC width {} not compiled", this->fc_n_out); } } while (0)
 
 template<class DeviceType, class Traits>
 std::array<int, 2> Grace1LFusedKK<DeviceType, Traits>::pad_widths(const GRACE1LModel &m)
@@ -56,9 +72,9 @@ std::array<int, 2> Grace1LFusedKK<DeviceType, Traits>::pad_widths(const GRACE1LM
   if (m.has_uq || m.lmax > G1LF_MAX_LMAX || m.rho_n_out > 4 * G1LF_RQ ||
       (g1lf_radial_ok(m.nradmax, nlm) && g1lf_fc_ok(fc)))
     return {0, 0};
-  // radial and FC widths padded to the compiled FC widths 32 / 64
-  int nr = g1lf_radial_ok(m.nradmax, nlm) ? m.nradmax : m.nradmax <= G1LF_NO_M ? G1LF_NO_M : G1LF_NO;
-  int no = fc <= G1LF_NO_M ? G1LF_NO_M : G1LF_NO;
+  // radial and FC widths padded to the compiled FC widths 20 / 32 / 48 / 64
+  int nr = g1lf_radial_ok(m.nradmax, nlm) ? m.nradmax : g1lf_pad_width(m.nradmax);
+  int no = g1lf_pad_width(fc);
   if (m.AAA_right_A) nr = no = std::max(nr, no);    // legacy AAA = AA1 x A: one channel count
   if (m.nradmax > nr || fc > no || !g1lf_radial_ok(nr, nlm)) return {0, 0};
   return {nr, no};
@@ -109,8 +125,8 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
   if (!g1lf_radial_ok(this->nradmax, nlm))
     GRACE_KK_ERROR("GRACE-1L/KK: radial width {} outside the compiled bond kernels", this->nradmax);
   if (!g1lf_fc_ok(this->fc_n_out))
-    GRACE_KK_ERROR("GRACE-1L/KK: FC width {} not compiled (must be {} or {})", this->fc_n_out, G1LF_NO,
-                     G1LF_NO_M);
+    GRACE_KK_ERROR("GRACE-1L/KK: FC width {} not compiled (must be {}, {}, {} or {})", this->fc_n_out, G1LF_NO_S,
+                     G1LF_NO_M, G1LF_NO_OFF, G1LF_NO);
   if (this->rho_n_out > 4 * G1LF_RQ) GRACE_KK_ERROR("GRACE-1L/KK: rho width {} > {}", this->rho_n_out, 4 * G1LF_RQ);
   auto live = [](const GRACE1LModel::CGProduct &p, bool left, bool right) {
     std::vector<int> v;
@@ -130,23 +146,12 @@ void Grace1LFusedKK<DeviceType, Traits>::setup()
   build_prod_meta(pm_AAA, m.prod_AAA, false);
   build_prod_meta(pm_AAAA, m.prod_AAAA, true);
   build_red_meta();
-  {   // shape-specialised CG products (generated): table match up to fp32 rounding
-    auto same = [](const GRACE1LModel::CGProduct &p, int nt, const int (*tab)[3], const double *cg) {
-      if ((int) p.cg_coeff.size() != nt) return false;
-      for (int t = 0; t < nt; t++)
-        if (p.left_ind[t] != tab[t][0] || p.right_ind[t] != tab[t][1] || p.m_sum_ind[t] != tab[t][2] ||
-            std::fabs(p.cg_coeff[t] - cg[t]) > 1e-6 * std::max(1.0, std::fabs(cg[t]))) return false;
-      return true;
-    };
-    namespace S = G1LShape_L;
-    shape_id = (same(m.prod_AA, S::nt_AA, S::tab_AA, S::cg_AA) && same(m.prod_AAA, S::nt_AAA, S::tab_AAA, S::cg_AAA) &&
-                same(m.prod_AAAA, S::nt_AAAA, S::tab_AAAA, S::cg_AAAA)) ? 1 : 0;
-    if (no_shape) shape_id = 0;
-    ng_AAA = 0;
-    for (int x : m.prod_AAA.left_ind) ng_AAA = std::max(ng_AAA, x + 1);
-    this->log.info(fmt("[GRACE-1L/KK] CG products {}\n",
-                     shape_id ? "specialised: GRACE-1L large shape" : "generic (tables differ from the compiled shape)"));
-  }
+  // shape-specialised CG products (cg_tables.h), product by product
+  cgt_AA = cgt_match(cgt::G1L_AA{}, m.prod_AA); cgt_AAA = cgt_match(cgt::G1L_AAA{}, m.prod_AAA);
+  cgt_AAAA = cgt_match(cgt::G1L_AAAA{}, m.prod_AAAA);
+  if (no_shape) cgt_AA = cgt_AAA = cgt_AAAA = -1;
+  this->log.info(fmt("[GRACE-1L/KK] CG products {}\n",
+                   cgt_summary({{"AA", cgt_AA}, {"AAA", cgt_AAA}, {"AAAA", cgt_AAAA}})));
   {
     d_lfrom = V1<int>("g1lf:lfrom", nlm);
     auto h = Kokkos::create_mirror_view(d_lfrom);
@@ -228,8 +233,8 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_A()
     if (a_mfma) {    // CDNA: matrix-core basis (begin_run)
       auto run = [&](auto cpl) {
         GraceFusedKK::a_fwd_mfma<DeviceType, Traits, decltype(cpl)::value>(
-            "g1lf:A", this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n, this->d_A, this->x,
-            this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff, this->d_z_tr,
+            "g1lf:A", this->lmax, this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n, this->d_A,
+            this->x, this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff, this->d_z_tr,
             this->couple_eq, this->couple_bit1, this->couple_bit2, this->couple_lambda, this->d_mask,
             this->d_idx_sph, this->alm, this->blm, this->cl, this->dl, d_splR);
       };
@@ -360,11 +365,12 @@ void Grace1LFusedKK<DeviceType, Traits>::fused_bond_bwd()
     if (bwd_wave) {    // GPU: one 64-thread team per atom, thread = bond (begin_run)
       auto run = [&](auto cpl) {
         GraceFusedKK::bond_bwd_wave<DeviceType, Traits, decltype(cpl)::value>(
-            "g1lf:bond_bwd", this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n, this->d_A_adj,
-            this->f, d_vir, this->x, this->type, this->d_map, bond_list(), this->d_ilist, this->d_bond_cutoff,
-            this->d_z_tr, this->couple_eq, this->couple_bit1, this->couple_bit2, this->couple_lambda, this->d_mask,
-            this->d_dedl, this->d_idx_sph, this->alm, this->blm, this->cl, this->dl, d_splR, this->vflag_global != 0,
-            this->vflag_atom != 0, this->cvflag_atom != 0, this->d_vatom, this->d_cvatom);
+            "g1lf:bond_bwd", this->lmax, this->chunk_size, this->chunk_offset, this->nradmax, 1.0f, spline_n,
+            this->d_A_adj, this->f, d_vir, this->x, this->type, this->d_map, bond_list(), this->d_ilist,
+            this->d_bond_cutoff, this->d_z_tr, this->couple_eq, this->couple_bit1, this->couple_bit2,
+            this->couple_lambda, this->d_mask, this->d_dedl, this->d_idx_sph, this->alm, this->blm, this->cl, this->dl,
+            d_splR, this->vflag_global != 0, this->vflag_atom != 0, this->cvflag_atom != 0, this->d_vatom,
+            this->d_cvatom);
       };
       if (this->couple_eq) run(std::true_type{});
       else run(std::false_type{});
@@ -612,19 +618,6 @@ void Grace1LFusedKK<DeviceType, Traits>::fc_bwd(const FCMeta &m, const t_nn3 &do
   GraceFusedKK::fc_bwd<DeviceType, NO, NIR>(m, this->chunk_size, dout, din_l, din_r);
 }
 
-template<class DeviceType, class Traits>
-void Grace1LFusedKK<DeviceType, Traits>::prod_fwd(const ProdMeta &m, const t_nn3 &L, const t_nn3 &R, const t_nn3 &out)
-{
-  GraceFusedKK::prod_fwd(m, this->chunk_size, L, R, out);
-}
-
-template<class DeviceType, class Traits>
-void Grace1LFusedKK<DeviceType, Traits>::prod_rev(const ProdMeta &m, const t_nn3 &L, const t_nn3 &R, const t_nn3 &D, const t_nn3 &dL,
-                                                  const t_nn3 &dR, bool acc_left)
-{
-  GraceFusedKK::prod_rev(m, this->chunk_size, L, R, D, dL, dR, acc_left);
-}
-
 
 
 /* ----------------------------------------------------------------------
@@ -801,8 +794,10 @@ template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::stage_bond_fwd(int, int) { fused_A(); }
 
 // GPU: the run's compact bond list (every bond kernel of the run reads it) and the bond kernels for this model; one
-// line on stderr per process: the kernels of the first run and why. The wave-per-atom backward is the default on HIP
-// only: on CUDA the team-of-256 kernel is faster for 1L (A100, g1lf:bond_bwd 77 vs 88 ms per call, C-diamond-125k).
+// line on stderr per process: the kernels of the first run and why. The wave-per-atom backward is the default on HIP,
+// and on CUDA for lmax 3; at lmax 4 the team-of-256 kernel is faster on CUDA (A100, g1lf:bond_bwd 77 vs 88 ms per
+// call, C-diamond-125k), at lmax 3 the wave kernel (RTX 4070 SUPER, GRACE-OFF-1L-small, water 5k: 0.566 -> 0.541
+// us/atom/step).
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::begin_run()
 {
@@ -814,7 +809,7 @@ void Grace1LFusedKK<DeviceType, Traits>::begin_run()
     const int lmax = this->lmax, NR = this->nradmax;
     const KernelChoice a = GraceFusedKK::fused_mfma(GraceFusedKK::a_fwd_mfma_fits<DeviceType>(lmax, NR));
     const KernelChoice w = GraceFusedKK::fused_wave_bwd(GraceFusedKK::bond_bwd_wave_fits<DeviceType>(lmax, NR),
-                                                        is_hip_v<DeviceType>);
+                                                        is_hip_v<DeviceType> || lmax == 3);
     a_mfma = a.on;
     bwd_wave = w.on;
     static std::once_flag logged;
@@ -826,44 +821,17 @@ void Grace1LFusedKK<DeviceType, Traits>::begin_run()
   }
 }
 
-#define G1LF_SHAPE_FWD(P, Lv, Rv, Ov)                                                                  \
-  {                                                                                                 \
-    auto L_ = Lv; auto R_ = Rv; auto O_ = Ov;                                                       \
-    const int cs = this->chunk_size, nc = (int) O_.extent(1);                                       \
-    Kokkos::parallel_for("g1lf:ShapeProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),         \
-      KOKKOS_LAMBDA(const int q) {                                                                  \
-        const int k = q / cs, ii = q - k * cs;                                                      \
-        G1LShape_L::fwd_##P(L_, R_, O_, ii, k);                                                     \
-      });                                                                                           \
-  }
-#define G1LF_SHAPE_REV(P, Lv, Rv, Dv, dLv, dRv, NG)                                                     \
-  {                                                                                                 \
-    auto L_ = Lv; auto R_ = Rv; auto D_ = Dv; auto dL_ = dLv; auto dR_ = dRv;                       \
-    const int cs = this->chunk_size, nc = (int) D_.extent(1), nx = (int) dL_.extent(2), ng = NG;    \
-    Kokkos::parallel_for("g1lf:ShapeRevProd_" #P, Kokkos::RangePolicy<DeviceType, hip_lb_t<DeviceType, 256, 2>>(0, cs * nc),      \
-      KOKKOS_LAMBDA(const int q) {                                                                  \
-        const int k = q / cs, ii = q - k * cs;                                                      \
-        G1LShape_L::rev_##P(L_, R_, D_, dL_, dR_, ii, k);                                           \
-        for (int x = ng; x < nx; x++) dL_(ii, k, x) = 0.0f;                                         \
-      });                                                                                           \
-  }
-
 template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::stage_dense_fwd()
 {
-  if (this->fc_n_out == G1LF_NO) fc_fwd4<G1LF_NO>(fcm_A1, this->d_A, this->d_A, this->d_A1);
-  else fc_fwd4<G1LF_NO_M>(fcm_A1, this->d_A, this->d_A, this->d_A1);
-  if (shape_id) G1LF_SHAPE_FWD(AA, this->d_A1, this->d_A1, this->d_AA)
-  else prod_fwd(pm_AA, this->d_A1, this->d_A1, this->d_AA);
-  if (this->fc_n_out == G1LF_NO) fc_fwd4<G1LF_NO>(fcm_AA1, this->d_AA, this->d_A, this->d_AA1);
-  else fc_fwd4<G1LF_NO_M>(fcm_AA1, this->d_AA, this->d_A, this->d_AA1);
+  G1LF_FC(fc_fwd4<NO>(fcm_A1, this->d_A, this->d_A, this->d_A1));
+  cg_prod_fwd(cgt::G1L_AA{}, cgt_AA, pm_AA, "g1lf:ShapeProd_AA", this->chunk_size, this->d_A1, this->d_A1, this->d_AA);
+  G1LF_FC(fc_fwd4<NO>(fcm_AA1, this->d_AA, this->d_A, this->d_AA1));
   const auto &right = this->grace_model->AAA_right_A ? this->d_A : this->d_A1;    // AAA = AA1 x A1 (legacy: x A)
-  if (shape_id) G1LF_SHAPE_FWD(AAA, this->d_AA1, right, this->d_AAA)
-  else prod_fwd(pm_AAA, this->d_AA1, right, this->d_AAA);
-  if (this->fc_n_out == G1LF_NO) fc_fwd4<G1LF_NO>(fcm_AA2, this->d_AA, this->d_A, this->d_AA2);
-  else fc_fwd4<G1LF_NO_M>(fcm_AA2, this->d_AA, this->d_A, this->d_AA2);
-  if (shape_id) G1LF_SHAPE_FWD(AAAA, this->d_AA2, this->d_AA2, this->d_AAAA)
-  else prod_fwd(pm_AAAA, this->d_AA2, this->d_AA2, this->d_AAAA);
+  cg_prod_fwd(cgt::G1L_AAA{}, cgt_AAA, pm_AAA, "g1lf:ShapeProd_AAA", this->chunk_size, this->d_AA1, right, this->d_AAA);
+  G1LF_FC(fc_fwd4<NO>(fcm_AA2, this->d_AA, this->d_A, this->d_AA2));
+  cg_prod_fwd(cgt::G1L_AAAA{}, cgt_AAAA, pm_AAAA, "g1lf:ShapeProd_AAAA", this->chunk_size,
+              this->d_AA2, this->d_AA2, this->d_AAAA);
 }
 
 template<class DeviceType, class Traits>
@@ -877,23 +845,17 @@ template<class DeviceType, class Traits>
 void Grace1LFusedKK<DeviceType, Traits>::stage_dense_bwd()
 {
   red_bwd<G1LF_RQ, G1LF_NIN>();
-  if (shape_id) G1LF_SHAPE_REV(AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj,
-                               (int) this->d_AA2_adj.extent(2))
-  else prod_rev(pm_AAAA, this->d_AA2, this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj, false);
-  if (this->fc_n_out == G1LF_NO) fc_bwd<G1LF_NO, G1LF_NIR>(fcm_AA2, this->d_AA2_adj, this->d_AA_adj, this->d_A_adj);
-  else fc_bwd<G1LF_NO_M, G1LF_NIR>(fcm_AA2, this->d_AA2_adj, this->d_AA_adj, this->d_A_adj);
+  cg_prod_rev<false>(cgt::G1L_AAAA{}, cgt_AAAA, pm_AAAA, "g1lf:ShapeRevProd_AAAA", this->chunk_size, this->d_AA2,
+                     this->d_AA2, this->d_AAAA_adj, this->d_AA2_adj, this->d_AA2_adj);
+  G1LF_FC(fc_bwd<NO, G1LF_NIR>(fcm_AA2, this->d_AA2_adj, this->d_AA_adj, this->d_A_adj));
   const bool aaa_a = this->grace_model->AAA_right_A;
   const auto &right = aaa_a ? this->d_A : this->d_A1, &right_adj = aaa_a ? this->d_A_adj : this->d_A1_adj;
-  if (shape_id) G1LF_SHAPE_REV(AAA, this->d_AA1, right, this->d_AAA_adj, this->d_AA1_adj, right_adj, ng_AAA)
-  else prod_rev(pm_AAA, this->d_AA1, right, this->d_AAA_adj, this->d_AA1_adj, right_adj, false);
-  if (this->fc_n_out == G1LF_NO) fc_bwd<G1LF_NO, G1LF_NIR>(fcm_AA1, this->d_AA1_adj, this->d_AA_adj, this->d_A_adj);
-  else fc_bwd<G1LF_NO_M, G1LF_NIR>(fcm_AA1, this->d_AA1_adj, this->d_AA_adj, this->d_A_adj);
-  // AA reverse accumulates into A1_adj (generated with --acc AA); nothing to zero beyond the generated range
-  if (shape_id) G1LF_SHAPE_REV(AA, this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj,
-                               (int) this->d_A1_adj.extent(2))
-  else prod_rev(pm_AA, this->d_A1, this->d_A1, this->d_AA_adj, this->d_A1_adj, this->d_A1_adj, true);
-  if (this->fc_n_out == G1LF_NO) fc_bwd<G1LF_NO, G1LF_NIR>(fcm_A1, this->d_A1_adj, this->d_A_adj, this->d_A_adj);
-  else fc_bwd<G1LF_NO_M, G1LF_NIR>(fcm_A1, this->d_A1_adj, this->d_A_adj, this->d_A_adj);
+  cg_prod_rev<false>(cgt::G1L_AAA{}, cgt_AAA, pm_AAA, "g1lf:ShapeRevProd_AAA", this->chunk_size, this->d_AA1, right,
+                     this->d_AAA_adj, this->d_AA1_adj, right_adj);
+  G1LF_FC(fc_bwd<NO, G1LF_NIR>(fcm_AA1, this->d_AA1_adj, this->d_AA_adj, this->d_A_adj));
+  cg_prod_rev<true>(cgt::G1L_AA{}, cgt_AA, pm_AA, "g1lf:ShapeRevProd_AA", this->chunk_size, this->d_A1, this->d_A1,
+                    this->d_AA_adj, this->d_A1_adj, this->d_A1_adj);    // accumulates into A1_adj
+  G1LF_FC(fc_bwd<NO, G1LF_NIR>(fcm_A1, this->d_A1_adj, this->d_A_adj, this->d_A_adj));
 }
 
 template<class DeviceType, class Traits>

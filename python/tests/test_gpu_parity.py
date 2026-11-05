@@ -69,7 +69,7 @@ def test_against_lammps_fused_kk(mod, layer, cell):
 TF_REF = FX / "ref_tf" / "registry_tf_fp64.npz"    # TPCalculator, -fp64 SavedModels; CPU side: test_ref_tf.py
 
 
-# GRACE-2L-SMAX-OMAT-large: its own 2L shape on the GPU (g2l_shape_smaxl.h); the legacy models: the legacy layout (the
+# GRACE-2L-SMAX-OMAT-large: its own CG tables on the GPU (cg_tables.h); the legacy models: the legacy layout (the
 # fused engines; 2L at its own compiled widths)
 @pytest.mark.parametrize("model", ["GRACE-2L-SMAX-OMAT-large", "GRACE-1L-OAM", "GRACE-1L-OMAT", "GRACE-2L-OAM", "GRACE-2L-OMAT"])
 @pytest.mark.parametrize("cell", ["W54", "WMo54", "W2tri"])
@@ -95,14 +95,35 @@ def test_against_tf_fp64(mod, model, cell):
     assert np.abs(stress - ref[f"{k}/stress"]).max() / np.abs(ref[f"{k}/stress"]).max() <= 1e-5
 
 
+@pytest.mark.parametrize("model", ["GRACE-2L-SMAX-OMAT-medium", "GRACE-2L-OMAT-medium-ft-E"])
+def test_dimers_against_tf_fp64(model):
+    """GRACE-2L dimers stretched toward the cutoff: the RMSNorm epsilon (CPU side: test_ref_tf.py::test_dimers)"""
+    from ase import Atoms
+    from grace_runtime import GRACERuntimeCalculator
+    path = CACHE / model / "kokkos.npz"
+    if not path.exists():
+        pytest.skip(f"registry model {model} not in the test cache")
+    ref = np.load(FX / "ref_tf" / "dimers_tf_fp64.npz")
+    calc = GRACERuntimeCalculator(str(path), device=GPU)
+    for el in ref["elements"]:
+        for r in ref["distances"]:
+            at = Atoms(f"{el}2", positions=[[0, 0, 0], [r, 0, 0]])
+            at.calc = calc
+            k = f"{model}/{el}2/{r}"
+            dE = abs(at.get_potential_energy() - ref[f"{k}/energy"])
+            dF = np.abs(at.get_forces() - ref[f"{k}/forces"]).max()
+            assert dE <= 1e-5 and dF <= 1e-4, (k, dE, dF)
+
+
 @pytest.mark.parametrize("name, path_kind", [("legacy_2l_small", "zero-padded"), ("legacy_2l_wide", "generic"),
                                              ("grace_2l_small", "zero-padded"), ("legacy_1l_wide", "zero-padded"),
-                                             ("grace_1l_small", "zero-padded")])
+                                             ("grace_1l_small", "zero-padded"), ("grace_2l_l3", "zero-padded")])
 def test_outside_compiled_widths(mod, name, path_kind, monkeypatch, tmp_path):
     """GRACE-1L/2L models with widths outside the compiled kernels (tests/fixtures/{name}.npz, random weights):
-    legacy_2l_small, grace_2l_small (the RMSNorms of the current models), legacy_1l_wide (42 radial channels) and
-    grace_1l_small (radial 20, FC 40) run zero-padded to compiled widths; legacy_2l_wide, wider than every set, is
-    refused (device="auto" too: no CPU fallback) unless GRACE_GENERIC_KERNELS=1, then runs on the generic GPU engine.
+    legacy_2l_small, grace_2l_small (the RMSNorms of the current models), legacy_1l_wide (42 radial channels),
+    grace_1l_small (radial 20, FC 40) and grace_2l_l3 (lmax 3, max_order 3: the lmax-3 layer-1 bond kernels) run
+    zero-padded to compiled widths; legacy_2l_wide, wider than every set, is refused (device="auto" too: no CPU
+    fallback) unless GRACE_GENERIC_KERNELS=1, then runs on the generic GPU engine.
     Either way a warning (slow_notice) says so, and the results are the CPU engine's."""
     pytest.importorskip("grace_runtime._core")
     from grace_runtime import GRACERuntimeCalculator
@@ -126,11 +147,32 @@ def test_outside_compiled_widths(mod, name, path_kind, monkeypatch, tmp_path):
         warnings.simplefilter("always")
         at.calc = GRACERuntimeCalculator(path, device=GPU)
     assert any(note in str(w.message) for w in caught)
+    check_gpu_equals_cpu(at, path)
+
+
+def check_gpu_equals_cpu(at, path):
+    """at with the GPU calculator attached against the CPU engine on the model file at path"""
+    from grace_runtime import GRACERuntimeCalculator
     e, f, ei = at.get_potential_energy(), at.get_forces(), at.get_potential_energies()
     at.calc = GRACERuntimeCalculator(path, device="cpu", num_threads=4)
     assert abs(e - at.get_potential_energy()) / len(at) <= 2e-6
     assert np.abs(f - at.get_forces()).max() <= 2e-5
     assert np.abs(ei - at.get_potential_energies()).max() <= 1e-5
+
+
+@pytest.mark.parametrize("name", ["grace_1l_w48", "grace_1l_l3"])
+def test_1l_own_widths(mod, name):
+    """GRACE-1L models (tests/fixtures, random weights) on GPU kernels of their own widths, with the results of the
+    CPU engine: grace_1l_w48 (lmax 4, radial channels and FC 48, the widths of GRACE-OFF-1L-large; before: zero-padded
+    to 64) and grace_1l_l3 (lmax 3, max_order 3, radial channels and FC 20, as GRACE-OFF-1L-small; before: padded to
+    32). They take the lmax-4 and lmax-3 bond kernels (HIP: the matrix-core basis, the wave-per-atom backward)."""
+    from grace_runtime import GRACERuntimeCalculator
+    from ase.io import read
+    path = str(FX / f"{name}.npz")
+    assert mod.Model(path).slow_notice == ""
+    at = read(FX / "WMo54.data", format="lammps-data", atom_style="atomic", Z_of_type={1: 74, 2: 42})
+    at.calc = GRACERuntimeCalculator(path, device=GPU)
+    check_gpu_equals_cpu(at, path)
 
 
 def test_permuted_input_same_result(mod):

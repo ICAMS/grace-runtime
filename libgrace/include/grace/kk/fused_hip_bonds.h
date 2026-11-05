@@ -11,8 +11,8 @@
 // on the host backends the neighbour list (those kernels keep their cutoff test).
 //
 // bond_bwd_wave: the bond backward of the radial-angular basis A[i, n, lm] = sum_j z[mu_j, n] R_nl(x_ij) Y_lm(r_ij)
-// (GRACE-1L g1lf:bond_bwd, GRACE-2L g2lf:L1_bwd), lmax 4: one team of 64 threads per atom, thread = bond (rounds of
-// 64 bonds). The thread keeps its bond's Y and dY / dr in registers and loops over all radial channels; the force of
+// (GRACE-1L g1lf:bond_bwd, GRACE-2L g2lf:L1_bwd), lmax 3 or 4: one team of 64 threads per atom, thread = bond (rounds
+// of 64 bonds). The thread keeps its bond's Y and dY / dr in registers and loops over all radial channels; the force of
 // the bond is summed over the channels in registers. Compared with the (bond, channel) threads of the team-of-256
 // kernels: no team barrier and no shared-memory sum over the channels per round of TEAM / NR bonds, and the
 // geometry of a bond is computed once by its own thread. Shared memory: only the atom's dE/dA rows.
@@ -162,35 +162,37 @@ void compact_bonds(const int inum, const int maxneigh, const XV &x, const TV &ty
                                                cmask, cnb, cnum);
 }
 
-// bond_bwd_wave: lmax 4 (Y, G in registers), the atom's dE/dA rows in shared memory
-constexpr int FBW_LMAX = 4;
-inline size_t bond_bwd_wave_shmem(int NR)
+// bond_bwd_wave and a_fwd_mfma: compiled for lmax 3 and 4 (Y, G in registers; the lmax argument picks the instance)
+inline bool fused_lmax_ok(int lmax) { return lmax == 3 || lmax == 4; }
+// bond_bwd_wave: the atom's dE/dA rows in shared memory
+inline size_t bond_bwd_wave_shmem(int NR, int lmax)
 {
-  return (size_t) NR * fused_lmp((FBW_LMAX + 1) * (FBW_LMAX + 1)) * sizeof(float) + 16;
+  return (size_t) NR * fused_lmp((lmax + 1) * (lmax + 1)) * sizeof(float) + 16;
 }
 template<class DeviceType> bool bond_bwd_wave_fits(int lmax, int NR)
 {
-  return lmax == FBW_LMAX && bond_bwd_wave_shmem(NR) <= team_scratch_max<DeviceType>(FBW_TEAM);
+  return fused_lmax_ok(lmax) && bond_bwd_wave_shmem(NR, lmax) <= team_scratch_max<DeviceType>(FBW_TEAM);
 }
 
 // nbl: the run's bonds (BondList over compact_bonds), the atom's row at its ilist position (league rank + chunk offset)
-template<class DeviceType, class Traits, bool CPL, class AaV, class FV, class VirV, class XV, class TV, class MapV,
-         class NblV, class IlV, class BcV, class ZV, class MaskV, class DedlV, class GV, class SplV, class VaV, class CvaV>
-void bond_bwd_wave(const char *label, const int cs, const int co, const int NR, const float ascale, const int N,
-                   const AaV &Aa, const FV &f, const VirV &vir, const XV &x, const TV &type, const MapV &map,
-                   const NblV &nbl, const IlV &ilist, const BcV &bc, const ZV &ztr, const int ceq, const int cb1,
-                   const int cb2, const double clam, const MaskV &cmask, const DedlV &dedl, const GV &idx_s,
-                   const GV &alm, const GV &blm, const GV &cl, const GV &dl, const SplV &sc, const bool do_v,
-                   const bool do_va, const bool do_cva, const VaV &va, const CvaV &cva)
+template<class DeviceType, class Traits, bool CPL, int LM, class AaV, class FV, class VirV, class XV, class TV,
+         class MapV, class NblV, class IlV, class BcV, class ZV, class MaskV, class DedlV, class GV, class SplV,
+         class VaV, class CvaV>
+void bond_bwd_wave_l(const char *label, const int cs, const int co, const int NR, const float ascale, const int N,
+                     const AaV &Aa, const FV &f, const VirV &vir, const XV &x, const TV &type, const MapV &map,
+                     const NblV &nbl, const IlV &ilist, const BcV &bc, const ZV &ztr, const int ceq, const int cb1,
+                     const int cb2, const double clam, const MaskV &cmask, const DedlV &dedl, const GV &idx_s,
+                     const GV &alm, const GV &blm, const GV &cl, const GV &dl, const SplV &sc, const bool do_v,
+                     const bool do_va, const bool do_cva, const VaV &va, const CvaV &cva)
 {
   using F = float;
   using KKA = typename Traits::kk_acc_float;
-  constexpr int LM = FBW_LMAX, NL = LM + 1, NLM = NL * NL;
-  constexpr int LMP = fused_lmp(NLM);    // 28: dE/dA row of a channel as 7 float4
+  constexpr int NL = LM + 1, NLM = NL * NL;
+  constexpr int LMP = fused_lmp(NLM);    // lmax 4: 28, dE/dA row of a channel as 7 float4 (lmax 3: 20)
   using team_policy = Kokkos::TeamPolicy<DeviceType, hip_lb_t<DeviceType, FBW_TEAM, FBW_MINB>>;
   using member = typename team_policy::member_type;
   team_policy pol(cs, FBW_TEAM);
-  pol = pol.set_scratch_size(0, Kokkos::PerTeam(bond_bwd_wave_shmem(NR)));
+  pol = pol.set_scratch_size(0, Kokkos::PerTeam(bond_bwd_wave_shmem(NR, LM)));
 
   Kokkos::parallel_for(label, pol, KOKKOS_LAMBDA(const member &t) {
     const int ii = t.league_rank();
@@ -313,42 +315,51 @@ void bond_bwd_wave(const char *label, const int cs, const int co, const int NR, 
   });
 }
 
-// a_fwd_mfma (below): lmax 4, batches of AFM_NB bonds, team of AFM_TEAM = 4 wavefronts, each with up to AFM_MAXP
-// (16-channel tile, l) output blocks: the radial width NR fits when ceil(NR / 16) * 5 <= 4 AFM_MAXP (NR <= 48)
-constexpr int AFM_LMAX = 4, AFM_NB = 32, AFM_TEAM = 256, AFM_MAXP = 4;
-inline size_t a_fwd_mfma_shmem(int NR)
+// bond_bwd_wave_l for lmax 3 or 4 (bond_bwd_wave_fits)
+template<class DeviceType, class Traits, bool CPL, class... A>
+void bond_bwd_wave(const char *label, const int lmax, const A &...a)
 {
-  constexpr int NL = AFM_LMAX + 1;
+  if (lmax == 3) bond_bwd_wave_l<DeviceType, Traits, CPL, 3>(label, a...);
+  else bond_bwd_wave_l<DeviceType, Traits, CPL, 4>(label, a...);
+}
+
+// a_fwd_mfma (below): batches of AFM_NB bonds, team of AFM_TEAM = 4 wavefronts, each with up to AFM_MAXP
+// (16-channel tile, l) output blocks: the radial width NR fits when ceil(NR / 16) (lmax + 1) <= 4 AFM_MAXP (lmax 4:
+// NR <= 48, lmax 3: NR <= 64)
+constexpr int AFM_NB = 32, AFM_TEAM = 256, AFM_MAXP = 4;
+inline size_t a_fwd_mfma_shmem(int NR, int lmax)
+{
+  const int NL = lmax + 1;
   return (size_t) AFM_NB * (NL * NL + NR * NL + 1) * sizeof(float) + AFM_NB * sizeof(int) + 16;
 }
 template<class DeviceType> bool a_fwd_mfma_fits(int lmax, int NR)
 {
-  return lmax == AFM_LMAX && (NR + 15) / 16 * (AFM_LMAX + 1) <= (AFM_TEAM / 64) * AFM_MAXP &&
-         a_fwd_mfma_shmem(NR) <= team_scratch_max<DeviceType>(AFM_TEAM);
+  return fused_lmax_ok(lmax) && (NR + 15) / 16 * (lmax + 1) <= (AFM_TEAM / 64) * AFM_MAXP &&
+         a_fwd_mfma_shmem(NR, lmax) <= team_scratch_max<DeviceType>(AFM_TEAM);
 }
 
 #if GRACE_KK_GEMM_MFMA
 // The basis A[i, n, lm] = ascale sum_j z[mu_j, n] R_nl(x_ij) Y_lm(r_ij) (GRACE-1L g1lf:A, GRACE-2L g2lf:L1_A) on the
-// CDNA matrix cores, lmax 4: team of 256 per atom, batches of 32 bonds staged as in the team kernels (Y, and
+// CDNA matrix cores, lmax LM: team of 256 per atom, batches of 32 bonds staged as in the team kernels (Y, and
 // P = R z per (bond, channel, l)); per l block the product A_l (channels x (2l+1)) = P_l^T Y_l with
 // v_mfma_f32_16x16x4f32: k = lane group <-> bond, A operand rows = 16 channels, B operand columns = the 2l+1 lm of the
 // block. The (channel tile, l) output blocks are split over the 4 wavefronts. Out of range bonds: P = 0, Y = 0.
 // Only for a_fwd_mfma_fits(lmax, NR).
-template<class DeviceType, class Traits, bool CPL, class AV, class XV, class TV, class MapV, class NblV, class IlV,
-         class BcV, class ZV, class MaskV, class GV, class SplV>
-void a_fwd_mfma(const char *label, const int cs, const int co, const int NR, const float ascale, const int N,
-                const AV &Af, const XV &x, const TV &type, const MapV &map, const NblV &nbl, const IlV &ilist,
-                const BcV &bc, const ZV &ztr, const int ceq, const int cb1, const int cb2, const double clam,
-                const MaskV &cmask, const GV &idx_s, const GV &alm, const GV &blm, const GV &cl, const GV &dl,
-                const SplV &sc)
+template<class DeviceType, class Traits, bool CPL, int LM, class AV, class XV, class TV, class MapV, class NblV,
+         class IlV, class BcV, class ZV, class MaskV, class GV, class SplV>
+void a_fwd_mfma_l(const char *label, const int cs, const int co, const int NR, const float ascale, const int N,
+                  const AV &Af, const XV &x, const TV &type, const MapV &map, const NblV &nbl, const IlV &ilist,
+                  const BcV &bc, const ZV &ztr, const int ceq, const int cb1, const int cb2, const double clam,
+                  const MaskV &cmask, const GV &idx_s, const GV &alm, const GV &blm, const GV &cl, const GV &dl,
+                  const SplV &sc)
 {
   using F = float;
-  constexpr int NB = AFM_NB, NL = AFM_LMAX + 1, NLM = NL * NL, TEAM = AFM_TEAM, MAXP = AFM_MAXP;
+  constexpr int NB = AFM_NB, NL = LM + 1, NLM = NL * NL, TEAM = AFM_TEAM, MAXP = AFM_MAXP;
   const int nout = NR * NL, ntn = (NR + 15) / 16, npair = ntn * NL;
   using team_policy = Kokkos::TeamPolicy<DeviceType, Kokkos::LaunchBounds<TEAM, 2>>;
   using member = typename team_policy::member_type;
   team_policy pol(cs, TEAM);
-  pol = pol.set_scratch_size(0, Kokkos::PerTeam(a_fwd_mfma_shmem(NR)));
+  pol = pol.set_scratch_size(0, Kokkos::PerTeam(a_fwd_mfma_shmem(NR, LM)));
   Kokkos::parallel_for(label, pol, KOKKOS_LAMBDA(const member &t) {
     const int ii = t.league_rank();
     const int i = ilist[ii + co];
@@ -376,7 +387,7 @@ void a_fwd_mfma(const char *label, const int cs, const int co, const int NR, con
           double rm = r, drm, dlm;    // the model's bond length: r' of a coupled bond (grace/coupling.h)
           if (CPL && coupling_cross(cmask(i), cmask(j), cb1, cb2)) coupling_shift(ceq, r, rc, clam, rm, drm, dlm);
           xs[b] = F(rm / rc);
-          real_sph(AFM_LMAX, F(dx * rinv), F(dy * rinv), F(dz * rinv), idx_s, alm, blm, cl, dl, Ys + b * NLM);
+          real_sph(LM, F(dx * rinv), F(dy * rinv), F(dz * rinv), idx_s, alm, blm, cl, dl, Ys + b * NLM);
         } else {
           for (int y = 0; y < NLM; y++) Ys[b * NLM + y] = 0.0f;
         }
@@ -419,6 +430,14 @@ void a_fwd_mfma(const char *label, const int cs, const int co, const int NR, con
       }
     }
   });
+}
+
+// a_fwd_mfma_l for lmax 3 or 4 (a_fwd_mfma_fits)
+template<class DeviceType, class Traits, bool CPL, class... A>
+void a_fwd_mfma(const char *label, const int lmax, const A &...a)
+{
+  if (lmax == 3) a_fwd_mfma_l<DeviceType, Traits, CPL, 3>(label, a...);
+  else a_fwd_mfma_l<DeviceType, Traits, CPL, 4>(label, a...);
 }
 #endif
 

@@ -277,7 +277,7 @@ int main()
   // test_2l_padded / test_1l_padded: a model zero-padded to wider channels (GRACE2LModel / GRACE1LModel::padded, how
   // the GPU engines run it on compiled widths) gives the original's results. tests/fixtures: legacy_2l_small (radial
   // channels 16 / 8), grace_2l_small (16 / 8, the RMSNorms of the current models), legacy_1l_wide (radial and FC
-  // 42 -> 64), grace_1l_small (radial 20 -> 32, FC 40 -> 64)
+  // 42 -> 48), grace_1l_small (radial 20 -> 32, FC 40 -> 48; the GPU keeps radial 20 and pads only the FC)
   {
     const Cell c = load_cell(fx + "/WMo54.npz");
     auto same = [&](auto &a, auto &b, const std::string &name) {
@@ -299,8 +299,8 @@ int main()
       b.setup_types(2, type2mu_for(mp->element_names));
       same(a, b, name);
     }
-    for (const auto &[name, nr, no] : std::vector<std::tuple<std::string, int, int>>{{"legacy_1l_wide", 64, 64},
-                                                                                     {"grace_1l_small", 32, 64}}) {
+    for (const auto &[name, nr, no] : std::vector<std::tuple<std::string, int, int>>{{"legacy_1l_wide", 48, 48},
+                                                                                     {"grace_1l_small", 32, 48}}) {
       auto ms = std::make_shared<grace::GRACE1LModel>();
       ms->load(fx + "/" + name + ".npz");
       auto mp = std::make_shared<grace::GRACE1LModel>(ms->padded(nr, no));
@@ -308,6 +308,111 @@ int main()
       a.setup_types(2, type2mu_for(ms->element_names));
       b.setup_types(2, type2mu_for(mp->element_names));
       same(a, b, name);
+    }
+  }
+  // max_order 3: a file without the AAAA / BBBB stage (the loader adds a dead one) gives the results of the order-4
+  // file with zero AAAA / BBBB reduce weights. tests/fixtures: legacy_1l_wide, grace_1l_small, legacy_2l_small,
+  // grace_2l_small (their AAAA / BBBB arrays are removed or zeroed here)
+  {
+    const Cell c = load_cell(fx + "/WMo54.npz");
+    const auto ends_with = [](const std::string &k, const std::string &e) {
+      return k.size() >= e.size() && k.compare(k.size() - e.size(), e.size(), e) == 0;
+    };
+    const auto has_stage = [](const std::string &k) {
+      return k.find("AAAA") != std::string::npos || k.find("BBBB") != std::string::npos || k.rfind("fc_AA2_", 0) == 0 ||
+             k.rfind("fc_BB2_", 0) == 0;
+    };
+    // zeroed: the AAAA / BBBB reduce weights 0; stripped: every array of the two stages removed
+    const auto variants = [&](const std::string &path) {
+      auto full = grace::cnpy::npz_load(path);
+      auto zeroed = full, stripped = full;
+      for (auto &[k, a] : full) {
+        if (ends_with(k, "_reduce_AAAA_W") || ends_with(k, "_reduce_BBBB_W")) {
+          grace::cnpy::NpyArray z = a;
+          z.data_holder = std::make_shared<std::vector<char>>(a.num_bytes(), 0);
+          zeroed[k] = z;
+        }
+        if (has_stage(k)) stripped.erase(k);
+        if (ends_with(k, "_instruction_names") && a.shape[0] > 0) {    // [.., AAAA] / [.., BBBB]: drop the last name
+          const std::string last(a.data<char>() + (a.shape[0] - 1) * a.word_size, a.word_size);
+          if (last.compare(0, 4, "AAAA") == 0 || last.compare(0, 4, "BBBB") == 0) {
+            grace::cnpy::NpyArray n({a.shape[0] - 1}, a.word_size, false);
+            n.descr = a.descr;
+            std::copy(a.data<char>(), a.data<char>() + n.num_bytes(), n.data<char>());
+            stripped[k] = n;
+          }
+        }
+      }
+      return std::make_pair(zeroed, stripped);
+    };
+    const auto same = [&](auto &a, auto &b, const std::string &name) {
+      const Result ra = run(a, c, 1, true), rb = run(b, c, 1, true);
+      double df = 0, dpe = 0;
+      for (int q = 0; q < 3 * c.n; q++) df = std::max(df, std::fabs(ra.f[q] - rb.f[q]));
+      for (int i = 0; i < c.n; i++) dpe = std::max(dpe, std::fabs(ra.eatom[i] - rb.eatom[i]));
+      std::printf("max_order 3 vs zeroed AAAA (%s): dE %.3e  max|de_i| %.3e  max|dF| %.3e\n", name.c_str(),
+                  std::fabs(ra.e - rb.e), dpe, df);
+      CHECK(std::fabs(ra.e - rb.e) / c.n <= 1e-9 && dpe <= 1e-9 && df <= 1e-6);
+      CHECK(std::fabs(ra.e) > 1e-3);    // not a vanishing model
+    };
+    for (const std::string name : {"legacy_1l_wide", "grace_1l_small"}) {
+      const auto [zeroed, stripped] = variants(fx + "/" + name + ".npz");
+      auto mz = std::make_shared<grace::GRACE1LModel>(), ms = std::make_shared<grace::GRACE1LModel>();
+      mz->load_arrays(zeroed);
+      ms->load_arrays(stripped);
+      CHECK(mz->max_order == 4 && ms->max_order == 3);
+      grace::Grace1LFused a(mz, {}, {}), b(ms, {}, {});
+      a.setup_types(2, type2mu_for(mz->element_names));
+      b.setup_types(2, type2mu_for(ms->element_names));
+      same(a, b, name);
+    }
+    for (const std::string name : {"legacy_2l_small", "grace_2l_small"}) {
+      const auto [zeroed, stripped] = variants(fx + "/" + name + ".npz");
+      auto mz = std::make_shared<grace::GRACE2LModel>(), ms = std::make_shared<grace::GRACE2LModel>();
+      mz->load_arrays(zeroed);
+      ms->load_arrays(stripped);
+      CHECK(mz->max_order == 4 && ms->max_order == 3);
+      grace::Grace2LFused a(mz, {}, {}), b(ms, {}, {});
+      a.setup_types(2, type2mu_for(mz->element_names));
+      b.setup_types(2, type2mu_for(ms->element_names));
+      same(a, b, name);
+    }
+    // a file with some of the AAAA / BBBB arrays is broken, not an order-3 model
+    const auto refused = [&](auto &model, const grace::cnpy::npz_t &npz, const char *what) {
+      try {
+        model.load_arrays(npz);
+      } catch (const grace::Error &e) {
+        return std::string(e.what()).find(what) != std::string::npos;
+      }
+      return false;
+    };
+    {
+      auto npz = variants(fx + "/grace_1l_small.npz").second;
+      npz["rho_reduce_AAAA_W"] = grace::cnpy::npz_load(fx + "/grace_1l_small.npz")["rho_reduce_AAAA_W"];
+      grace::GRACE1LModel m;
+      CHECK(refused(m, npz, "AAAA stage is incomplete"));
+    }
+    {    // one of the two stages gone: the message names the one that is there and the one that is not
+      const auto full = grace::cnpy::npz_load(fx + "/grace_2l_small.npz");
+      for (const auto &[gone, there] : {std::pair<std::string, std::string>{"BBBB", "AAAA"}, {"AAAA", "BBBB"}}) {
+        auto npz = full;
+        const std::string fc = gone == "BBBB" ? "fc_BB2_" : "fc_AA2_";
+        for (auto &[k, a] : full)
+          if (k.find(gone) != std::string::npos || k.rfind(fc, 0) == 0) npz.erase(k);
+        grace::GRACE2LModel m;
+        CHECK(refused(m, npz, ("stage(s) " + there + " but not " + gone).c_str()));
+      }
+    }
+    if (m2->has_uq) {    // UQ of a max_order 3 model is refused (the dead block would add a basis column)
+      grace::GRACE2LModel m;
+      m.load_arrays(variants(test_model("GRACE_TEST_M2", "GRACE-2L-SMAX-OMAT-medium")).second);
+      bool uq_refused = false;
+      try {
+        m.validate_uq();
+      } catch (const grace::Error &e) {
+        uq_refused = std::string(e.what()).find("max_order 3") != std::string::npos;
+      }
+      CHECK(m.max_order == 3 && m.has_uq && uq_refused);
     }
   }
   // thread count changes the summation order only (document the size, require it to be tiny)
@@ -367,7 +472,11 @@ int main()
     CHECK(threw);
     tf.ensure(1 << 16, 100);
     CHECK(tf.buf.size() == (size_t) (1 << 16) * 100 * 3 && tf.of((1 << 16) - 1)[299] == 0.0);
-    std::printf("usable after a failed growth: 2L, 3L, ThreadForces\n");
+    // a compute that throws before reduce() (the zero-bond error): the next ensure() clears its rows
+    tf.of(1)[5] = 1.0;
+    tf.ensure(1 << 16, 100);
+    CHECK(tf.of(1)[5] == 0.0);
+    std::printf("usable after a failed growth: 2L, 3L, ThreadForces; force rows cleared after a throw\n");
   }
   return 0;
 }

@@ -1627,7 +1627,7 @@ void Grace3LFused::compute(int inum, const int *ilist, int n_nodes, int nmax_nod
   run_layer(0, true, src, out, fl);
   tick(P_S9);
   throw_zero_bond(work);
-  if (n_nodes > 0) g->fthr.reduce(out.f, n_nodes);
+  g->fthr.reduce(out.f, n_nodes);
   tick(P_FRED);
   if (fl.virial)
     for (auto &wp : work)

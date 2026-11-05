@@ -3,6 +3,72 @@
 Notable changes of grace-runtime, grace-runtime-cuda12 and grace-runtime-rocm6 (they share one version). Each
 release has a section "Changed defaults" when a default behaves differently.
 
+## [0.1.4](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.4) (2026-11-05)
+
+GRACE-1L/2L models with `max_order` 3, faster GPU kernels for the GRACE-OFF models, and GRACE-2L results near the
+cutoff that match TensorFlow.
+
+### Added
+
+- **GRACE-1L and GRACE-2L models with `max_order` 3** (no AAAA / BBBB products; for example the small GRACE-OFF
+  models) run on the CPU and on NVIDIA and AMD GPUs, in Python and in LAMMPS, with the same results as TensorFlow.
+  Such models have no uncertainty head. GRACE-2L files of such models need `export_kokkos` of a tensorpotential newer
+  than 0.6.2.1; GRACE-1L files exported earlier load as they are. Older grace-runtime versions refuse such files
+  (`fc_AA2_w_left missing`).
+
+### Fixed
+
+- **GRACE-2L near the cutoff:** the RMSNorm epsilon is now 1e-10, the value of tensorpotential (was 1e-8). Energies and
+  forces change where atoms have few neighbors or bonds close to the cutoff (molecules, surfaces, dissociation), by up
+  to 2 eV for a dimer 0.05 Å inside the cutoff, and now agree with TensorFlow there. Bulk results are not visibly
+  affected.
+- CPU: after a call that stopped with the error for two atoms at the same position, the next call on the same
+  calculator returned wrong forces (the bond forces of the failed call were added; energies were right).
+
+### Changed
+
+- **Faster GPU kernels**, mainly for the GRACE-OFF models:
+  - GRACE-1L: GPU kernels of their own for FC widths 20 and 48 and for radial widths up to 32 and 48 (before:
+    zero-padded to 32 or 64).
+  - Models with lmax 3 get the wave-per-atom bond backward and, on AMD CDNA GPUs, the matrix-core basis kernels
+    (before: lmax 4 only).
+  - The specialised CG-product kernels are chosen product by product instead of for a whole model shape, so models
+    whose products match only partly (the GRACE-OFF models, GRACE-2L-OMAT, GRACE-2L-OAM) use them too.
+  - AMD GPUs: the GRACE-2L layer-2 backward of models with 48 layer-2 channels and lmax 4 fits more teams per compute
+    unit.
+
+Time per atom and step (µs; Python, fixed positions), about 5,000 atoms of water (GRACE-2L-OMAT: bcc W), before and
+after these kernels:
+
+| Model | RTX 4070 SUPER | MI250X (one GCD) |
+|---|---|---|
+| GRACE-OFF-1L-small | 0.85 → 0.54 (−36 %) | 1.35 → 0.70 (−48 %) |
+| GRACE-OFF-1L-large | 3.81 → 2.67 (−30 %) | 3.08 → 2.13 (−31 %) |
+| GRACE-OFF-2L-small | 2.04 → 1.96 (−4 %) | 2.84 → 2.28 (−20 %) |
+| GRACE-OFF-2L-medium | 3.56 → 3.45 (−3 %) | 4.50 → 3.74 (−17 %) |
+| GRACE-OFF-2L-large | 4.85 → 4.64 (−4 %) | 5.68 → 4.60 (−19 %) |
+| GRACE-2L-OMAT | 3.72 → 3.50 (−6 %) | 3.94 → 3.07 (−22 %) |
+
+Results change at the level of fp32 rounding only.
+
+### LAMMPS (`grace-runtime` branch of the LAMMPS fork)
+
+- Builds grace-runtime 0.1.4: the models, fixes and GPU kernels above.
+
+### Documentation
+
+- Models: fits with `max_order` 3; exporting a model published as `saved_model/` only; the GRACE-1L widths with GPU
+  kernels of their own.
+- Benchmarks: the time-per-atom chart names its benchmark system.
+
+### Changed defaults
+
+- NVIDIA GPUs: GRACE-1L models with lmax 3 use the wave-per-atom bond backward (`GRACE_FUSED_WAVE_BWD`, which still
+  switches it either way).
+- GPU padding of GRACE-1L fits: FC widths up to 20 pad to 20 (was 32), from 33 to 48 pad to 48 (was 64); radial
+  widths up to 32 run unpadded (was: padded to 32 unless they divide 256), from 33 to 48 pad to 48 (was 64). The
+  padding warning names the new widths.
+
 ## [0.1.3](https://github.com/ICAMS/grace-runtime/releases/tag/0.1.3) (2026-11-03)
 
 Fixes, and the LAMMPS fork on the current stable LAMMPS.

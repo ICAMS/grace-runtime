@@ -148,11 +148,13 @@ struct RowLocks {
 };
 
 // per-thread force rows [nmax][3] (no atomics: neighbours of one thread's atoms are often owned by another).
-// Kept all-zero between computes: reduce() adds them to atom->f in contiguous chunks and clears them.
+// Kept all-zero between computes: reduce() adds them to atom->f in contiguous chunks and clears them. A compute that
+// throws between ensure() and reduce() (the zero-bond error) leaves them dirty; the next ensure() clears them.
 // Each thread first touches its own rows (SpreadBuf), which it then writes all compute long.
 struct ThreadForces {
   SpreadBuf<double> buf;
   int nth = 1, nmax = 0;
+  bool dirty = false;    // set by ensure(), cleared by reduce()
   void ensure(int nthreads, int nmax_)
   {
     if (nthreads != nth || nmax_ > nmax) {
@@ -161,7 +163,9 @@ struct ThreadForces {
       buf.assign((size_t) nthreads * nmax_ * 3, 0.0, nthreads);
       nth = nthreads;
       nmax = nmax_;
-    }
+    } else if (dirty)
+      buf.assign(buf.size(), 0.0, nthreads);
+    dirty = true;
   }
   double *of(int tid) { return buf.data() + (size_t) tid * nmax * 3; }
   void reduce(double *f, int nall)    // f: atom->f[0] (contiguous [nmax][3])
@@ -181,6 +185,7 @@ struct ThreadForces {
         std::memset(src + q0, 0, (q1 - q0) * sizeof(double));
       }
     }
+    dirty = false;
   }
 };
 
